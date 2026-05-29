@@ -1,4 +1,9 @@
-//! csd-gpu-miner CLI.
+//! csd-pool-miner CLI.
+//!
+//! The public build mines to the CSD pool by default: it connects to the
+//! compiled-in pool endpoint (see [`csd_gpu_miner::endpoint`]) over Stratum v1.
+//! There is intentionally **no** node/pool override flag — the only required
+//! argument is `--address`, your csd1 payout address.
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -8,9 +13,10 @@ use anyhow::{bail, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use csd_gpu_miner::backends::cpu::CpuBackend;
-use csd_gpu_miner::http::NodeClient;
+use csd_gpu_miner::endpoint;
 use csd_gpu_miner::logging;
-use csd_gpu_miner::loop_::{run_forever_with, MiningConfig};
+use csd_gpu_miner::loop_::MiningConfig;
+use csd_gpu_miner::stratum::{run_stratum, StratumClient};
 
 #[cfg(feature = "opencl")]
 use csd_gpu_miner::backends::opencl::OpenclBackend;
@@ -20,14 +26,15 @@ use csd_gpu_miner::backends::cuda::CudaBackend;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "csd-gpu-miner",
+    name = "csd-pool-miner",
     version,
-    about = "Standalone GPU miner for Compute Substrate v2."
+    about = "Standalone pool miner for Compute Substrate (mines to the CSD pool)."
 )]
 struct Cli {
-    /// Node RPC base URL.
-    #[arg(long, default_value = "http://127.0.0.1:8799")]
-    node: String,
+    /// Your csd1 payout address (the pool credits shares to this address).
+    /// Required. Accepts 40 lowercase hex chars, optionally `0x`-prefixed (42).
+    #[arg(long)]
+    address: String,
 
     /// Backend to use.
     #[arg(long, default_value = "auto")]
@@ -79,25 +86,29 @@ struct Cli {
     #[arg(long, default_value = "logs")]
     log_dir: PathBuf,
 
-    /// v74 port: maximum blocks the miner is willing to be BEHIND the
-    /// canonical-explorer-derived tip before pausing. 0 = strict (default;
-    /// any BEHIND skips). N>0 = allow up to N blocks behind. The AHEAD
-    /// direction is always governed by the asymmetric rule
-    /// (`+1 universal, +N>1 grace-only`) regardless of this value.
-    #[arg(long, default_value_t = 0)]
-    max_network_lag: u64,
-
-    /// v75 port: path to a newline-separated list of peer RPC URLs
-    /// (one URL per line, e.g. `http://1.2.3.4:8799`). Each FOUND-block
-    /// submit is fanned out to local + every peer URL in parallel
-    /// threads. Empty / missing file = local-only submit (no regression
-    /// vs pre-v75 behavior). Use this to reduce orphan rate when libp2p
-    /// gossip is too slow or the mesh is small.
-    #[arg(long, default_value = "")]
-    broadcast_peers_file: String,
-
     #[command(subcommand)]
     cmd: Option<Cmd>,
+}
+
+/// Validate a csd1 payout address and return its canonical 40-lowercase-hex
+/// form (the `0x` prefix, if present, is stripped). Accepts exactly 40
+/// lowercase hex chars, or 42 chars when `0x`-prefixed. Rejects wrong length,
+/// uppercase, and any non-hex character.
+///
+/// Kept pure (no I/O) so it is unit-testable and so `main` can fail fast with a
+/// clear message before opening a socket to the pool.
+fn validate_address(addr: &str) -> Result<String> {
+    let body = addr.strip_prefix("0x").unwrap_or(addr);
+    if body.len() != 40 {
+        bail!(
+            "--address must be 40 hex chars (or 42 with a 0x prefix); got {} chars",
+            addr.len()
+        );
+    }
+    if !body.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        bail!("--address must be lowercase hex (0-9, a-f); got {addr:?}");
+    }
+    Ok(body.to_string())
 }
 
 #[derive(Subcommand, Debug)]
@@ -154,35 +165,21 @@ fn cpu_hashing_threads(cli: &Cli) -> usize {
 /// iter-31: build the dual-mining MiningConfig from CLI flags.
 ///
 /// When a GPU backend is active, `--cpu-threads`/`--cpu-share` directly
-/// drive the new in-loop CPU worker pool. When the active backend IS
-/// the CPU backend (no GPU usable), we deliberately zero the dual-mining
-/// pool: the CPU backend already saturates all its hashing threads
-/// internally, so spawning a second pool inside the loop would just
-/// contend with itself.
+/// drive the in-loop CPU worker pool that races the GPU per launch. When the
+/// active backend IS the CPU backend (no GPU usable), we deliberately zero the
+/// dual-mining pool: the CPU backend already saturates all its hashing threads
+/// internally, so spawning a second pool inside the loop would just contend
+/// with itself.
 ///
-/// v74/v75 port: also loads the broadcast-peers list and propagates the
-/// asymmetric-gate lag knob.
+/// The node-only `MiningConfig` fields (`max_network_lag`, `broadcast_peers`)
+/// are left at their defaults — they have no meaning in pool mode (the pool
+/// owns canonicity and there is no node to broadcast blocks to).
 fn build_mining_config(cli: &Cli, backend_is_cpu: bool) -> MiningConfig {
-    let broadcast_peers =
-        csd_gpu_miner::loop_::load_broadcast_peers(&cli.broadcast_peers_file);
-    if !broadcast_peers.is_empty() {
-        tracing::info!(
-            "v75: loaded {} peer RPC URL(s) from {}",
-            broadcast_peers.len(),
-            cli.broadcast_peers_file,
-        );
-    } else if !cli.broadcast_peers_file.is_empty() {
-        tracing::warn!(
-            "v75: broadcast_peers_file={} not found or empty; falling back to local-only submit",
-            cli.broadcast_peers_file,
-        );
-    }
     if backend_is_cpu {
         return MiningConfig {
             cpu_threads: 0,
             cpu_share: 0.0,
-            max_network_lag: cli.max_network_lag,
-            broadcast_peers,
+            ..MiningConfig::default()
         };
     }
     let max_threads = num_cpus_default();
@@ -191,14 +188,13 @@ fn build_mining_config(cli: &Cli, backend_is_cpu: bool) -> MiningConfig {
     MiningConfig {
         cpu_threads,
         cpu_share,
-        max_network_lag: cli.max_network_lag,
-        broadcast_peers,
+        ..MiningConfig::default()
     }
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let _log_guard = logging::init("csd-gpu-miner", &cli.log_dir)?;
+    let _log_guard = logging::init("csd-pool-miner", &cli.log_dir)?;
 
     if matches!(cli.cmd, Some(Cmd::Devices)) {
         return print_devices();
@@ -224,7 +220,19 @@ fn main() -> Result<()> {
 
     print_build_features();
 
-    let client = NodeClient::new(&cli.node);
+    // Validate the payout address up front so a typo fails fast (before we open
+    // a socket to the pool) with a clear message.
+    let address = validate_address(&cli.address)?;
+
+    // The pool endpoint is compiled in (lightly obfuscated) — the public build
+    // has no override flag. Connect over Stratum v1 and authorize as `address`.
+    let endpoint = endpoint::pool_endpoint();
+    tracing::info!(
+        "csd-pool-miner: connecting to pool {endpoint} as address {address}"
+    );
+    let client = StratumClient::connect(&endpoint, &address)
+        .map_err(|e| anyhow::anyhow!("failed to connect to pool {endpoint}: {e}"))?;
+
     let stop = Arc::new(AtomicBool::new(false));
     {
         let stop = stop.clone();
@@ -243,7 +251,7 @@ fn main() -> Result<()> {
                 b.threads,
                 cli.reserve
             );
-            run_forever_with(&b, &client, stop, build_mining_config(&cli, true))
+            run_stratum(&b, &client, stop, build_mining_config(&cli, true))
         }
 
         #[cfg(feature = "opencl")]
@@ -264,7 +272,7 @@ fn main() -> Result<()> {
                 b.blocks, b.threads_per_block, b.nonces_per_thread,
                 (b.blocks as u64) * (b.threads_per_block as u64) * (b.nonces_per_thread as u64),
             );
-            run_forever_with(&b, &client, stop, build_mining_config(&cli, false))
+            run_stratum(&b, &client, stop, build_mining_config(&cli, false))
         }
         #[cfg(not(feature = "opencl"))]
         BackendChoice::Opencl => bail!("opencl backend not compiled in (rebuild with --features opencl)"),
@@ -287,7 +295,7 @@ fn main() -> Result<()> {
                 b.blocks, b.threads_per_block, b.nonces_per_thread,
                 (b.blocks as u64) * (b.threads_per_block as u64) * (b.nonces_per_thread as u64),
             );
-            run_forever_with(&b, &client, stop, build_mining_config(&cli, false))
+            run_stratum(&b, &client, stop, build_mining_config(&cli, false))
         }
         #[cfg(not(feature = "cuda"))]
         BackendChoice::Cuda => bail!("cuda backend not compiled in (rebuild with --features cuda)"),
@@ -316,7 +324,7 @@ fn main() -> Result<()> {
                             b.blocks, b.threads_per_block, b.nonces_per_thread,
                             (b.blocks as u64) * (b.threads_per_block as u64) * (b.nonces_per_thread as u64),
                         );
-                        return run_forever_with(&b, &client, stop, build_mining_config(&cli, false));
+                        return run_stratum(&b, &client, stop, build_mining_config(&cli, false));
                     }
                     Ok(Err(e)) => {
                         tracing::warn!("auto: CUDA init returned error: {}", e);
@@ -354,7 +362,7 @@ fn main() -> Result<()> {
                             b.blocks, b.threads_per_block, b.nonces_per_thread,
                             (b.blocks as u64) * (b.threads_per_block as u64) * (b.nonces_per_thread as u64),
                         );
-                        return run_forever_with(&b, &client, stop, build_mining_config(&cli, false));
+                        return run_stratum(&b, &client, stop, build_mining_config(&cli, false));
                     }
                     Err(e) => {
                         tracing::warn!("auto: OpenCL init failed: {}", e);
@@ -373,7 +381,7 @@ fn main() -> Result<()> {
                 b.threads,
                 cli.reserve
             );
-            run_forever_with(&b, &client, stop, build_mining_config(&cli, true))
+            run_stratum(&b, &client, stop, build_mining_config(&cli, true))
         }
     }
 }
@@ -387,7 +395,7 @@ fn print_build_features() {
         opencl
     );
     if !cuda {
-        tracing::info!("  to enable CUDA: cargo build -p csd-gpu-miner --release --features cuda");
+        tracing::info!("  to enable CUDA: cargo build -p csd-pool-miner --release --features cuda");
     }
 }
 
@@ -458,4 +466,46 @@ fn ctrlc_lite<F: FnOnce() + Send + 'static>(handler: F) {
         let _ = h_thread;
     });
     let _ = h;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_address;
+
+    #[test]
+    fn accepts_40_lowercase_hex() {
+        let addr = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(addr.len(), 40);
+        assert_eq!(validate_address(addr).unwrap(), addr);
+    }
+
+    #[test]
+    fn accepts_0x_prefixed_and_strips_it() {
+        let body = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        let prefixed = format!("0x{body}");
+        assert_eq!(prefixed.len(), 42);
+        // The canonical form drops the 0x prefix.
+        assert_eq!(validate_address(&prefixed).unwrap(), body);
+    }
+
+    #[test]
+    fn rejects_wrong_length() {
+        assert!(validate_address("abcd").is_err()); // too short
+        assert!(validate_address(&"a".repeat(39)).is_err()); // 39
+        assert!(validate_address(&"a".repeat(41)).is_err()); // 41 (no 0x)
+        assert!(validate_address(&format!("0x{}", "a".repeat(39))).is_err()); // 0x + 39
+        assert!(validate_address(&format!("0x{}", "a".repeat(41))).is_err()); // 0x + 41
+    }
+
+    #[test]
+    fn rejects_non_hex() {
+        // 'g' is not a hex digit.
+        assert!(validate_address("0123456789abcdef0123456789abcdef0123456g").is_err());
+    }
+
+    #[test]
+    fn rejects_uppercase() {
+        // Uppercase hex is rejected (csd1 addresses are lowercase hex).
+        assert!(validate_address("0123456789ABCDEF0123456789abcdef01234567").is_err());
+    }
 }

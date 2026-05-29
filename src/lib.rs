@@ -23,6 +23,7 @@ pub mod backend;
 pub mod backends;
 pub mod coinbase;
 pub mod consensus_types;
+pub mod endpoint;
 pub mod http;
 pub mod logging;
 pub mod loop_;
