@@ -11,6 +11,7 @@
 //! does not implement [`crate::work_source::WorkSource`] (Task 4).
 
 pub mod client;
+pub mod mapping;
 pub mod protocol;
 
 pub use client::{StratumClient, StratumJob};
