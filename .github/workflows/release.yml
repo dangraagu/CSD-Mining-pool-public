@@ -1,0 +1,80 @@
+name: release
+
+# Builds the Windows miner binaries and publishes them to a GitHub Release.
+#
+# Triggers:
+#   * push a tag  v*   -> build all variants AND publish them to the release
+#   * workflow_dispatch -> build only (smoke-test that everything compiles)
+#
+# Assets produced (consumed by install-csd-miner.bat):
+#   csd-pool-miner-cpu.exe      (always; no GPU deps, runs anywhere)
+#   csd-pool-miner-nvidia.exe   (CUDA; best-effort)
+#   csd-pool-miner-amd.exe      (OpenCL; best-effort)
+#
+# NOTE for the operator: before tagging a REAL release, set the pool endpoint in
+# src/endpoint.rs (it ships as a placeholder).
+#
+# FIRST-RUN ITERATION POINTS (these run on GitHub, not locally — watch the logs):
+#   * The CPU build is the safe one and should always succeed.
+#   * The NVIDIA/AMD builds are marked continue-on-error so a failure there does
+#     NOT block the CPU release. The AMD/OpenCL link step (vcpkg) is the most
+#     likely thing to need adjustment on the first run.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Prepare dist folder
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force dist | Out-Null
+
+      - name: Build CPU (always works, no GPU deps)
+        shell: pwsh
+        run: |
+          cargo build --release
+          Copy-Item target/release/csd-gpu-miner.exe dist/csd-pool-miner-cpu.exe
+
+      - name: Build NVIDIA (cuda)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          cargo build --release --features cuda
+          Copy-Item target/release/csd-gpu-miner.exe dist/csd-pool-miner-nvidia.exe
+
+      - name: Install OpenCL via vcpkg (for the AMD build)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install opencl:x64-windows
+          "LIB=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\lib;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build AMD (opencl)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          cargo build --release --features opencl
+          Copy-Item target/release/csd-gpu-miner.exe dist/csd-pool-miner-amd.exe
+
+      - name: List built artifacts
+        shell: pwsh
+        run: Get-ChildItem dist
+
+      - name: Publish to GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: false

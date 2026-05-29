@@ -7,6 +7,23 @@ AMD) or falling back to CPU.
 It connects to the pool **by default**: there is no server/pool flag to set. The
 only thing you have to provide is your csd1 address.
 
+## Install (Windows — one click)
+
+Easiest path — no toolchain, no manual download:
+
+1. Download **`install-csd-miner.bat`** from this repo (or from a release).
+2. Double-click it.
+
+It auto-detects your GPU (NVIDIA / AMD, else CPU), installs the VC++ runtime via
+`winget` if needed, downloads the matching prebuilt binary from the latest
+GitHub Release, asks for your csd1 payout address the first time (and remembers
+it), then starts mining. To force a build: `install-csd-miner.bat nvidia|amd|cpu`.
+
+Prefer to run the binary yourself? Grab the matching
+`csd-pool-miner-<nvidia|amd|cpu>.exe` from
+[Releases](https://github.com/dangraagu/CSD-Mining-pool-public/releases/latest)
+and see [Quick start](#quick-start).
+
 ## Requirements
 
 One of:
