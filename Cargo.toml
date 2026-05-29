@@ -1,0 +1,60 @@
+[package]
+name        = "csd-pool-miner"
+version     = "0.1.0"
+edition     = "2021"
+rust-version = "1.75"
+license     = "MIT OR Apache-2.0"
+description = "Compute Substrate standalone pool miner (CPU default; CUDA + OpenCL optional)."
+
+# The library crate keeps its original name so the binary's
+# `use csd_gpu_miner::...` paths (and any downstream consumers) are unchanged
+# after the package rename to `csd-pool-miner`.
+[lib]
+name = "csd_gpu_miner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "csd-gpu-miner"
+path = "src/main.rs"
+
+[features]
+# Default is CPU-only so the crate builds with no GPU toolchain present.
+# Enable a GPU backend explicitly, e.g.:
+#   cargo build --release --features cuda
+#   cargo build --release --features opencl
+#   cargo build --release --features "cuda,opencl"   # auto-pick best at runtime
+default     = ["cpu-only"]
+cuda        = ["dep:cudarc"]
+opencl      = ["dep:opencl3"]
+# Explicit CPU-only marker (no GPU toolchain required). Carries no deps.
+cpu-only    = []
+
+[dependencies]
+anyhow      = "1.0"
+serde       = { version = "1.0", features = ["derive"] }
+serde_json  = "1.0"
+hex         = "0.4"
+sha2        = { version = "0.10", features = ["compress"] }
+rand        = "0.8"
+rand_chacha = "0.3"
+humantime   = "2"
+clap        = { version = "4.5", features = ["derive"] }
+tracing     = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender   = "0.2"
+ureq        = { version = "2", features = ["json"] }
+
+# Optional GPU backends. Both link/compile their kernels at runtime, so the
+# default CPU-only build does not require any GPU toolchain on the build host.
+cudarc      = { version = "0.19", features = ["cuda-13020", "driver", "nvrtc"], optional = true }
+opencl3     = { version = "0.9", optional = true }
+
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+debug         = false
+strip         = true
+# unwind (not abort) so the miner can catch panics from cudarc when an
+# incompatible CUDA toolkit is installed, and fall back to OpenCL cleanly.
+panic         = "unwind"
