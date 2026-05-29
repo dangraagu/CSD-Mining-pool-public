@@ -28,6 +28,7 @@ pub mod logging;
 pub mod loop_;
 pub mod selftest;
 pub mod sha256d_cpu;
+pub mod work_source;
 
 /// Compatibility shim: the work-template/submission types used to live in a
 /// sibling `csd-consensus` crate. They are now vendored into

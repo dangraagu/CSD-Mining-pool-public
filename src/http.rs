@@ -187,6 +187,23 @@ impl NodeClient {
     }
 }
 
+impl crate::work_source::WorkSource for NodeClient {
+    fn poll_work(&self) -> anyhow::Result<crate::work_source::WorkOutcome> {
+        use crate::work_source::WorkOutcome;
+        match self.get_work_classified()? {
+            crate::http::GetWork::Work(resp) => {
+                Ok(WorkOutcome::Work(resp.templates.into_iter().flatten().collect()))
+            }
+            crate::http::GetWork::ServiceUnavailable => Ok(WorkOutcome::Hold),
+        }
+    }
+    fn submit(&self, sub: &crate::csd_consensus::WorkSubmission) -> anyhow::Result<()> {
+        self.submit_work(sub).map(|_| ())
+    }
+    fn tip(&self) -> Option<crate::csd_consensus::Hash32> { self.get_tip().ok() }
+    fn report_hashrate(&self, ghs: f64) { let _ = self.post_miner_heartbeat(ghs); }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
