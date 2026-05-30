@@ -1,23 +1,15 @@
 //! Pooled Stratum-v1 mining loop.
 //!
-//! This is the Stratum counterpart to [`crate::loop_::run_forever_with`] (the
-//! node/HTTP solo loop). It deliberately does **not** reuse that function:
-//! the node loop is welded to NodeClient-only concerns that have no meaning in
-//! a pool — the v74 asymmetric explorer-gate (`/stats` BEHIND / AHEAD-FORK),
-//! the pre-submit `/tip` staleness check, the 503 mine-through path, the
-//! sustained-STALE circuit breaker, and the full 8-byte extranonce roll. In a
-//! pool, **the pool owns canonicity**: there is no node tip to gate against, and
-//! the coinbase extranonce is split `xn1(4) ‖ xn2(4)` where the low half (xn1)
-//! is pool-fixed at subscribe time and only the high half (xn2) may roll.
+//! Polls the Stratum client for the latest job, maps `mining.notify` into a
+//! csd1 work template, and races the GPU against a CPU worker pool over the
+//! nonce range, gating every find through a CPU re-hash before submit. In a
+//! pool, **the server owns canonicity**, and the coinbase extranonce is split
+//! `xn1(4) ‖ xn2(4)`: the low half (xn1) is pool-fixed at subscribe time and
+//! only the high half (xn2) rolls.
 //!
-//! So this loop keeps just the *inner hashing pattern* of the node loop —
-//! coinbase_txid → merkle_root_from_branch → header_84 → partition_nonce_range
-//! → backend.hash_range raced against the CPU worker pool → CPU re-hash
-//! correctness gate → submit — and swaps the work intake and submit shape:
-//!
+//! Per iteration:
 //!   1. `client.latest_job()` (poll). `None` ⇒ no notify yet ⇒ brief sleep +
-//!      retry (the Stratum analogue of [`crate::work_source::WorkOutcome::Hold`];
-//!      there is no last-good template to mine through on, unlike the 503 path).
+//!      retry.
 //!   2. share target = [`target_from_difficulty`]`(client.current_difficulty())`.
 //!   3. map notify → [`crate::csd_consensus::WorkTemplate`] via
 //!      [`crate::stratum::mapping::notify_to_template`].
@@ -26,12 +18,6 @@
 //!   5. on FOUND `(xn2, nonce)`: build the submit field trio with
 //!      [`build_submit`]`(xn2, template.time, nonce)` and send it via
 //!      [`StratumClient::send_submit`].
-//!
-//! DRY note: the per-launch hashing block (CPU/GPU race + correctness gate) is
-//! duplicated from `run_forever_with` rather than factored into a shared helper.
-//! That is an intentional Phase-1 tradeoff — extracting it cleanly is blocked on
-//! the two loops differing in submit shape, extranonce semantics, and refresh
-//! triggers. A future DRY pass can lift the inner block once those settle.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -42,7 +28,7 @@ use anyhow::Result;
 
 use crate::backend::{MiningBackend, MiningResult};
 use crate::coinbase::{coinbase_txid, header_84, merkle_root_from_branch};
-use crate::loop_::{partition_nonce_range, MiningConfig};
+use crate::mining_config::{partition_nonce_range, MiningConfig};
 use crate::sha256d_cpu::{finish_sha256d_from_midstate_fast, midstate_of_first_chunk_fast};
 use crate::stratum::client::StratumClient;
 use crate::stratum::mapping::{build_submit, compose_extranonce, notify_to_template};
@@ -138,8 +124,7 @@ struct CpuFind {
 /// `client` must already be connected (handshake done, reader thread running).
 /// Work is pulled from its background-updated `latest_job()` / difficulty; found
 /// shares are submitted via `client.send_submit`. The CPU+GPU split honours the
-/// same `MiningConfig` knobs as the node loop (`cpu_threads`, `cpu_share`); the
-/// node-only knobs (`max_network_lag`, `broadcast_peers`) are ignored here.
+/// `MiningConfig` knobs `cpu_threads` and `cpu_share`.
 pub fn run_stratum<B: MiningBackend>(
     backend: &B,
     client: &StratumClient,
@@ -781,7 +766,6 @@ mod tests {
             let cfg = MiningConfig {
                 cpu_threads: 0,
                 cpu_share: 0.0,
-                ..MiningConfig::default()
             };
             run_stratum(&backend, &client, stop_for_loop, cfg)
         });

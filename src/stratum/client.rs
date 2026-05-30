@@ -5,8 +5,7 @@
 //! This is the **protocol/transport** layer only. The reader thread parses
 //! `mining.notify` into a [`StratumJob`] (the raw 9-tuple + the session
 //! extranonce1) and stashes `mining.set_difficulty` — it does NOT build a
-//! [`crate::csd_consensus::WorkTemplate`] (Task 3) and this type does NOT
-//! implement [`crate::work_source::WorkSource`] (Task 4).
+//! [`crate::csd_consensus::WorkTemplate`]; the mapping step does that.
 //!
 //! Concurrency model:
 //!   - The write half of the socket lives behind a `Mutex<TcpStream>` so the

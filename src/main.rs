@@ -15,7 +15,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use csd_gpu_miner::backends::cpu::CpuBackend;
 use csd_gpu_miner::endpoint;
 use csd_gpu_miner::logging;
-use csd_gpu_miner::loop_::MiningConfig;
+use csd_gpu_miner::mining_config::MiningConfig;
 use csd_gpu_miner::stratum::{run_stratum, StratumClient};
 
 #[cfg(feature = "opencl")]
@@ -170,16 +170,11 @@ fn cpu_hashing_threads(cli: &Cli) -> usize {
 /// dual-mining pool: the CPU backend already saturates all its hashing threads
 /// internally, so spawning a second pool inside the loop would just contend
 /// with itself.
-///
-/// The node-only `MiningConfig` fields (`max_network_lag`, `broadcast_peers`)
-/// are left at their defaults — they have no meaning in pool mode (the pool
-/// owns canonicity and there is no node to broadcast blocks to).
 fn build_mining_config(cli: &Cli, backend_is_cpu: bool) -> MiningConfig {
     if backend_is_cpu {
         return MiningConfig {
             cpu_threads: 0,
             cpu_share: 0.0,
-            ..MiningConfig::default()
         };
     }
     let max_threads = num_cpus_default();
@@ -188,7 +183,6 @@ fn build_mining_config(cli: &Cli, backend_is_cpu: bool) -> MiningConfig {
     MiningConfig {
         cpu_threads,
         cpu_share,
-        ..MiningConfig::default()
     }
 }
 
