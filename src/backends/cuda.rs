@@ -99,17 +99,16 @@ impl CudaBackend {
         ctx.set_blocking_synchronize()
             .map_err(|e| anyhow!("cuda: set_blocking_synchronize failed: {}", e))?;
 
-        // compute_75 -> compute_120 (Blackwell native).
-        // Add NVRTC pass-through flags --maxrregcount=64 and
-        // --use_fast_math. The first lets ptxas use up to 64 registers per
-        // thread before spilling to local memory (default cap is often
-        // lower on Blackwell); SHA-256 has ~80 hot u32 working values, so
-        // reducing spills directly raises throughput. --use_fast_math is
-        // safe for SHA (all integer math; no FP results to relax) and
-        // sometimes unlocks small ptxas optimizations even on pure-int
-        // kernels via dead-code elimination of intrinsics imports.
+        // Target compute_75 (Turing) as the NVRTC virtual arch. The resulting
+        // PTX runs on EVERY CUDA 13-supported NVIDIA GPU (Turing through
+        // Blackwell) via the driver's forward JIT, so this one public binary
+        // works across miners' cards. Targeting a generation-specific arch
+        // (e.g. compute_120 / Blackwell) only ran on that exact generation and
+        // silently fell back to CPU on every other card.
+        // --maxrregcount=64 lets ptxas use up to 64 registers per thread before
+        // spilling; --use_fast_math is safe for the all-integer SHA-256 kernel.
         let opts = CompileOptions {
-            arch: Some("compute_120"),
+            arch: Some("compute_75"),
             options: vec!["--maxrregcount=64".into(), "--use_fast_math".into()],
             ..Default::default()
         };
