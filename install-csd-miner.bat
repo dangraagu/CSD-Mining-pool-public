@@ -72,6 +72,18 @@ if !errorlevel! NEQ 0 (
   exit /b 1
 )
 
+REM --- 3b. Also fetch the multi-GPU + auto-update launchers next to this file ---
+echo Fetching the multi-GPU / auto-update launchers ...
+where curl >nul 2>&1
+if !errorlevel!==0 (
+  curl -L -f -s -o "%~dp0mine-all-gpus.bat" "https://raw.githubusercontent.com/%REPO%/main/mine-all-gpus.bat"
+  curl -L -f -s -o "%~dp0mine-auto.bat" "https://raw.githubusercontent.com/%REPO%/main/mine-auto.bat"
+) else (
+  powershell -NoProfile -Command "try { Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/%REPO%/main/mine-all-gpus.bat' -OutFile '%~dp0mine-all-gpus.bat' -UseBasicParsing; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/%REPO%/main/mine-auto.bat' -OutFile '%~dp0mine-auto.bat' -UseBasicParsing } catch {}"
+)
+echo   - mine-all-gpus.bat  = mine on ALL GPUs at once
+echo   - mine-auto.bat      = all GPUs + auto-update (recommended for 24/7)
+
 REM --- 4. csd1 payout address: prompt once, remember thereafter ---
 set "ADDR="
 if exist "%CFG%" set /p ADDR=<"%CFG%"
