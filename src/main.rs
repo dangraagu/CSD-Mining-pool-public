@@ -82,6 +82,13 @@ struct Cli {
     #[arg(long, default_value_t = 0.4)]
     cpu_share: f32,
 
+    /// GPU device index to mine on (see the `devices` subcommand for the list).
+    /// Default 0. To use multiple GPUs, run one instance per card, each with a
+    /// different --device (e.g. --device 0 and --device 1), all to the same
+    /// address — the pool sums their shares.
+    #[arg(long, default_value_t = 0)]
+    device: usize,
+
     /// Log directory (rotates previous log on startup).
     #[arg(long, default_value = "logs")]
     log_dir: PathBuf,
@@ -255,7 +262,7 @@ fn main() -> Result<()> {
                 cli.blocks, cli.threads_per_block, cli.nonces_per_thread,
             );
             let init = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                OpenclBackend::new(cli.blocks, cli.threads_per_block, cli.nonces_per_thread)
+                OpenclBackend::new(cli.device, cli.blocks, cli.threads_per_block, cli.nonces_per_thread)
             }));
             let b = match init {
                 Ok(Ok(b)) => b,
@@ -285,7 +292,7 @@ fn main() -> Result<()> {
             // version mismatch; catch it so we exit with a clear message
             // instead of an unwinding backtrace.
             let init = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                CudaBackend::new(cli.blocks, cli.threads_per_block, cli.nonces_per_thread)
+                CudaBackend::new(cli.device, cli.blocks, cli.threads_per_block, cli.nonces_per_thread)
             }));
             let b = match init {
                 Ok(Ok(b)) => b,
@@ -322,7 +329,7 @@ fn main() -> Result<()> {
                 // nvrtc64_122.dll). Catch the panic so `auto` can fall
                 // through to OpenCL.
                 let cuda_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    CudaBackend::new(cli.blocks, cli.threads_per_block, cli.nonces_per_thread)
+                    CudaBackend::new(cli.device, cli.blocks, cli.threads_per_block, cli.nonces_per_thread)
                 }));
                 match cuda_result {
                     Ok(Ok(b)) => {
@@ -362,7 +369,7 @@ fn main() -> Result<()> {
                     "auto: trying OpenCL geom={}x{}x{}",
                     cli.blocks, cli.threads_per_block, cli.nonces_per_thread
                 );
-                match OpenclBackend::new(cli.blocks, cli.threads_per_block, cli.nonces_per_thread) {
+                match OpenclBackend::new(cli.device, cli.blocks, cli.threads_per_block, cli.nonces_per_thread) {
                     Ok(b) => {
                         tracing::info!(
                             "auto: SELECTED opencl (geom={}x{}x{} = {} nonces/launch, 2-queue pipelined)",

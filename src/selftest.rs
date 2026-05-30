@@ -109,7 +109,7 @@ pub fn run(opts: SelftestOpts) -> Result<()> {
     #[cfg(feature = "opencl")]
     {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            OpenclBackend::new(opts.blocks, opts.threads_per_block, opts.nonces_per_thread)
+            OpenclBackend::new(0, opts.blocks, opts.threads_per_block, opts.nonces_per_thread)
         }));
         match r {
             Ok(Ok(b)) => {
@@ -140,7 +140,7 @@ pub fn run(opts: SelftestOpts) -> Result<()> {
     #[cfg(feature = "cuda")]
     {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            CudaBackend::new(opts.blocks, opts.threads_per_block, opts.nonces_per_thread)
+            CudaBackend::new(0, opts.blocks, opts.threads_per_block, opts.nonces_per_thread)
         }));
         match r {
             Ok(Ok(b)) => {

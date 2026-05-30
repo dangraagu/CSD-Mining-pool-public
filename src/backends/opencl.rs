@@ -39,13 +39,26 @@ pub struct OpenclBackend {
 }
 
 impl OpenclBackend {
-    pub fn new(blocks: u32, threads_per_block: u32, nonces_per_thread: u32) -> Result<Self> {
+    pub fn new(
+        device_index: usize,
+        blocks: u32,
+        threads_per_block: u32,
+        nonces_per_thread: u32,
+    ) -> Result<Self> {
         let devices = get_all_devices(CL_DEVICE_TYPE_GPU)
             .map_err(|e| anyhow!("opencl: get_all_devices failed: {:?}", e))?;
         if devices.is_empty() {
             bail!("opencl: no GPU devices found");
         }
-        let device = Device::new(devices[0]);
+        if device_index >= devices.len() {
+            bail!(
+                "opencl: no GPU at --device {} (found {} OpenCL GPU(s): valid indices 0..={})",
+                device_index,
+                devices.len(),
+                devices.len() - 1
+            );
+        }
+        let device = Device::new(devices[device_index]);
         let name = device.name().unwrap_or_default();
         tracing::info!("opencl device: {}", name);
 

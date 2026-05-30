@@ -82,8 +82,14 @@ struct PipeRes {
 }
 
 impl CudaBackend {
-    pub fn new(blocks: u32, threads_per_block: u32, nonces_per_thread: u32) -> Result<Self> {
-        let ctx = CudaContext::new(0).map_err(|e| anyhow!("cuda: open device 0 failed: {}", e))?;
+    pub fn new(
+        device_index: usize,
+        blocks: u32,
+        threads_per_block: u32,
+        nonces_per_thread: u32,
+    ) -> Result<Self> {
+        let ctx = CudaContext::new(device_index)
+            .map_err(|e| anyhow!("cuda: open device {} failed: {}", device_index, e))?;
         let name = ctx.name().unwrap_or_else(|_| "<unknown>".into());
         tracing::info!("cuda device: {}", name);
 
