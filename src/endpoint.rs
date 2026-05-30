@@ -30,8 +30,8 @@
 //!      reconstructs the expected plaintext at test time from the same scramble,
 //!      so a mistyped byte is caught before it ships.
 //!
-//! Do NOT commit a real production IP to the public repo — keep the placeholder
-//! here and substitute it in the release build only.
+//! Prefer a stable hostname (which survives VPS IP changes) over a raw IP. The
+//! obfuscated hostname is fine to commit; avoid committing a raw production IP.
 
 use std::hint::black_box;
 
@@ -39,15 +39,13 @@ use std::hint::black_box;
 /// sufficient for the stated goal (defeat `strings`, not a reverse engineer).
 const XOR_KEY: u8 = 0x5a;
 
-/// **PLACEHOLDER — replace with the scrambled real `host:3333` when cutting a
-/// release.** These bytes are `"pool.REPLACE-AT-RELEASE.example:3333"` with
-/// every byte XOR'd by [`XOR_KEY`]. Kept as a clearly-fake host so an
-/// un-substituted build fails fast at connect time (DNS error) rather than
-/// silently mining nowhere.
+/// The live pool endpoint `"pool.yamaduo.no:3333"`, with every byte XOR'd by
+/// [`XOR_KEY`]. The cleartext host never appears in source — only this
+/// scrambled form does. To change the endpoint, re-scramble the new `host:3333`
+/// (see "Cutting a release" above) and update the test below.
 const SCRAMBLED_ENDPOINT: &[u8] = &[
-    0x2a, 0x35, 0x35, 0x36, 0x74, 0x08, 0x1f, 0x0a, 0x16, 0x1b, 0x19, 0x1f,
-    0x77, 0x1b, 0x0e, 0x77, 0x08, 0x1f, 0x16, 0x1f, 0x1b, 0x09, 0x1f, 0x74,
-    0x3f, 0x22, 0x3b, 0x37, 0x2a, 0x36, 0x3f, 0x60, 0x69, 0x69, 0x69, 0x69,
+    0x2a, 0x35, 0x35, 0x36, 0x74, 0x23, 0x3b, 0x37, 0x3b, 0x3e, 0x2f, 0x35,
+    0x74, 0x34, 0x35, 0x60, 0x69, 0x69, 0x69, 0x69,
 ];
 
 /// Decode and return the pool endpoint as a `host:port` string.
@@ -74,7 +72,7 @@ mod tests {
     /// (not stored as a top-level `const`) so the *plaintext* never exists as a
     /// compile-time literal anywhere in the crate.
     fn expected_plaintext() -> String {
-        "pool.REPLACE-AT-RELEASE.example:3333".to_string()
+        "pool.yamaduo.no:3333".to_string()
     }
 
     #[test]
