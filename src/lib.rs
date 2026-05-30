@@ -27,10 +27,9 @@ pub mod selftest;
 pub mod sha256d_cpu;
 pub mod stratum;
 
-/// Compatibility shim: the work-template/submission types used to live in a
-/// sibling `csd-consensus` crate. They are now vendored into
-/// [`consensus_types`]; this alias keeps the original `csd_consensus::Type`
-/// import paths working unchanged across the codebase.
+/// Compatibility shim: re-exports the vendored [`consensus_types`] under the
+/// `csd_consensus` path, so `csd_consensus::Type` import paths keep working
+/// unchanged across the codebase.
 pub mod csd_consensus {
     pub use crate::consensus_types::*;
 }

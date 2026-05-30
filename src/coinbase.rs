@@ -1,6 +1,6 @@
 //! Coinbase tx encoding helpers.
 //!
-//! The node's `/work/get` response splits the coinbase tx into:
+//! The work template splits the coinbase tx into:
 //!     coinbase_prefix || extranonce_le[8] || coinbase_suffix
 //!
 //! The miner mutates only the 8 extranonce bytes, so:

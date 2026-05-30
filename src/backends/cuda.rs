@@ -99,8 +99,8 @@ impl CudaBackend {
         ctx.set_blocking_synchronize()
             .map_err(|e| anyhow!("cuda: set_blocking_synchronize failed: {}", e))?;
 
-        // iter-22: compute_75 -> compute_120 (Blackwell native).
-        // iter-23 (F): add NVRTC pass-through flags --maxrregcount=64 and
+        // compute_75 -> compute_120 (Blackwell native).
+        // Add NVRTC pass-through flags --maxrregcount=64 and
         // --use_fast_math. The first lets ptxas use up to 64 registers per
         // thread before spilling to local memory (default cap is often
         // lower on Blackwell); SHA-256 has ~80 hot u32 working values, so

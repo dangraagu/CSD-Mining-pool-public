@@ -66,8 +66,8 @@ struct Cli {
     #[arg(long, default_value_t = 4096)]
     nonces_per_thread: u32,
 
-    /// iter-31 dual mining: CPU worker threads to run alongside the GPU
-    /// backend. 0 disables CPU mining (GPU-only, like pre-iter-31).
+    /// Dual mining: CPU worker threads to run alongside the GPU
+    /// backend. 0 disables CPU mining (GPU-only).
     /// Range 0..num_cpus. Each worker uses SHA-NI via sha2::compress256.
     /// Presets:  light=6   mid=8   heavy=16
     /// Modern desktop CPUs sustain ~115 MH/s per thread, so 16 threads ≈
@@ -75,7 +75,7 @@ struct Cli {
     #[arg(long, default_value_t = 16)]
     cpu_threads: usize,
 
-    /// iter-31 dual mining: fraction of the per-template nonce range the
+    /// Dual mining: fraction of the per-template nonce range the
     /// CPU pool sweeps (0.0..=1.0). GPU takes the rest. Default 0.4 maps
     /// roughly to "CPU+GPU finish their slices in similar wall time" for
     /// a 16-thread CPU + 3+ GH/s GPU. 0.0 disables CPU mining.
@@ -162,7 +162,7 @@ fn cpu_hashing_threads(cli: &Cli) -> usize {
     avail.saturating_sub(cli.reserve).max(1)
 }
 
-/// iter-31: build the dual-mining MiningConfig from CLI flags.
+/// Build the dual-mining MiningConfig from CLI flags.
 ///
 /// When a GPU backend is active, `--cpu-threads`/`--cpu-share` directly
 /// drive the in-loop CPU worker pool that races the GPU per launch. When the
@@ -254,12 +254,16 @@ fn main() -> Result<()> {
                 "backend=opencl (forced) blocks={} tpb={} npt={} - trying init...",
                 cli.blocks, cli.threads_per_block, cli.nonces_per_thread,
             );
-            let b = match OpenclBackend::new(cli.blocks, cli.threads_per_block, cli.nonces_per_thread) {
-                Ok(b) => b,
-                Err(e) => {
+            let init = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                OpenclBackend::new(cli.blocks, cli.threads_per_block, cli.nonces_per_thread)
+            }));
+            let b = match init {
+                Ok(Ok(b)) => b,
+                Ok(Err(e)) => {
                     tracing::error!("opencl init failed: {}", e);
                     bail!("opencl init failed: {}", e);
                 }
+                Err(_) => bail!("opencl init panicked; try --backend cpu"),
             };
             tracing::info!(
                 "backend=opencl ready (geom={}x{}x{} = {} nonces/launch, 2-queue pipelined)",
@@ -277,12 +281,21 @@ fn main() -> Result<()> {
                 "backend=cuda (forced) blocks={} tpb={} npt={} - trying init...",
                 cli.blocks, cli.threads_per_block, cli.nonces_per_thread,
             );
-            let b = match CudaBackend::new(cli.blocks, cli.threads_per_block, cli.nonces_per_thread) {
-                Ok(b) => b,
-                Err(e) => {
+            // cudarc can panic (not just return Err) on a CUDA-toolkit/NVRTC
+            // version mismatch; catch it so we exit with a clear message
+            // instead of an unwinding backtrace.
+            let init = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                CudaBackend::new(cli.blocks, cli.threads_per_block, cli.nonces_per_thread)
+            }));
+            let b = match init {
+                Ok(Ok(b)) => b,
+                Ok(Err(e)) => {
                     tracing::error!("cuda init failed: {}", e);
                     bail!("cuda init failed: {}", e);
                 }
+                Err(_) => bail!(
+                    "cuda init panicked (likely a cudarc/NVRTC vs CUDA-toolkit mismatch); try --backend opencl or --backend cpu"
+                ),
             };
             tracing::info!(
                 "backend=cuda ready (geom={}x{}x{} = {} nonces/launch, 2-stream pipelined)",
@@ -451,15 +464,12 @@ fn print_devices() -> Result<()> {
     Ok(())
 }
 
-/// Minimal ctrl-c handler so we don't pull in a dedicated crate.
-fn ctrlc_lite<F: FnOnce() + Send + 'static>(handler: F) {
-    use std::sync::Mutex;
-    let h = Arc::new(Mutex::new(Some(handler)));
-    let h_thread = h.clone();
-    std::thread::spawn(move || {
-        let _ = h_thread;
-    });
-    let _ = h;
+/// Install a Ctrl-C handler that runs `handler` (which sets the stop flag) on
+/// interrupt, so the miner shuts down cleanly instead of being hard-killed.
+fn ctrlc_lite<F: Fn() + Send + 'static>(handler: F) {
+    if let Err(e) = ctrlc::set_handler(move || handler()) {
+        tracing::warn!("could not install ctrl-c handler ({e}); Ctrl-C will hard-stop");
+    }
 }
 
 #[cfg(test)]

@@ -56,7 +56,7 @@ impl OpenclBackend {
         // `create_default_with_properties` (CL_VERSION_2_0). Migration would
         // change the queue-size semantics and risk perturbing a verified hot
         // path; keep the legacy API and silence the warning until we have a
-        // tested migration path. See iter-23..28 SESSION_HANDOFF notes.
+        // tested migration path.
         #[allow(deprecated)]
         let queue_a = CommandQueue::create_default(&context, CL_QUEUE_PROFILING_ENABLE)
             .map_err(|e| anyhow!("opencl: create queue_a failed: {:?}", e))?;
@@ -215,7 +215,7 @@ impl MiningBackend for OpenclBackend {
             };
             if let Some(res) = drain_result {
                 // Drain the other pipe too so its in-flight work doesn't
-                // race with the next /work/get.
+                // race with the next job.
                 let (other, oqueue) = pick_pipe(&mut a, &mut b, current_pipe ^ 1, &self.queue_a, &self.queue_b);
                 if other.in_flight {
                     let _ = drain_pipe(oqueue, other);

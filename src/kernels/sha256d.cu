@@ -20,7 +20,7 @@
 // shifts + or into a single instruction. About 3 cycles vs. 5 for a
 // scalar rotation.
 //
-// iter-28 (G — Blackwell sm_120 touch-up):
+// Blackwell sm_120 notes:
 //   After a careful read of this kernel, the existing structure is already
 //   close to optimal for per-nonce sha256d on sm_120: midstate/K/tail all
 //   live in registers or __constant__ memory; `__funnelshift_r` is used
@@ -55,7 +55,7 @@ __device__ __forceinline__ unsigned int ROTR_FUNNEL(unsigned int x, unsigned int
 
 #define ROTR(x, n) ROTR_FUNNEL((x), (n))
 
-// iter-28: __byte_perm(x, 0, 0x0123) reverses the bytes of x (BE<->LE).
+// __byte_perm(x, 0, 0x0123) reverses the bytes of x (BE<->LE).
 // Selector 0x0123 picks bytes [3,2,1,0] from the low 32 bits of (x|0<<32)
 // which is exactly the BE-byte-swap of x.
 //   __byte_perm(x, 0, 0x0123) ==
@@ -143,7 +143,7 @@ __device__ __forceinline__ bool try_one_nonce(
     w[3] = w3_bits;
     // Bytes 16..20 of the second block = nonce in LE byte order, packed BE
     // into a 32-bit word — i.e. a 32-bit byte-reverse of the nonce.
-    // iter-28: BSWAP32 (__byte_perm) replaces the 7-op mask/shift/OR chain
+    // BSWAP32 (__byte_perm) replaces the 7-op mask/shift/OR chain
     // with one PRMT instruction. Hot path — runs once per try_one_nonce.
     w[4] = BSWAP32(nonce);
     w[5] = 0x80000000u;
@@ -192,7 +192,7 @@ __global__ void mine_sha256d(
     unsigned int *found_hash             // 8 words
 ) {
     // Cache target as BE-packed words once per thread.
-    // iter-28: keep the explicit byte-by-byte pack here (not BSWAP32) — the
+    // keep the explicit byte-by-byte pack here (not BSWAP32) — the
     // input is `const unsigned char *target_be` and the alignment is not
     // guaranteed, so reading it as a u32* and bswap'ing would risk a
     // misaligned global load. Per-thread, runs once, not in the hot loop.

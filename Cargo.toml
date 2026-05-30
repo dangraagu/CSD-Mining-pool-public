@@ -42,6 +42,7 @@ clap        = { version = "4.5", features = ["derive"] }
 tracing     = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender   = "0.2"
+ctrlc       = "3"
 
 # Optional GPU backends. Both link/compile their kernels at runtime, so the
 # default CPU-only build does not require any GPU toolchain on the build host.

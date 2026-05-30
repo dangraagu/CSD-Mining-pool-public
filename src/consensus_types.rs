@@ -1,13 +1,12 @@
 //! Vendored consensus types.
 //!
-//! These types are lifted verbatim from the `csd-consensus` crate of the
-//! Compute Substrate v2 workspace so that this miner builds as a fully
-//! standalone single crate (no path dependency on the private workspace).
+//! These types model the CSD consensus wire format. They are vendored here so
+//! the miner builds as a fully standalone single crate.
 //!
 //! CONSENSUS WARNING: every byte layout here is wire-visible and must match
-//! the node exactly. Do not reorder fields, change integer widths, or touch
-//! encoded forms — doing so changes the wire protocol the node speaks on
-//! `/work/get` and `/work/submit`.
+//! the network exactly. Do not reorder fields, change integer widths, or touch
+//! encoded forms — doing so changes the consensus wire protocol and would
+//! break compatibility.
 //!
 //! Scope: only the symbols the miner actually consumes are vendored —
 //! `Hash32`, `WorkTemplate`, `WorkSubmission`, `HexHash32`, and the two
@@ -21,10 +20,10 @@ use serde::{Deserialize, Serialize};
 /// 32-byte hash, big-endian on the wire (matches header serialization).
 pub type Hash32 = [u8; 32];
 
-/// A single work unit served to a miner by the node's `/work/get` endpoint.
+/// A single work unit served to a miner.
 ///
-/// Fields are JSON-friendly so the same struct is returned by the node over
-/// the wire and consumed here directly.
+/// Fields are JSON-friendly so the same struct is sent over the wire and
+/// consumed here directly.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkTemplate {
     /// Monotonic id; the miner echoes it on submit so the node can detect
@@ -67,7 +66,7 @@ pub struct WorkTemplate {
     pub height: u64,
 }
 
-/// Same-shape submission payload sent by miners to `/work/submit`.
+/// Same-shape submission payload sent by miners.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkSubmission {
     pub id: u64,
