@@ -105,6 +105,12 @@ struct Handshake {
     reader: BufReader<TcpStream>,
     write_stream: TcpStream,
     subscribe: SubscribeResult,
+    /// Push frames (notify/set_difficulty) the bridge bunched in BEFORE the
+    /// authorize reply, consumed by the handshake loop. Replayed through
+    /// `dispatch_frame` once `Shared` exists so the first job/difficulty isn't
+    /// lost. (Pushes that arrive AFTER the authorize reply stay buffered in
+    /// `reader` and are handled by the reader thread directly.)
+    early_pushes: Vec<String>,
 }
 
 impl StratumClient {
@@ -130,6 +136,14 @@ impl StratumClient {
         // early pushes already in its buffer aren't lost); the writer mutex
         // takes the separate write-side clone of the same socket.
         let writer = Arc::new(Mutex::new(hs.write_stream));
+
+        // Replay pushes the bridge sent before the authorize reply (consumed by
+        // the handshake loop). Done now that `shared` exists and before the
+        // reader thread starts, so the first job/difficulty is available
+        // immediately instead of waiting for the next push.
+        for push in &hs.early_pushes {
+            dispatch_frame(push, &shared);
+        }
 
         let reader = Self::spawn_reader(
             endpoint.to_string(),
@@ -202,6 +216,14 @@ impl StratumClient {
         // push before the authorize reply, so match on `id` rather than order.
         let mut subscribe: Option<SubscribeResult> = None;
         let mut authorized: Option<bool> = None;
+        // Pushes the bridge interleaves before the authorize reply. We must NOT
+        // drop them: the real bridge sends the first set_difficulty + notify
+        // right after the subscribe result, i.e. before the id=2 reply we are
+        // still waiting for here. Captured raw and replayed via `dispatch_frame`
+        // once `Shared` exists (see connect/reconnect), so the first job isn't
+        // lost (which manifested as the miner hanging on "waiting for first
+        // mining.notify").
+        let mut early_pushes: Vec<String> = Vec::new();
 
         let mut line = String::new();
         while subscribe.is_none() || authorized.is_none() {
@@ -219,10 +241,13 @@ impl StratumClient {
 
             // Responses to our calls carry our id (1 = subscribe, 2 =
             // authorize). Pushes (notify/set_difficulty) have id:null and a
-            // `method`; ignore them during the handshake.
+            // `method`; capture them for replay rather than dropping them.
             let resp: Response = match serde_json::from_str(trimmed) {
                 Ok(r) => r,
-                Err(_) => continue, // not a response frame (e.g. a push)
+                Err(_) => {
+                    early_pushes.push(trimmed.to_string()); // a push frame, not a response
+                    continue;
+                }
             };
             match resp.id {
                 Some(1) => {
@@ -241,7 +266,10 @@ impl StratumClient {
                     }
                     authorized = Some(resp.result.as_bool().unwrap_or(false));
                 }
-                _ => continue,
+                _ => {
+                    early_pushes.push(trimmed.to_string()); // id:null push interleaved in
+                    continue;
+                }
             }
         }
 
@@ -256,6 +284,7 @@ impl StratumClient {
             reader,
             write_stream: writer,
             subscribe,
+            early_pushes,
         })
     }
 
@@ -501,6 +530,13 @@ fn reconnect(
                     .extranonce2_size
                     .store(hs.subscribe.extranonce2_size as u64, Ordering::Relaxed);
 
+                // Replay pushes bunched in before the authorize reply (consumed
+                // by the handshake), so a reconnect re-seeds the current
+                // job/difficulty immediately too.
+                for push in &hs.early_pushes {
+                    dispatch_frame(push, shared);
+                }
+
                 // Install the new socket: the reader continues from the fresh
                 // handshake's buffered reader (preserving any early pushes), and
                 // the shared writer is swapped to the new write-side stream.
@@ -654,6 +690,65 @@ mod tests {
         assert_eq!(client.current_difficulty(), 512.0);
 
         drop(client); // triggers reader shutdown + join
+        let _ = server.join();
+    }
+
+    /// Regression test for the "waiting for first mining.notify" hang.
+    ///
+    /// The real bridge bunches `subscribe-result -> set_difficulty -> notify`
+    /// and sends the first notify BEFORE the authorize reply. The handshake
+    /// loop reads those pushes while still waiting for the id=2 response, so it
+    /// must CAPTURE them (not discard) — otherwise the first job is lost and the
+    /// miner waits forever for a notify that already arrived.
+    #[test]
+    fn connect_captures_early_notify_sent_before_authorize_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut br = BufReader::new(sock.try_clone().unwrap());
+            let mut req_line = String::new();
+            br.read_line(&mut req_line).unwrap(); // subscribe
+            req_line.clear();
+            br.read_line(&mut req_line).unwrap(); // authorize
+
+            // Real-bridge order: subscribe result, THEN set_difficulty + notify,
+            // THEN the authorize reply LAST. The pushes land while the handshake
+            // loop is still waiting for the id=2 authorize response.
+            sock.write_all(
+                b"{\"id\":1,\"result\":[[[\"mining.notify\",\"1\"]],\"abcd1234\",4],\"error\":null}\n",
+            )
+            .unwrap();
+            sock.write_all(b"{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":[512.0]}\n")
+                .unwrap();
+            sock.write_all(
+                b"{\"id\":null,\"method\":\"mining.notify\",\"params\":[\"earlyjob\",\"00ff\",\"aa\",\"bb\",[\"cc\"],\"01000000\",\"1d00ffff\",\"60c0babe\",true]}\n",
+            )
+            .unwrap();
+            sock.write_all(b"{\"id\":2,\"result\":true,\"error\":null}\n")
+                .unwrap();
+            sock.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+        });
+
+        let client =
+            StratumClient::connect(&addr.to_string(), "csd1testaddr").expect("connect ok");
+
+        // The early notify (sent before the authorize reply) must be surfaced.
+        let mut job = None;
+        for _ in 0..50 {
+            if let Some(j) = client.latest_job() {
+                job = Some(j);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let job = job.expect("early notify (pre-authorize) must be surfaced, not discarded");
+        assert_eq!(job.notify.job_id, "earlyjob");
+        assert_eq!(client.current_difficulty(), 512.0);
+
+        drop(client);
         let _ = server.join();
     }
 }
