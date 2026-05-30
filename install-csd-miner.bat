@@ -28,7 +28,9 @@ echo(
 REM --- 1. Pick the build variant (arg overrides auto-detect) ---
 set "VARIANT=%~1"
 if not defined VARIANT (
-  for /f "usebackq delims=" %%i in (`powershell -NoProfile -Command "$n=(Get-CimInstance Win32_VideoController ^| Select-Object -ExpandProperty Name) -join ','; if ($n -match 'NVIDIA'){'nvidia'} elseif ($n -match 'AMD^|Radeon'){'amd'} else {'cpu'}"`) do set "VARIANT=%%i"
+  REM Pipe-free PowerShell (no '|' to mis-escape inside the for/f backticks):
+  REM use .Name instead of "| Select-Object" and "-or" instead of the regex "|".
+  for /f "usebackq delims=" %%i in (`powershell -NoProfile -Command "$n=((Get-CimInstance Win32_VideoController).Name -join ','); if ($n -match 'NVIDIA'){'nvidia'} elseif ($n -match 'AMD' -or $n -match 'Radeon'){'amd'} else {'cpu'}"`) do set "VARIANT=%%i"
 )
 if not defined VARIANT set "VARIANT=cpu"
 echo Selected build: %VARIANT%
