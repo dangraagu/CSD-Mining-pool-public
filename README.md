@@ -7,6 +7,9 @@ AMD) or falling back to CPU.
 It connects to the pool **by default**: there is no server/pool flag to set. The
 only thing you have to provide is your addr20 (a 40-hex CSD payout address).
 
+Discord channel for mining stats, updates and support/improvements:
+https://discord.gg/Gr9gCjzC9e
+
 ## Install (Windows — one click)
 
 Easiest path — no toolchain, no manual download:
