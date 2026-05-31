@@ -39,7 +39,7 @@ REM --- 2. payout address (reuse the saved one, else prompt) ---
 set "ADDR="
 if exist "%CFG%" set /p ADDR=<"%CFG%"
 if not defined ADDR (
-  set /p ADDR=Enter your csd1 payout address ^(40 hex^):
+  set /p ADDR=Enter your addr20 payout address ^(40 hex^):
   > "%CFG%" echo !ADDR!
 )
 if not defined ADDR ( echo [X] No address entered. & pause & exit /b 1 )

@@ -166,7 +166,7 @@ pub fn subscribe_request(id: u64) -> Request {
     }
 }
 
-/// Build a `mining.authorize` request: `["<csd1 address>", "x"]`. The password
+/// Build a `mining.authorize` request: `["<addr20>", "x"]`. The password
 /// field is the conventional placeholder `"x"` (the bridge only checks the
 /// worker address).
 pub fn authorize_request(id: u64, worker: &str) -> Request {

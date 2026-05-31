@@ -3,7 +3,7 @@
 //! The public build mines to the CSD pool by default: it connects to the
 //! compiled-in pool endpoint (see [`csd_gpu_miner::endpoint`]) over Stratum v1.
 //! There is intentionally **no** node/pool override flag — the only required
-//! argument is `--address`, your csd1 payout address.
+//! argument is `--address`, your addr20 payout address.
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -31,7 +31,7 @@ use csd_gpu_miner::backends::cuda::CudaBackend;
     about = "Standalone pool miner for Compute Substrate (mines to the CSD pool)."
 )]
 struct Cli {
-    /// Your csd1 payout address (the pool credits shares to this address).
+    /// Your addr20 payout address (the pool credits shares to this address).
     /// Required. Accepts 40 lowercase hex chars, optionally `0x`-prefixed (42).
     #[arg(long)]
     address: String,
@@ -97,7 +97,7 @@ struct Cli {
     cmd: Option<Cmd>,
 }
 
-/// Validate a csd1 payout address and return its canonical 40-lowercase-hex
+/// Validate an addr20 payout address and return its canonical 40-lowercase-hex
 /// form (the `0x` prefix, if present, is stripped). Accepts exactly 40
 /// lowercase hex chars, or 42 chars when `0x`-prefixed. Rejects wrong length,
 /// uppercase, and any non-hex character.
@@ -516,7 +516,7 @@ mod tests {
 
     #[test]
     fn rejects_uppercase() {
-        // Uppercase hex is rejected (csd1 addresses are lowercase hex).
+        // Uppercase hex is rejected (addr20 addresses are lowercase hex).
         assert!(validate_address("0123456789ABCDEF0123456789abcdef01234567").is_err());
     }
 }

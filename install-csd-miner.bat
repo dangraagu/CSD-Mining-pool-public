@@ -9,7 +9,7 @@ REM  Double-click. It will:
 REM    1. Detect your GPU (NVIDIA / AMD) or fall back to CPU.
 REM    2. Install the Microsoft VC++ runtime via winget if missing.
 REM    3. Download the matching prebuilt miner from GitHub Releases.
-REM    4. Ask for your csd1 payout address once (and remember it).
+REM    4. Ask for your addr20 payout address once (and remember it).
 REM    5. Start mining to the pool.
 REM  Override detection:  install-csd-miner.bat nvidia ^| amd ^| cpu
 REM  GPU drivers are NOT installed here - the GPU builds need your
@@ -84,18 +84,18 @@ if !errorlevel!==0 (
 echo   - mine-all-gpus.bat  = mine on ALL GPUs at once
 echo   - mine-auto.bat      = all GPUs + auto-update (recommended for 24/7)
 
-REM --- 4. csd1 payout address: prompt once, remember thereafter ---
+REM --- 4. addr20 payout address: prompt once, remember thereafter ---
 set "ADDR="
 if exist "%CFG%" set /p ADDR=<"%CFG%"
 if not defined ADDR (
   echo(
-  echo Enter YOUR csd1 payout address ^(40 hex characters^) - where the
+  echo Enter YOUR addr20 payout address ^(40 hex characters^) - where the
   echo pool sends your mining rewards:
   set /p ADDR=^>
   > "%CFG%" echo !ADDR!
 )
 if not defined ADDR (
-  echo [X] No address entered. Re-run and provide your csd1 address.
+  echo [X] No address entered. Re-run and provide your addr20.
   pause
   exit /b 1
 )

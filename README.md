@@ -5,7 +5,7 @@ payout address and it mines to the CSD pool — auto-detecting your GPU (NVIDIA 
 AMD) or falling back to CPU.
 
 It connects to the pool **by default**: there is no server/pool flag to set. The
-only thing you have to provide is your csd1 address.
+only thing you have to provide is your addr20 (a 40-hex CSD payout address).
 
 ## Install (Windows — one click)
 
@@ -16,7 +16,7 @@ Easiest path — no toolchain, no manual download:
 
 It auto-detects your GPU (NVIDIA / AMD, else CPU), installs the VC++ runtime via
 `winget` if needed, downloads the matching prebuilt binary from the latest
-GitHub Release, asks for your csd1 payout address the first time (and remembers
+GitHub Release, asks for your addr20 payout address the first time (and remembers
 it), then starts mining. To force a build: `install-csd-miner.bat nvidia|amd|cpu`.
 
 Prefer to run the binary yourself? Grab the matching
@@ -40,24 +40,24 @@ with the matching feature (see [Building](#building)).
 ## Quick start
 
 ```sh
-csd-pool-miner --address <YOUR_CSD1_ADDRESS>
+csd-pool-miner --address <YOUR_ADDR20>
 ```
 
 That's it. The miner will:
 
 1. auto-detect the best backend (tries CUDA → OpenCL → CPU),
 2. connect to the CSD pool,
-3. start submitting shares for `<YOUR_CSD1_ADDRESS>`.
+3. start submitting shares for `<YOUR_ADDR20>`.
 
 ### Choosing a backend
 
 Auto-detect is the default. To force one:
 
 ```sh
-csd-pool-miner --address <YOUR_CSD1_ADDRESS> --backend auto    # default: cuda -> opencl -> cpu
-csd-pool-miner --address <YOUR_CSD1_ADDRESS> --backend cuda     # NVIDIA
-csd-pool-miner --address <YOUR_CSD1_ADDRESS> --backend opencl   # AMD / other
-csd-pool-miner --address <YOUR_CSD1_ADDRESS> --backend cpu      # CPU only
+csd-pool-miner --address <YOUR_ADDR20> --backend auto    # default: cuda -> opencl -> cpu
+csd-pool-miner --address <YOUR_ADDR20> --backend cuda     # NVIDIA
+csd-pool-miner --address <YOUR_ADDR20> --backend opencl   # AMD / other
+csd-pool-miner --address <YOUR_ADDR20> --backend cpu      # CPU only
 ```
 
 ### Useful extras
@@ -74,9 +74,9 @@ shares accrue continuously; the pool settles all eligible miners together once a
 hour, so you won't see a payout the instant you find a share — wait for the next
 :00 settlement.
 
-## Where to get a csd1 address
+## Where to get an addr20
 
-`--address` is your CSD payout address: **40 lowercase hex characters** (an
+`--address` is your **addr20** — your CSD payout address: **40 lowercase hex characters** (an
 optional `0x` prefix is accepted). Create one with your CSD node/wallet — it's
 the same address you'd receive coinbase rewards on when solo mining. Anything
 that isn't 40 hex chars is rejected at startup with a clear error.
