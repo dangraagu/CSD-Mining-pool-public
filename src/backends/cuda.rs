@@ -1,6 +1,9 @@
 //! CUDA mining backend — 2-stream pipelined.
 //!
-//! NVRTC JIT-compiles `sha256d.cu` at startup. Two CUDA streams alternate
+//! A pre-built PTX (`sha256d.ptx`, compiled offline from `sha256d.cu`) is loaded
+//! via the driver's JIT (`cuModuleLoadData`) at startup — NVRTC is never invoked,
+//! so only the NVIDIA driver is needed at runtime (no CUDA Toolkit). Two CUDA
+//! streams alternate
 //! kernel launches; while one stream is hashing the host reads back the
 //! other stream's prior flag and decides whether to stop. The kernel
 //! itself sweeps `nonces_per_thread` nonces per work-item.
@@ -28,12 +31,17 @@ use anyhow::{anyhow, Result};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
-use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
+use cudarc::nvrtc::Ptx;
 
 use crate::backend::{MiningBackend, MiningResult};
 use crate::sha256d_cpu::midstate_of_first_chunk_fast as midstate_of_first_chunk;
 
-const KERNEL_SRC: &str = include_str!("../kernels/sha256d.cu");
+// CUDA kernel, pre-compiled to PTX *offline* (nvcc -ptx -arch=compute_75
+// -maxrregcount=64 --use_fast_math; see scripts/build-ptx). We embed the PTX and
+// let the NVIDIA driver JIT it to SASS at module-load time, so the CUDA backend
+// needs ONLY the NVIDIA driver at runtime — NOT the CUDA Toolkit / nvrtc shared
+// library. Regenerate sha256d.ptx with scripts/build-ptx after editing the .cu.
+const KERNEL_PTX: &str = include_str!("../kernels/sha256d.ptx");
 const KERNEL_NAME: &str = "mine_sha256d";
 
 pub struct CudaBackend {
@@ -105,21 +113,16 @@ impl CudaBackend {
         ctx.set_blocking_synchronize()
             .map_err(|e| anyhow!("cuda: set_blocking_synchronize failed: {}", e))?;
 
-        // Target compute_75 (Turing) as the NVRTC virtual arch. The resulting
-        // PTX runs on EVERY CUDA 13-supported NVIDIA GPU (Turing through
-        // Blackwell) via the driver's forward JIT, so this one public binary
-        // works across miners' cards. Targeting a generation-specific arch
-        // (e.g. compute_120 / Blackwell) only ran on that exact generation and
-        // silently fell back to CPU on every other card.
-        // --maxrregcount=64 lets ptxas use up to 64 registers per thread before
-        // spilling; --use_fast_math is safe for the all-integer SHA-256 kernel.
-        let opts = CompileOptions {
-            arch: Some("compute_75"),
-            options: vec!["--maxrregcount=64".into(), "--use_fast_math".into()],
-            ..Default::default()
-        };
-        let ptx = compile_ptx_with_opts(KERNEL_SRC, opts)
-            .map_err(|e| anyhow!("nvrtc compile failed: {}", e))?;
+        // Load the pre-compiled PTX (embedded as `KERNEL_PTX`) and hand it to the
+        // driver's built-in PTX->SASS JIT. The PTX targets the compute_75 (Turing)
+        // virtual arch, so the driver forward-JITs it onto EVERY CUDA-13-supported
+        // NVIDIA GPU (Turing through Blackwell) — this one public binary works
+        // across miners' cards. Crucially, loading pre-built PTX uses ONLY the
+        // driver (cuModuleLoadData); it never touches NVRTC, so no CUDA Toolkit /
+        // nvrtc shared library is needed at runtime. (The previous code
+        // NVRTC-compiled the kernel at startup and silently fell back to CPU on
+        // any miner without nvrtc.dll / libnvrtc — the reported "full CPU load" bug.)
+        let ptx = Ptx::from_src(KERNEL_PTX);
         let module = ctx
             .load_module(ptx)
             .map_err(|e| anyhow!("cuda: load_module failed: {}", e))?;

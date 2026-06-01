@@ -1,15 +1,15 @@
 name: release
 
-# Builds the Windows miner binaries and publishes them to a GitHub Release.
+# Builds the Windows + Linux miner binaries and publishes them to a GitHub Release.
 #
 # Triggers:
 #   * push a tag  v*   -> build all variants AND publish them to the release
 #   * workflow_dispatch -> build only (smoke-test that everything compiles)
 #
-# Assets produced (consumed by install-csd-miner.bat):
-#   csd-pool-miner-cpu.exe      (always; no GPU deps, runs anywhere)
-#   csd-pool-miner-nvidia.exe   (CUDA; best-effort)
-#   csd-pool-miner-amd.exe      (OpenCL; best-effort)
+# Assets produced (consumed by install-csd-miner.bat / install-csd-miner.sh):
+#   csd-pool-miner-cpu.exe    / csd-pool-miner-linux-cpu     (always; no GPU deps)
+#   csd-pool-miner-nvidia.exe / csd-pool-miner-linux-nvidia  (CUDA; best-effort)
+#   csd-pool-miner-amd.exe    / csd-pool-miner-linux-amd     (OpenCL; best-effort)
 #
 # NOTE for the operator: before tagging a REAL release, set the pool endpoint in
 # src/endpoint.rs (it ships as a placeholder).
@@ -71,6 +71,51 @@ jobs:
       - name: List built artifacts
         shell: pwsh
         run: Get-ChildItem dist
+
+      - name: Publish to GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: false
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Prepare dist folder
+        run: mkdir -p dist
+
+      - name: Build CPU (always works, no GPU deps)
+        run: |
+          cargo build --release
+          cp target/release/csd-gpu-miner dist/csd-pool-miner-linux-cpu
+
+      # NVIDIA: the CUDA backend embeds a pre-built PTX and JITs it via the driver,
+      # so this build needs NO CUDA Toolkit on the runner (cudarc dlopens the driver
+      # at runtime; the PTX is committed). continue-on-error keeps CPU shipping.
+      - name: Build NVIDIA (cuda)
+        continue-on-error: true
+        run: |
+          cargo build --release --features cuda
+          cp target/release/csd-gpu-miner dist/csd-pool-miner-linux-nvidia
+
+      - name: Install OpenCL loader + headers (for the AMD build)
+        continue-on-error: true
+        run: sudo apt-get update && sudo apt-get install -y ocl-icd-opencl-dev
+
+      - name: Build AMD (opencl)
+        continue-on-error: true
+        run: |
+          cargo build --release --features opencl
+          cp target/release/csd-gpu-miner dist/csd-pool-miner-linux-amd
+
+      - name: List built artifacts
+        run: ls -la dist
 
       - name: Publish to GitHub Release (tags only)
         if: startsWith(github.ref, 'refs/tags/')

@@ -44,8 +44,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender   = "0.2"
 ctrlc       = "3"
 
-# Optional GPU backends. Both link/compile their kernels at runtime, so the
-# default CPU-only build does not require any GPU toolchain on the build host.
+# Optional GPU backends; the default CPU-only build pulls in neither, and neither
+# needs a GPU toolchain on the BUILD host. CUDA embeds a pre-built PTX (see
+# src/backends/cuda.rs) and JITs it via the NVIDIA driver at runtime — never via
+# NVRTC — so only the driver is required at runtime, no CUDA Toolkit. The `nvrtc`
+# feature stays ONLY because cudarc's `Ptx` type (consumed by `load_module`) lives
+# behind it; the NVRTC compiler itself is never invoked.
 cudarc      = { version = "0.19", features = ["cuda-13020", "driver", "nvrtc"], optional = true }
 opencl3     = { version = "0.9", optional = true }
 

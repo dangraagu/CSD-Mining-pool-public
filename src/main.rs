@@ -288,9 +288,9 @@ fn main() -> Result<()> {
                 "backend=cuda (forced) blocks={} tpb={} npt={} - trying init...",
                 cli.blocks, cli.threads_per_block, cli.nonces_per_thread,
             );
-            // cudarc can panic (not just return Err) on a CUDA-toolkit/NVRTC
-            // version mismatch; catch it so we exit with a clear message
-            // instead of an unwinding backtrace.
+            // cudarc can panic (not just return Err) on a low-level driver/context
+            // error during init; catch it so we exit with a clear message instead
+            // of an unwinding backtrace.
             let init = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 CudaBackend::new(cli.device, cli.blocks, cli.threads_per_block, cli.nonces_per_thread)
             }));
@@ -301,7 +301,7 @@ fn main() -> Result<()> {
                     bail!("cuda init failed: {}", e);
                 }
                 Err(_) => bail!(
-                    "cuda init panicked (likely a cudarc/NVRTC vs CUDA-toolkit mismatch); try --backend opencl or --backend cpu"
+                    "cuda init panicked (driver/context error during init); try --backend opencl or --backend cpu"
                 ),
             };
             tracing::info!(
@@ -323,11 +323,9 @@ fn main() -> Result<()> {
                     "auto: trying CUDA geom={}x{}x{}",
                     cli.blocks, cli.threads_per_block, cli.nonces_per_thread
                 );
-                // cudarc panics (rather than returning Err) when its
-                // hard-coded NVRTC dll name doesn't match the installed
-                // CUDA toolkit (e.g. CUDA 13 vs cudarc 0.11 looking for
-                // nvrtc64_122.dll). Catch the panic so `auto` can fall
-                // through to OpenCL.
+                // cudarc can panic (rather than return Err) on a low-level driver
+                // or context error during init. Catch the panic so `auto` can fall
+                // through to OpenCL instead of crashing.
                 let cuda_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     CudaBackend::new(cli.device, cli.blocks, cli.threads_per_block, cli.nonces_per_thread)
                 }));

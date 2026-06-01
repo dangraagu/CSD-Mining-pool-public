@@ -27,12 +27,37 @@ Prefer to run the binary yourself? Grab the matching
 [Releases](https://github.com/dangraagu/CSD-Mining-pool-public/releases/latest)
 and see [Quick start](#quick-start).
 
+## Install (Ubuntu / Linux — one command)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dangraagu/CSD-Mining-pool-public/main/install-csd-miner.sh | bash
+```
+
+Auto-detects your GPU (NVIDIA / AMD, else CPU), downloads the matching prebuilt
+binary from the latest GitHub Release, asks for your addr20 the first time (and
+remembers it under `~/.config/csd-pool-miner/`), then starts mining. Force a
+variant by passing it through: `… | bash -s -- nvidia|amd|cpu`.
+
+Piping into `bash` leaves no terminal to prompt on, so supply your addr20 in the
+environment (or as the 2nd arg) the first time:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dangraagu/CSD-Mining-pool-public/main/install-csd-miner.sh | CSD_ADDR=<YOUR_ADDR20> bash
+```
+
+Prefer to run it yourself? Download `csd-pool-miner-linux-<nvidia|amd|cpu>` from
+[Releases](https://github.com/dangraagu/CSD-Mining-pool-public/releases/latest),
+then `chmod +x csd-pool-miner-linux-<variant>` and run it with `--address
+<YOUR_ADDR20>`. For 24/7 rigs, `mine-all-gpus.sh` (every card) and `mine-auto.sh`
+(every card + auto-update) are fetched alongside the installer.
+
 ## Requirements
 
 One of:
 
-- **NVIDIA GPU** — recent NVIDIA driver (the CUDA backend links at runtime; no
-  toolkit install needed). Use a build with the `cuda` feature.
+- **NVIDIA GPU** — a recent NVIDIA driver is enough. The CUDA backend ships a
+  pre-built kernel (PTX) and JITs it through the driver, so **no CUDA Toolkit /
+  nvrtc is required**. Use a build with the `cuda` feature.
 - **AMD / other GPU** — an OpenCL driver/runtime for your card. Use a build with
   the `opencl` feature.
 - **CPU only** — no GPU or driver required; works out of the box.
