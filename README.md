@@ -125,10 +125,23 @@ hour, so you won't see a payout the instant you find a share — wait for the ne
 
 ## Where to get an addr20
 
-`--address` is your **addr20** — your CSD payout address: **40 lowercase hex characters** (an
-optional `0x` prefix is accepted). Create one with your CSD node/wallet — it's
-the same address you'd receive coinbase rewards on when solo mining. Anything
-that isn't 40 hex chars is rejected at startup with a clear error.
+`--address` is your **addr20** — your CSD payout address: **40 lowercase hex
+characters** (an optional `0x` prefix is accepted).
+
+**No address yet? Create a wallet in one step:**
+
+- **Windows** — download & double-click **`create-wallet.bat`**
+- **Linux** — `curl -fsSL https://raw.githubusercontent.com/dangraagu/CSD-Mining-pool-public/main/create-wallet.sh | bash`
+- **Already have the miner?** — `csd-pool-miner newwallet`
+
+It generates a fresh key locally, prints your **addr20**, and writes it (with the
+private key) to `csd-wallet.txt`. ⚠️ **Back up that file — losing the private key
+means losing access to any coins paid to the address.** The saved key imports into
+a full node with `csd wallet recover` when you want to spend.
+
+Already have a CSD node/wallet? Your existing address works too — it's the same
+one you'd receive coinbase on when solo mining. Anything that isn't 40 hex chars
+is rejected at startup with a clear error.
 
 ## Building
 

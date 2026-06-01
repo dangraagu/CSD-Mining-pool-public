@@ -1,6 +1,6 @@
 [package]
 name        = "csd-pool-miner"
-version     = "0.1.5"
+version     = "0.1.6"
 edition     = "2021"
 rust-version = "1.75"
 license     = "MIT OR Apache-2.0"
@@ -38,6 +38,12 @@ hex         = "0.4"
 sha2        = { version = "0.10", features = ["compress"] }
 rand        = "0.8"
 rand_chacha = "0.3"
+# Wallet keygen (`newwallet` subcommand). Versions pinned to MATCH the CSD chain
+# (compute-substrate) so addr20 derivation is byte-identical and spendable:
+#   addr20 = RIPEMD160(SHA256(compressed_secp256k1_pubkey)).
+# secp256k1 0.29 + ripemd 0.1 are exactly what the chain's Cargo.toml uses.
+secp256k1   = { version = "0.29", features = ["rand", "global-context"] }
+ripemd      = "0.1"
 humantime   = "2"
 clap        = { version = "4.5", features = ["derive"] }
 tracing     = "0.1"

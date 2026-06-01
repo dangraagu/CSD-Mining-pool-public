@@ -40,7 +40,11 @@ use crate::sha256d_cpu::midstate_of_first_chunk_fast as midstate_of_first_chunk;
 // -maxrregcount=64 --use_fast_math; see scripts/build-ptx). We embed the PTX and
 // let the NVIDIA driver JIT it to SASS at module-load time, so the CUDA backend
 // needs ONLY the NVIDIA driver at runtime — NOT the CUDA Toolkit / nvrtc shared
-// library. Regenerate sha256d.ptx with scripts/build-ptx after editing the .cu.
+// library. The PTX `.version` is pinned LOW (6.3, the sm_75 floor): a newer
+// toolkit stamps a too-new ISA that older drivers reject with
+// CUDA_ERROR_UNSUPPORTED_PTX_VERSION (→ silent CPU fallback). The kernel uses only
+// old integer ops, so 6.3 is valid and loads on any CUDA-10.0+ driver.
+// Regenerate sha256d.ptx with scripts/build-ptx after editing the .cu.
 const KERNEL_PTX: &str = include_str!("../kernels/sha256d.ptx");
 const KERNEL_NAME: &str = "mine_sha256d";
 

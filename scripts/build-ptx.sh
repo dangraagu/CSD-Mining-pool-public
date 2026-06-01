@@ -15,4 +15,13 @@ fi
 
 echo "Compiling kernel to PTX (arch=compute_75) ..."
 nvcc -ptx -arch=compute_75 -maxrregcount=64 --use_fast_math "$CU" -o "$PTX"
+
+# nvcc stamps the toolkit's PTX ISA into .version, which is too NEW for older
+# NVIDIA drivers (they reject it with CUDA_ERROR_UNSUPPORTED_PTX_VERSION and the
+# miner silently falls back to CPU). The SHA-256d kernel uses only old integer
+# instructions, so pin .version down to 6.3 (the sm_75 floor) for broad driver
+# compatibility. If you later edit the kernel and selftest shows the cuda backend
+# failing to load, the kernel gained a newer instruction -- raise this number.
+sed -i 's/^\.version .*/.version 6.3/' "$PTX"
+echo "Pinned PTX .version to 6.3 for broad driver compatibility."
 echo "[OK] Wrote $PTX"

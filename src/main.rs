@@ -25,6 +25,7 @@ use csd_gpu_miner::backends::opencl::OpenclBackend;
 use csd_gpu_miner::backends::cuda::CudaBackend;
 
 mod config_file;
+mod keygen;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -130,6 +131,12 @@ fn validate_address(addr: &str) -> Result<String> {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// Create a brand-new CSD payout wallet (keypair + addr20) locally, print
+    /// it, and save it to ./csd-wallet.txt. The private key is generated on
+    /// this machine and is NEVER sent anywhere — back it up, losing it loses
+    /// the coins. The address it prints is what you pass to `--address`.
+    Newwallet,
+
     /// Probe and print available GPU devices, then exit. Use this when
     /// `--backend auto` keeps falling back to CPU and you want to know why.
     Devices,
@@ -289,6 +296,11 @@ fn main() -> Result<()> {
         tracing::info!(config = %p.display(), "loaded config file");
     }
     merge_config(&mut cli, &matches, file_cfg);
+
+    if matches!(cli.cmd, Some(Cmd::Newwallet)) {
+        // No network, no address needed: generate a key locally and exit.
+        return keygen::run();
+    }
 
     if matches!(cli.cmd, Some(Cmd::Devices)) {
         return print_devices();
