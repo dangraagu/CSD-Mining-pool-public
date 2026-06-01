@@ -1,0 +1,47 @@
+# csd-pool-miner config file (optional).
+#
+# Copy this to one of these locations (first one found wins):
+#   ./config.toml                              next to where you run the miner
+#   ~/.config/csd-pool-miner/config.toml       Linux / macOS
+#   %APPDATA%\csd-pool-miner\config.toml       Windows
+# or point at it explicitly with:  --config <path>
+#
+# Every setting is OPTIONAL and mirrors a CLI flag. Precedence is:
+#   explicit CLI flag  >  this file  >  built-in default
+# so anything you pass on the command line always overrides this file.
+
+# Your addr20 payout address (40 lowercase hex, optional 0x prefix). Set it here
+# and you can start the miner with no --address flag.
+#address = "your40charhexaddr20goeshere0000000000000"
+
+# Backend: "auto" (default: cuda -> opencl -> cpu), "cpu", "opencl", or "cuda".
+#backend = "auto"
+
+# --- CPU dual-mining (only applies when a GPU backend is active) -------------
+# cpu_threads = CPU worker threads that mine ALONGSIDE the GPU. This is the knob
+# for "my CPU is busy even on the GPU build":
+#   * Set 0 to mine GPU-only and leave the CPU free. Recommended on laptops,
+#     where the CPU and GPU share one power/thermal budget, so CPU mining can
+#     actually lower your GPU hashrate.
+#   * Raise it (e.g. 8 or 16) on a desktop to add CPU hashrate on top of the GPU.
+# Default if unset: 16.
+#cpu_threads = 0
+
+# Fraction of each work template's nonce range the CPU pool sweeps (0.0..=1.0);
+# the GPU takes the rest. Ignored when cpu_threads = 0. Default: 0.4.
+#cpu_share = 0.4
+
+# --- CPU-only backend --------------------------------------------------------
+# threads = total hashing threads for the CPU backend. Unset = all logical cores
+# minus `reserve`.
+#threads = 8
+# reserve = cores to leave free for the OS / I/O when `threads` is unset.
+#reserve = 4
+
+# --- GPU device + launch geometry --------------------------------------------
+# device = which GPU to mine on (list them with: csd-pool-miner --address X devices)
+#device = 0
+# Launch geometry — leave unset unless you are deliberately tuning throughput.
+#blocks = 560
+#threads_per_block = 256
+#nonces_per_thread = 4096

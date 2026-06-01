@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 
 use csd_gpu_miner::backends::cpu::CpuBackend;
 use csd_gpu_miner::endpoint;
@@ -24,6 +24,8 @@ use csd_gpu_miner::backends::opencl::OpenclBackend;
 #[cfg(feature = "cuda")]
 use csd_gpu_miner::backends::cuda::CudaBackend;
 
+mod config_file;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "csd-pool-miner",
@@ -31,10 +33,18 @@ use csd_gpu_miner::backends::cuda::CudaBackend;
     about = "Standalone pool miner for Compute Substrate (mines to the CSD pool)."
 )]
 struct Cli {
-    /// Your addr20 payout address (the pool credits shares to this address).
-    /// Required. Accepts 40 lowercase hex chars, optionally `0x`-prefixed (42).
+    /// Path to a TOML config file. If omitted, `./config.toml` then the platform
+    /// config dir (`~/.config/csd-pool-miner/config.toml`, or on Windows
+    /// `%APPDATA%\csd-pool-miner\config.toml`) are tried. Explicit CLI flags
+    /// always override the config file. See `config.example.toml`.
     #[arg(long)]
-    address: String,
+    config: Option<PathBuf>,
+
+    /// Your addr20 payout address (the pool credits shares to this address).
+    /// 40 lowercase hex chars, optionally `0x`-prefixed (42). Provide it here or
+    /// as `address =` in the config file; this flag wins if both are set.
+    #[arg(long)]
+    address: Option<String>,
 
     /// Backend to use.
     #[arg(long, default_value = "auto")]
@@ -193,9 +203,92 @@ fn build_mining_config(cli: &Cli, backend_is_cpu: bool) -> MiningConfig {
     }
 }
 
+/// Parse a backend name from the config file into a `BackendChoice`.
+fn parse_backend(s: &str) -> Option<BackendChoice> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "auto" => Some(BackendChoice::Auto),
+        "cpu" => Some(BackendChoice::Cpu),
+        "opencl" => Some(BackendChoice::Opencl),
+        "cuda" => Some(BackendChoice::Cuda),
+        _ => None,
+    }
+}
+
+/// Merge `file` config values into `cli` IN PLACE, but only for fields the user
+/// did NOT set explicitly on the command line — giving precedence
+/// CLI > config file > built-in default. `address` has no clap default, so it is
+/// taken from the file only when absent on the CLI.
+fn merge_config(cli: &mut Cli, matches: &clap::ArgMatches, file: config_file::FileConfig) {
+    use clap::parser::ValueSource;
+    let explicit = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
+
+    if cli.address.is_none() {
+        cli.address = file.address;
+    }
+    if !explicit("backend") {
+        if let Some(s) = file.backend.as_deref() {
+            match parse_backend(s) {
+                Some(b) => cli.backend = b,
+                None => tracing::warn!(backend = s, "config: unknown backend, keeping default"),
+            }
+        }
+    }
+    if !explicit("threads") {
+        if let Some(v) = file.threads {
+            cli.threads = Some(v);
+        }
+    }
+    if !explicit("reserve") {
+        if let Some(v) = file.reserve {
+            cli.reserve = v;
+        }
+    }
+    if !explicit("blocks") {
+        if let Some(v) = file.blocks {
+            cli.blocks = v;
+        }
+    }
+    if !explicit("threads_per_block") {
+        if let Some(v) = file.threads_per_block {
+            cli.threads_per_block = v;
+        }
+    }
+    if !explicit("nonces_per_thread") {
+        if let Some(v) = file.nonces_per_thread {
+            cli.nonces_per_thread = v;
+        }
+    }
+    if !explicit("cpu_threads") {
+        if let Some(v) = file.cpu_threads {
+            cli.cpu_threads = v;
+        }
+    }
+    if !explicit("cpu_share") {
+        if let Some(v) = file.cpu_share {
+            cli.cpu_share = v;
+        }
+    }
+    if !explicit("device") {
+        if let Some(v) = file.device {
+            cli.device = v;
+        }
+    }
+}
+
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let mut cli = Cli::from_arg_matches(&matches).map_err(|e| anyhow::anyhow!("{e}"))?;
     let _log_guard = logging::init("csd-pool-miner", &cli.log_dir)?;
+
+    // Merge an optional TOML config file. Precedence: explicit CLI flag > config
+    // file value > built-in default. Done before any subcommand so values set in
+    // the config (geometry, etc.) also apply to `selftest`. Logging is already
+    // up, so a parse-failed config produces a visible warning (then is ignored).
+    let (file_cfg, loaded_from) = config_file::FileConfig::load(cli.config.as_deref());
+    if let Some(p) = &loaded_from {
+        tracing::info!(config = %p.display(), "loaded config file");
+    }
+    merge_config(&mut cli, &matches, file_cfg);
 
     if matches!(cli.cmd, Some(Cmd::Devices)) {
         return print_devices();
@@ -222,8 +315,14 @@ fn main() -> Result<()> {
     print_build_features();
 
     // Validate the payout address up front so a typo fails fast (before we open
-    // a socket to the pool) with a clear message.
-    let address = validate_address(&cli.address)?;
+    // a socket to the pool) with a clear message. It may come from --address or
+    // the config file's `address =` key.
+    let address = match cli.address.as_deref() {
+        Some(a) => validate_address(a)?,
+        None => bail!(
+            "no payout address: pass --address <addr20>, or set `address = \"<addr20>\"` in a config file (see config.example.toml / the README)"
+        ),
+    };
 
     // The pool endpoint is compiled in (lightly obfuscated) — the public build
     // has no override flag. Connect over Stratum v1 and authorize as `address`.

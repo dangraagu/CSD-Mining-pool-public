@@ -95,6 +95,27 @@ csd-pool-miner devices     # list detected GPUs (handy if auto keeps picking CPU
 csd-pool-miner selftest    # cross-check every backend against the reference CPU hasher
 ```
 
+## Config file (optional)
+
+Instead of passing flags every run, drop a `config.toml` next to the binary, at
+`~/.config/csd-pool-miner/config.toml` (Linux/macOS) or
+`%APPDATA%\csd-pool-miner\config.toml` (Windows), or point at one with `--config
+<path>`. Any explicit CLI flag overrides the file, which overrides the built-in
+defaults. See [`config.example.toml`](config.example.toml) for every key — a
+minimal example:
+
+```toml
+address = "your40charhexaddr20goeshere0000000000000"
+# CPU threads to mine ALONGSIDE the GPU (dual mining). 0 = GPU-only.
+cpu_threads = 0
+```
+
+**CPU usage on GPU builds:** by default a GPU build *also* mines on the CPU
+(`cpu_threads = 16`) for extra hashrate, so you'll see high CPU use even while
+the GPU works. To let the GPU do the work and keep your CPU free — recommended
+on laptops, where the CPU and GPU share one power/thermal budget — set
+`cpu_threads = 0` (or pass `--cpu-threads 0`).
+
 ## Payouts
 
 Payouts are **batched hourly by the pool, at the top of every hour (:00)**. Your
