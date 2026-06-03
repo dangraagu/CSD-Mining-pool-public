@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# --- What this is -------------------------------------------------------
+# Opt-in CSD miner launcher: mines on THIS machine, to YOUR own payout
+# address, only while you choose to run it. Not silent or hidden, and does
+# not install or run itself on anyone else's computer. Standard pool miner
+# for the public Compute Substrate (CSD) chain. See README "What this is".
+# ------------------------------------------------------------------------
+
 # ============================================================
 #  Self-updating, multi-GPU launcher. Leave this running.
 #   * Runs one miner instance per GPU (each --device i, all to

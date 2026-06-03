@@ -3,6 +3,13 @@ setlocal EnableExtensions EnableDelayedExpansion
 title CSD Pool Miner - all GPUs
 color 0a
 
+REM --- What this is -------------------------------------------------------
+REM Opt-in CSD miner launcher: mines on THIS machine, to YOUR own payout
+REM address, only while you choose to run it. Not silent or hidden, and does
+REM not install or run itself on anyone else's computer. Standard pool miner
+REM for the public Compute Substrate (CSD) chain. See README.
+REM ------------------------------------------------------------------------
+
 REM ============================================================
 REM  Runs ONE miner instance per GPU for the biggest combined
 REM  hashrate. Each instance mines the SAME payout address on a
