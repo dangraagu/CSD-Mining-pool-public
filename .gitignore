@@ -2,3 +2,8 @@
 **/*.rs.bk
 Cargo.lock
 logs/
+
+# Wallet / key files — contain private keys, never commit to a public repo
+csd-wallet.txt
+*wallet*.txt
+*.key

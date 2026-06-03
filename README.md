@@ -10,6 +10,23 @@ only thing you have to provide is your addr20 (a 40-hex CSD payout address).
 Discord channel for mining stats, updates and support/improvements:
 https://discord.gg/Gr9gCjzC9e
 
+## What this is — and what it isn't
+
+This is **opt-in mining software you run on your own hardware.** Compute
+Substrate (CSD) is a public proof-of-work blockchain; this repository is the
+miner / pool client for it, maintained by the chain's operator.
+
+- You choose to download and run it. It mines **only when you start it**, on
+  **your own machine**, to **your own payout address** — nothing happens until
+  you do.
+- It is **not** silent, hidden, or self-spreading. There is no mechanism here to
+  install or run it on anyone else's computer, and nothing in this repo accesses
+  systems you don't control.
+- It is standard cryptocurrency-mining infrastructure (a Stratum pool client) —
+  the same category as the miner for any public proof-of-work coin.
+- The source is open and auditable, and the chain is public:
+  site <https://computesubstrate.org> · explorer <https://explorer.computesubstrate.org>.
+
 ## Install (Windows — one click)
 
 Easiest path — no toolchain, no manual download:
