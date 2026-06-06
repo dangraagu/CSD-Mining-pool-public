@@ -18,7 +18,7 @@
 //!   - On read error/timeout the reader logs and reconnects with capped
 //!     backoff, re-running the subscribe/authorize handshake. It never panics.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -34,13 +34,46 @@ use super::protocol::{
 
 /// How long to wait on `connect()` for the TCP three-way handshake.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-/// Read timeout on the socket so the reader thread can't block forever waiting
-/// for a frame from a wedged bridge. ~120s comfortably exceeds the bridge's
-/// notify/difficulty cadence, so a timeout means the link is actually dead.
+/// Read timeout on the socket so the reader thread wakes periodically instead of
+/// blocking forever on a quiet link. A timeout is a **benign idle** signal (the
+/// bridge simply hasn't pushed a frame lately), NOT a disconnect — see
+/// [`classify_read`], which keeps the session on a timeout. (Treating the
+/// timeout as fatal was the `os error 11` reconnect-storm bug on idle CPU rigs.)
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
 /// Reconnect backoff bounds.
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// What the reader thread should do with the outcome of one `read_line`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadAction {
+    /// A full `\n`-terminated frame (n > 0 bytes) arrived — process it.
+    Frame,
+    /// A benign **idle read-timeout**: `SO_RCVTIMEO` fired (`WouldBlock` /
+    /// `TimedOut`, surfaced as EAGAIN "os error 11"), or the syscall was
+    /// `Interrupted`. The link is quiet, not dead — keep the session and keep
+    /// waiting. Reconnecting here is the reconnect-storm bug.
+    Idle,
+    /// Clean EOF (peer closed) or a real I/O error — reconnect.
+    Reconnect,
+}
+
+/// Decide what to do with a `read_line` outcome, without touching the socket —
+/// kept pure so the idle-vs-dead policy is unit-tested directly.
+fn classify_read(read: &io::Result<usize>) -> ReadAction {
+    match read {
+        Ok(0) => ReadAction::Reconnect, // clean EOF: peer closed the connection
+        Ok(_) => ReadAction::Frame,
+        Err(e) => match e.kind() {
+            // SO_RCVTIMEO / EAGAIN / an interrupted syscall: the link is quiet,
+            // not dead. Keep waiting instead of tearing down the session.
+            ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted => {
+                ReadAction::Idle
+            }
+            _ => ReadAction::Reconnect,
+        },
+    }
+}
 
 /// A job pushed by the pool via `mining.notify`, paired with the session
 /// `extranonce1` captured at subscribe time. The notify→header mapping is
@@ -311,46 +344,48 @@ impl StratumClient {
                         return;
                     }
 
-                    line.clear();
+                    // Do NOT clear `line` here: a benign idle timeout
+                    // (ReadAction::Idle) may have left a partial frame buffered,
+                    // and the next read_line must append the rest. We clear only
+                    // after dispatching a frame or before reconnecting.
                     let read = reader.read_line(&mut line);
-                    let needs_reconnect = match read {
-                        Ok(0) => {
-                            // Clean EOF: peer closed the connection.
-                            if shared.shutdown.load(Ordering::Relaxed) {
-                                return;
-                            }
-                            tracing::warn!(
-                                "stratum: connection closed by {endpoint}, reconnecting"
-                            );
-                            true
-                        }
-                        Ok(_) => {
+                    match classify_read(&read) {
+                        ReadAction::Frame => {
                             dispatch_frame(line.trim(), &shared);
+                            line.clear();
                             backoff = BACKOFF_MIN; // healthy read resets backoff
-                            false
                         }
-                        Err(e) => {
+                        ReadAction::Idle => {
+                            // Benign idle read-timeout (SO_RCVTIMEO): the bridge
+                            // just hasn't pushed a frame within READ_TIMEOUT. The
+                            // link is fine — keep the session and keep waiting.
+                            // This is the fix for the `os error 11` reconnect storm.
+                        }
+                        ReadAction::Reconnect => {
                             if shared.shutdown.load(Ordering::Relaxed) {
                                 return;
                             }
-                            tracing::warn!(
-                                "stratum: read error from {endpoint}: {e}; reconnecting"
-                            );
-                            true
+                            if let Err(e) = &read {
+                                tracing::warn!(
+                                    "stratum: read error from {endpoint}: {e}; reconnecting"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    "stratum: connection closed by {endpoint}, reconnecting"
+                                );
+                            }
+                            line.clear();
+                            if !reconnect(
+                                &endpoint,
+                                &worker_addr,
+                                &shared,
+                                &writer,
+                                &mut reader,
+                                &mut backoff,
+                            ) {
+                                return; // shutdown requested mid-reconnect
+                            }
                         }
-                    };
-
-                    if needs_reconnect
-                        && !reconnect(
-                            &endpoint,
-                            &worker_addr,
-                            &shared,
-                            &writer,
-                            &mut reader,
-                            &mut backoff,
-                        )
-                    {
-                        return; // shutdown requested mid-reconnect
                     }
                 }
             })
@@ -574,6 +609,47 @@ mod tests {
             extranonce2_size: AtomicU64::new(xn2_size),
             shutdown: AtomicBool::new(false),
         })
+    }
+
+    #[test]
+    fn idle_read_timeout_keeps_the_session() {
+        // SO_RCVTIMEO firing on a quiet socket surfaces as WouldBlock/TimedOut
+        // (EAGAIN, "os error 11"); a signal as Interrupted. None of these mean
+        // the link is dead — the reader must keep waiting, never reconnect.
+        for kind in [
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::Interrupted,
+        ] {
+            let r: std::io::Result<usize> = Err(std::io::Error::from(kind));
+            assert_eq!(
+                classify_read(&r),
+                ReadAction::Idle,
+                "{kind:?} must stay idle, not reconnect"
+            );
+        }
+    }
+
+    #[test]
+    fn eof_and_real_errors_reconnect() {
+        assert_eq!(classify_read(&Ok(0)), ReadAction::Reconnect); // peer closed
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionAborted,
+        ] {
+            let r: std::io::Result<usize> = Err(std::io::Error::from(kind));
+            assert_eq!(
+                classify_read(&r),
+                ReadAction::Reconnect,
+                "{kind:?} must reconnect"
+            );
+        }
+    }
+
+    #[test]
+    fn full_frame_is_processed() {
+        assert_eq!(classify_read(&Ok(42)), ReadAction::Frame);
     }
 
     #[test]
