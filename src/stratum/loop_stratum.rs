@@ -122,13 +122,6 @@ struct CpuFind {
     hash: [u8; 32],
 }
 
-/// Source of pooled mining work + sink for found shares.
-///
-/// Abstracts the loop's dependency on a concrete [`StratumClient`] so
-/// `run_stratum` can be driven headless in tests (and, later, by a solo
-/// csd-node source — P3). The four methods are exactly what the loop calls
-/// today; `StratumClient` implements them by delegating to its inherent
-/// methods, so introducing this trait is a pure zero-behaviour-change refactor.
 /// One unit of work the loop mines, abstracted over pool vs solo sources.
 pub struct LoopWork {
     /// The work template; `template.target` is the gate target (pool share
@@ -148,6 +141,14 @@ pub enum WorkIntake {
     Idle,
 }
 
+/// Source of mining work + sink for found shares.
+///
+/// Abstracts the loop's dependency on a concrete [`StratumClient`] so
+/// `run_stratum` can be driven by the pool client, the test mock, or a solo
+/// `NodeWorkSource` (P3). The pool/Stratum behaviour lives in the DEFAULT
+/// methods (`next_work` = latest_job → notify_to_template; `submit_solution` =
+/// build_submit → send_submit); `StratumClient` + the mock inherit them, and a
+/// solo source overrides just those two.
 pub trait WorkSource {
     /// Latest job pushed by the pool, or `None` if none has arrived yet.
     fn latest_job(&self) -> Option<StratumJob>;
