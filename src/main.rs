@@ -47,6 +47,12 @@ struct Cli {
     #[arg(long)]
     address: Option<String>,
 
+    /// Pool endpoint override(s) as `host:port`, comma-separated or repeated
+    /// (alias `--url`). The first is the primary; the rest back failover. If
+    /// omitted, the compiled-in default pool is used.
+    #[arg(long = "pool", visible_alias = "url", value_delimiter = ',')]
+    pool: Vec<String>,
+
     /// Backend to use.
     #[arg(long, default_value = "auto")]
     backend: BackendChoice,
@@ -336,12 +342,19 @@ fn main() -> Result<()> {
         ),
     };
 
-    // The pool endpoint is compiled in (lightly obfuscated) — the public build
-    // has no override flag. Connect over Stratum v1 and authorize as `address`.
-    let endpoint = endpoint::pool_endpoint();
-    tracing::info!(
-        "csd-pool-miner: connecting to pool {endpoint} as address {address}"
-    );
+    // Resolve the pool endpoint(s): the operator's --url/--pool override(s) if
+    // given (validated host:port), else the compiled-in default. The first is
+    // the primary we connect to now; the full list will back failover (P1 §3).
+    let endpoints = endpoint::resolve_endpoints(&cli.pool, &endpoint::pool_endpoint())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let endpoint = endpoints[0].clone();
+    if endpoints.len() > 1 {
+        tracing::info!(
+            "csd-pool-miner: {} pool endpoints (failover order): {endpoints:?}",
+            endpoints.len()
+        );
+    }
+    tracing::info!("csd-pool-miner: connecting to pool {endpoint} as address {address}");
     let client = StratumClient::connect(&endpoint, &address)
         .map_err(|e| anyhow::anyhow!("failed to connect to pool {endpoint}: {e}"))?;
 
