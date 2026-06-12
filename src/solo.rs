@@ -228,6 +228,11 @@ pub struct NodeWorkSource {
     /// The poller thread handle (joined on `Drop`). `None` for a test-only idle
     /// source built without a poller.
     poller: Option<JoinHandle<()>>,
+    /// Optional D2 stats sink. `None` until `--stats-port` wires one in via
+    /// [`NodeWorkSource::attach_stats`]; mirrors `StratumClient.stats` so solo
+    /// gets the same `/1/summary` telemetry as the pool path. When set,
+    /// `record_hashrate` pushes the GH/s sample + the live health snapshot.
+    stats_sink: Option<Arc<crate::stats_server::StatsHandle>>,
 }
 
 impl NodeWorkSource {
@@ -262,7 +267,16 @@ impl NodeWorkSource {
             stats,
             shutdown,
             poller: Some(poller),
+            stats_sink: None,
         })
+    }
+
+    /// Attach a D2 stats sink. Called once at startup when `--stats-port` is set,
+    /// before the mining loop borrows the source (`&mut self`); `None` until then,
+    /// so the unconfigured solo build carries no stats overhead. Mirrors
+    /// [`crate::stratum::StratumClient::attach_stats`].
+    pub fn attach_stats(&mut self, handle: Arc<crate::stats_server::StatsHandle>) {
+        self.stats_sink = Some(handle);
     }
 
     /// Test-only constructor: an idle source (no poller, `latest = None`) so
@@ -276,6 +290,7 @@ impl NodeWorkSource {
             stats: Arc::new(SoloStats::default()),
             shutdown: Arc::new(AtomicBool::new(true)),
             poller: None,
+            stats_sink: None,
         }
     }
 }
@@ -455,6 +470,18 @@ impl WorkSource for NodeWorkSource {
             submitted: self.stats.submitted.load(Ordering::Relaxed),
             job_age_s,
             endpoint: self.base_url.clone(),
+        }
+    }
+
+    /// Route a combined-hashrate sample (GH/s) into the attached D2 stats sink,
+    /// if any — the solo mirror of `StratumClient::record_hashrate_sample`. No-op
+    /// when `--stats-port` is off. `self.health()` resolves to the override above
+    /// (solo `SoloStats`-backed snapshot, `endpoint = base_url`), so `/1/summary`
+    /// shows solo's accepted/rejected/job_age, not the empty default.
+    fn record_hashrate(&self, ghs: f64) {
+        if let Some(s) = &self.stats_sink {
+            s.record(ghs);
+            s.set_health(self.health());
         }
     }
 }
@@ -817,5 +844,39 @@ mod tests {
         // current_difficulty is the no-vardiff sentinel; worker_addr echoes addr.
         assert_eq!(src.current_difficulty(), 1.0);
         assert_eq!(src.worker_addr(), "deadbeef");
+    }
+
+    #[test]
+    fn node_work_source_record_hashrate_routes_into_attached_stats() {
+        use crate::stats_server::StatsHandle;
+
+        // An idle source (no poller / live node needed) with an attached D2 sink.
+        let mut src = NodeWorkSource::idle_for_test("http://127.0.0.1:1");
+        let handle = Arc::new(StatsHandle::new());
+        src.attach_stats(Arc::clone(&handle));
+
+        // The WorkSource override must push the GH/s sample + solo health into the
+        // handle (the same plumbing the pool path gets via StratumClient).
+        WorkSource::record_hashrate(&src, 2.0);
+
+        // StatsHandle::windows() returns GH/s verbatim (the *1e9 → H/s scaling
+        // happens later, in stats::summary_json), so a single 2.0 GH/s sample
+        // means the freshest (10s) window reads ~2.0 GH/s.
+        let w = handle.windows();
+        assert!(
+            (w[0] - 2.0).abs() < 1e-9,
+            "10s window should be ~2.0 GH/s, got {}",
+            w[0]
+        );
+        // And the pushed health snapshot is solo's (endpoint = the node base_url),
+        // proving record_hashrate called the NodeWorkSource health() override.
+        assert_eq!(handle.health().endpoint, "http://127.0.0.1:1");
+    }
+
+    #[test]
+    fn node_work_source_record_hashrate_without_sink_is_noop() {
+        // No sink attached ⇒ record_hashrate must not panic (unconfigured build).
+        let src = NodeWorkSource::idle_for_test("http://127.0.0.1:1");
+        WorkSource::record_hashrate(&src, 5.0); // no-op, no panic
     }
 }
