@@ -30,7 +30,7 @@ use crate::backend::{MiningBackend, MiningResult};
 use crate::coinbase::{coinbase_txid, header_84, merkle_root_from_branch};
 use crate::mining_config::{partition_nonce_range, MiningConfig};
 use crate::sha256d_cpu::{finish_sha256d_from_midstate_fast, midstate_of_first_chunk_fast};
-use crate::stratum::client::StratumClient;
+use crate::stratum::client::{StratumClient, StratumJob};
 use crate::stratum::mapping::{build_submit, compose_extranonce, notify_to_template};
 
 /// Pool-difficulty-1 target as 32 big-endian bytes:
@@ -119,15 +119,62 @@ struct CpuFind {
     hash: [u8; 32],
 }
 
+/// Source of pooled mining work + sink for found shares.
+///
+/// Abstracts the loop's dependency on a concrete [`StratumClient`] so
+/// `run_stratum` can be driven headless in tests (and, later, by a solo
+/// csd-node source — P3). The four methods are exactly what the loop calls
+/// today; `StratumClient` implements them by delegating to its inherent
+/// methods, so introducing this trait is a pure zero-behaviour-change refactor.
+pub trait WorkSource {
+    /// Latest job pushed by the pool, or `None` if none has arrived yet.
+    fn latest_job(&self) -> Option<StratumJob>;
+    /// Current share difficulty (defaults to 1.0 until the pool sends one).
+    fn current_difficulty(&self) -> f64;
+    /// The worker (csd1) address shares are submitted under.
+    fn worker_addr(&self) -> &str;
+    /// Send a `mining.submit` line for a found share.
+    fn send_submit(
+        &self,
+        worker: &str,
+        job_id: &str,
+        xn2_hex: &str,
+        ntime_hex: &str,
+        nonce_hex: &str,
+    ) -> Result<()>;
+}
+
+impl WorkSource for StratumClient {
+    fn latest_job(&self) -> Option<StratumJob> {
+        StratumClient::latest_job(self)
+    }
+    fn current_difficulty(&self) -> f64 {
+        StratumClient::current_difficulty(self)
+    }
+    fn worker_addr(&self) -> &str {
+        StratumClient::worker_addr(self)
+    }
+    fn send_submit(
+        &self,
+        worker: &str,
+        job_id: &str,
+        xn2_hex: &str,
+        ntime_hex: &str,
+        nonce_hex: &str,
+    ) -> Result<()> {
+        StratumClient::send_submit(self, worker, job_id, xn2_hex, ntime_hex, nonce_hex)
+    }
+}
+
 /// Run the pooled Stratum mining loop until `stop` is set.
 ///
 /// `client` must already be connected (handshake done, reader thread running).
 /// Work is pulled from its background-updated `latest_job()` / difficulty; found
 /// shares are submitted via `client.send_submit`. The CPU+GPU split honours the
 /// `MiningConfig` knobs `cpu_threads` and `cpu_share`.
-pub fn run_stratum<B: MiningBackend>(
+pub fn run_stratum<B: MiningBackend, W: WorkSource>(
     backend: &B,
-    client: &StratumClient,
+    client: &W,
     stop: Arc<AtomicBool>,
     cfg: MiningConfig,
 ) -> Result<()> {
@@ -785,6 +832,200 @@ mod tests {
         assert!(
             !post_handshake.contains("mining.submit"),
             "did not expect a submit in the brief hard-difficulty window, got: {post_handshake:?}"
+        );
+    }
+
+    // --- P0 headless harness: drive the REAL run_stratum with mock WorkSource
+    //     + mock Backend, no socket and no GPU. ---
+
+    use std::collections::VecDeque;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A programmable backend: pops a scripted result per `hash_range` call.
+    /// Once the script is exhausted it behaves like a real backend that hashes
+    /// until told to stop (so the loop never busy-spins). Lets a test exercise
+    /// the FOUND path + correctness gate with no GPU.
+    struct MockBackend {
+        script: Mutex<VecDeque<Option<MiningResult>>>,
+        calls: AtomicUsize,
+    }
+    impl MockBackend {
+        fn new(script: Vec<Option<MiningResult>>) -> Self {
+            MockBackend {
+                script: Mutex::new(script.into()),
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+    impl MiningBackend for MockBackend {
+        fn name(&self) -> &'static str {
+            "mock-backend"
+        }
+        fn hash_range(
+            &self,
+            _h: [u8; 84],
+            _t: [u8; 32],
+            _s: u32,
+            _e: u32,
+            stop: &AtomicBool,
+        ) -> Option<MiningResult> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(found) = self.script.lock().unwrap().pop_front().flatten() {
+                return Some(found);
+            }
+            // No scripted find: emulate a real backend hashing until told to
+            // stop. NOTE: relies on run_stratum driving the outer `stop` into
+            // the GPU backend's stop flag (via the bridge-poller thread); a
+            // future refactor that stopped doing so would hang this.
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            None
+        }
+    }
+
+    /// A socket-free [`WorkSource`]: serves one canned job + difficulty and
+    /// records every submit the loop sends, so `run_stratum` can be driven
+    /// headless and its submit behaviour asserted.
+    struct MockWorkSource {
+        job: StratumJob,
+        difficulty: f64,
+        worker: String,
+        submits: Arc<Mutex<Vec<(String, String, String, String, String)>>>,
+    }
+    impl MockWorkSource {
+        fn new(job: StratumJob, difficulty: f64) -> Self {
+            MockWorkSource {
+                job,
+                difficulty,
+                worker: "csd1mockworker".to_string(),
+                submits: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+    impl WorkSource for MockWorkSource {
+        fn latest_job(&self) -> Option<StratumJob> {
+            Some(self.job.clone())
+        }
+        fn current_difficulty(&self) -> f64 {
+            self.difficulty
+        }
+        fn worker_addr(&self) -> &str {
+            &self.worker
+        }
+        fn send_submit(
+            &self,
+            worker: &str,
+            job_id: &str,
+            xn2_hex: &str,
+            ntime_hex: &str,
+            nonce_hex: &str,
+        ) -> Result<()> {
+            self.submits.lock().unwrap().push((
+                worker.to_string(),
+                job_id.to_string(),
+                xn2_hex.to_string(),
+                ntime_hex.to_string(),
+                nonce_hex.to_string(),
+            ));
+            Ok(())
+        }
+    }
+
+    fn mock_job() -> StratumJob {
+        StratumJob {
+            notify: fixture_notify(),
+            extranonce1_hex: "aabbccdd".to_string(),
+        }
+    }
+
+    /// Drive the REAL `run_stratum` with a mock work source + a never-finds
+    /// backend: it must map the job, dispatch the backend, and shut down
+    /// cleanly on `stop` with no submit — the socket-free analogue of
+    /// `run_stratum_connects_maps_and_shuts_down_cleanly`.
+    #[test]
+    fn run_stratum_via_mock_worksource_shuts_down_clean() {
+        let work = Arc::new(MockWorkSource::new(mock_job(), 1024.0));
+        let backend = Arc::new(MockBackend::new(vec![])); // never finds
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let work_for_loop = Arc::clone(&work);
+        let backend_for_loop = Arc::clone(&backend);
+        let stop_for_loop = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let cfg = MiningConfig {
+                cpu_threads: 0,
+                cpu_share: 0.0,
+            };
+            run_stratum(
+                backend_for_loop.as_ref(),
+                work_for_loop.as_ref(),
+                stop_for_loop,
+                cfg,
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(120));
+        stop.store(true, Ordering::Relaxed);
+        let result = handle.join().expect("loop thread did not panic");
+        assert!(result.is_ok(), "run_stratum returns Ok on clean shutdown");
+        assert!(
+            backend.calls.load(Ordering::Relaxed) > 0,
+            "the loop must have actually dispatched the backend, not idled"
+        );
+        assert!(
+            work.submits.lock().unwrap().is_empty(),
+            "no share should be submitted when the backend never finds"
+        );
+    }
+
+    /// A backend that returns a find with a BOGUS hash must NOT produce a
+    /// submit: the loop's pre-submit CPU re-hash gate catches the mismatch and
+    /// skips it. Proves a malfunctioning/lying backend can't push a bad share.
+    #[test]
+    fn bad_backend_find_is_rejected_by_correctness_gate() {
+        let work = Arc::new(MockWorkSource::new(mock_job(), 1024.0));
+        // Claimed find with an all-zero hash that will NOT match the real
+        // sha256d of the header at that nonce.
+        let bogus = MiningResult {
+            nonce: 12345,
+            hash: [0u8; 32],
+        };
+        let backend = Arc::new(MockBackend::new(vec![Some(bogus)]));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let work_for_loop = Arc::clone(&work);
+        let backend_for_loop = Arc::clone(&backend);
+        let stop_for_loop = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let cfg = MiningConfig {
+                cpu_threads: 0,
+                cpu_share: 0.0,
+            };
+            run_stratum(
+                backend_for_loop.as_ref(),
+                work_for_loop.as_ref(),
+                stop_for_loop,
+                cfg,
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(120));
+        stop.store(true, Ordering::Relaxed);
+        handle
+            .join()
+            .expect("loop thread did not panic")
+            .expect("run_stratum Ok");
+        // The backend WAS dispatched and returned the bogus find (calls > 0)...
+        assert!(
+            backend.calls.load(Ordering::Relaxed) > 0,
+            "the loop must have dispatched the backend and processed the find"
+        );
+        // ...yet nothing was submitted — so the pre-submit gate is provably
+        // what rejected it (only the gate sits between FOUND and submit).
+        assert!(
+            work.submits.lock().unwrap().is_empty(),
+            "the correctness gate must reject a backend find whose hash is wrong"
         );
     }
 }
