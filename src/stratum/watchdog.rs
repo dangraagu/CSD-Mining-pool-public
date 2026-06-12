@@ -79,6 +79,29 @@ pub fn watchdog_decision(
     None
 }
 
+/// A `'static` view the watchdog thread uses to observe the session and request
+/// a reconnect — without holding the mining loop's borrows. Implemented by the
+/// live client (real socket) and a mock (tests).
+pub trait WatchdogView: Send + Sync {
+    /// Current session counters.
+    fn snapshot(&self) -> WatchdogSnapshot;
+    /// Force the connection to drop + re-handshake (reusing the af8c236 path).
+    fn request_reconnect(&self);
+}
+
+/// One watchdog evaluation: read the view's snapshot, decide, and act. Returns
+/// `true` if it triggered a reconnect. `now_ms` is injected so this is unit-
+/// tested with a fake clock + a mock view — no thread, no sleep, no socket.
+pub fn watchdog_tick(view: &dyn WatchdogView, cfg: WatchdogCfg, now_ms: u64) -> bool {
+    match watchdog_decision(view.snapshot(), cfg, now_ms) {
+        Some(WatchdogAction::ForceReconnect) => {
+            view.request_reconnect();
+            true
+        }
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,5 +164,48 @@ mod tests {
             last_new_job_ms: 0,
         };
         assert_eq!(watchdog_decision(snap, cfg(), 9_999_999), None);
+    }
+
+    struct MockView {
+        snap: WatchdogSnapshot,
+        reconnects: std::sync::atomic::AtomicU64,
+    }
+    impl MockView {
+        fn new(snap: WatchdogSnapshot) -> Self {
+            MockView {
+                snap,
+                reconnects: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+        fn reconnect_calls(&self) -> u64 {
+            self.reconnects.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+    impl WatchdogView for MockView {
+        fn snapshot(&self) -> WatchdogSnapshot {
+            self.snap
+        }
+        fn request_reconnect(&self) {
+            self.reconnects
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn tick_reconnects_on_trigger_and_idles_when_healthy() {
+        // A submit-ack streak → the tick acts exactly once.
+        let trig = MockView::new(WatchdogSnapshot {
+            consecutive_unacked: 10,
+            last_new_job_ms: 1,
+        });
+        assert!(watchdog_tick(&trig, WatchdogCfg::default(), 1_000));
+        assert_eq!(trig.reconnect_calls(), 1);
+        // Healthy snapshot → no action, no reconnect.
+        let ok = MockView::new(WatchdogSnapshot {
+            consecutive_unacked: 1,
+            last_new_job_ms: 1_000,
+        });
+        assert!(!watchdog_tick(&ok, WatchdogCfg::default(), 1_100));
+        assert_eq!(ok.reconnect_calls(), 0);
     }
 }

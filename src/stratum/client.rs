@@ -31,6 +31,7 @@ use super::protocol::{
     authorize_request, serialize_line, subscribe_request, submit_request, NotifyParams,
     Notification, Response, SubscribeResult,
 };
+use super::watchdog::{WatchdogSnapshot, WatchdogView};
 
 /// How long to wait on `connect()` for the TCP three-way handshake.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -564,6 +565,16 @@ impl StratumClient {
         &self.worker_addr
     }
 
+    /// A `'static` [`WatchdogView`] handle for the reliability-watchdog thread:
+    /// reads the session counters and can force a reconnect by shutting the
+    /// socket (so the reader's af8c236 reconnect path fires).
+    pub fn watchdog_handle(&self) -> Arc<dyn WatchdogView> {
+        Arc::new(ClientWatchdog {
+            shared: Arc::clone(&self.shared),
+            writer: Arc::clone(&self.writer),
+        })
+    }
+
     /// Send a `mining.submit` line for a found share. Serializes writes through
     /// the writer mutex. Errors bubble up so the caller can log/account them.
     pub fn send_submit(
@@ -606,6 +617,30 @@ impl Drop for StratumClient {
         if let Some(h) = self.reader.take() {
             let _ = h.join();
         }
+    }
+}
+
+/// Watchdog handle backed by the live client's shared state + writer socket.
+struct ClientWatchdog {
+    shared: Arc<Shared>,
+    writer: Arc<Mutex<TcpStream>>,
+}
+
+impl WatchdogView for ClientWatchdog {
+    fn snapshot(&self) -> WatchdogSnapshot {
+        WatchdogSnapshot {
+            consecutive_unacked: self.shared.stats.consecutive_unacked.load(Ordering::Relaxed),
+            last_new_job_ms: self.shared.stats.last_new_job_ms.load(Ordering::Relaxed),
+        }
+    }
+    fn request_reconnect(&self) {
+        // Shut the socket so the reader's existing reconnect path (the
+        // af8c236-blessed classify_read → reconnect) fires promptly — never a
+        // forked reconnect.
+        if let Ok(w) = self.writer.lock() {
+            let _ = w.shutdown(std::net::Shutdown::Both);
+        }
+        tracing::warn!("stratum: watchdog requested reconnect (shutting socket)");
     }
 }
 
