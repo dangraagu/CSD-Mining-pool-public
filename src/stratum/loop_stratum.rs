@@ -32,6 +32,7 @@ use crate::mining_config::{partition_nonce_range, MiningConfig};
 use crate::sha256d_cpu::{finish_sha256d_from_midstate_fast, midstate_of_first_chunk_fast};
 use crate::stratum::client::{StratumClient, StratumJob};
 use crate::stratum::mapping::{build_submit, compose_extranonce, notify_to_template};
+use crate::stratum::watchdog::{spawn_watchdog, WatchdogCfg, WatchdogView};
 
 /// Pool-difficulty-1 target as 32 big-endian bytes:
 /// `0x00000000FFFF0000000000000000000000000000000000000000000000000000`.
@@ -142,6 +143,13 @@ pub trait WorkSource {
         ntime_hex: &str,
         nonce_hex: &str,
     ) -> Result<()>;
+
+    /// A `'static` watchdog handle, if this source backs the reliability
+    /// watchdog. Default `None` (e.g. a future solo csd-node source or the test
+    /// mock); `StratumClient` returns a handle over its live connection.
+    fn watchdog_view(&self) -> Option<Arc<dyn WatchdogView>> {
+        None
+    }
 }
 
 impl WorkSource for StratumClient {
@@ -163,6 +171,9 @@ impl WorkSource for StratumClient {
         nonce_hex: &str,
     ) -> Result<()> {
         StratumClient::send_submit(self, worker, job_id, xn2_hex, ntime_hex, nonce_hex)
+    }
+    fn watchdog_view(&self) -> Option<Arc<dyn WatchdogView>> {
+        Some(self.watchdog_handle())
     }
 }
 
@@ -208,6 +219,15 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
             cfg.cpu_threads, cfg.cpu_share,
         );
     }
+
+    // Reliability watchdog: an out-of-band thread that forces a reconnect on a
+    // half-open socket (submits going un-acked) or a dead push channel (no new
+    // jobs). Detached — it owns Arc clones and exits when `stop` is set, so the
+    // loop never has to join it. Sources without a live connection (the test
+    // mock, a future solo source) return `None` and run without it.
+    let _watchdog = client
+        .watchdog_view()
+        .map(|view| spawn_watchdog(view, WatchdogCfg::default(), Arc::clone(&stop)));
 
     while !stop.load(Ordering::Relaxed) {
         // --- work intake: poll the pool's latest pushed job ---

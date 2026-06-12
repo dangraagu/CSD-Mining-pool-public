@@ -770,6 +770,9 @@ fn reconnect(
                     *w = hs.write_stream;
                 }
                 *backoff = BACKOFF_MIN;
+                // Fresh connection: clear the un-acked streak so the submit-ack
+                // watchdog doesn't immediately force another reconnect.
+                shared.stats.consecutive_unacked.store(0, Ordering::Relaxed);
                 tracing::info!("stratum: reconnected to {endpoint}");
                 return true;
             }
