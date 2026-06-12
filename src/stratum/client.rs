@@ -27,6 +27,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 
+use crate::endpoint::EndpointList;
 use super::protocol::{
     authorize_request, serialize_line, subscribe_request, submit_request, NotifyParams,
     Notification, Response, SubscribeResult,
@@ -44,6 +45,9 @@ const READ_TIMEOUT: Duration = Duration::from_secs(120);
 /// Reconnect backoff bounds.
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// After failing over to a backup pool, how long to stay there before the
+/// reconnect path retries the primary again (a quiet-period failback).
+const FAILBACK_MS: u64 = 30 * 60 * 1000; // 30 min
 
 /// What the reader thread should do with the outcome of one `read_line`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,10 +279,24 @@ struct Handshake {
 }
 
 impl StratumClient {
-    /// Connect to `endpoint` (`host:port`), run the subscribe + authorize
-    /// handshake, capture `extranonce1`/`extranonce2_size`, confirm authorize
-    /// returned `true` (bail otherwise), then spawn the reader thread.
+    /// Connect to a single `endpoint` (`host:port`) with no failover. Thin shim
+    /// over [`connect_failover`](Self::connect_failover) on a one-element list,
+    /// preserving every existing caller/test on a no-failover path.
     pub fn connect(endpoint: &str, worker_addr: &str) -> Result<Self> {
+        Self::connect_failover(&[endpoint.to_string()], worker_addr)
+    }
+
+    /// Connect to the PRIMARY pool (`endpoints.first()`), run the subscribe +
+    /// authorize handshake, capture `extranonce1`/`extranonce2_size`, confirm
+    /// authorize returned `true` (bail otherwise), then spawn the reader thread
+    /// with the full failover [`EndpointList`]. On a dropped connection the
+    /// reader rotates through `endpoints` (and fails back to the primary after a
+    /// quiet interval); a single-element list is the no-failover path.
+    pub fn connect_failover(endpoints: &[String], worker_addr: &str) -> Result<Self> {
+        let endpoint = endpoints
+            .first()
+            .ok_or_else(|| anyhow!("connect_failover needs at least one endpoint"))?;
+
         let hs = Self::handshake(endpoint, worker_addr)
             .with_context(|| format!("stratum handshake to {endpoint}"))?;
 
@@ -307,8 +325,11 @@ impl StratumClient {
             dispatch_frame(push, &shared);
         }
 
+        // Hand the reader the FULL ordered endpoint list (index 0 = primary it
+        // is already connected to) so its reconnect path can rotate to a backup
+        // and fail back. A one-element list is a no-op rotation.
         let reader = Self::spawn_reader(
-            endpoint.to_string(),
+            EndpointList::new(endpoints.to_vec()),
             worker_addr.to_string(),
             hs.reader,
             Arc::clone(&shared),
@@ -455,7 +476,7 @@ impl StratumClient {
     /// difficulty. On any read error/timeout/EOF it reconnects with capped
     /// backoff (re-subscribe/re-authorize) unless shutdown was signalled.
     fn spawn_reader(
-        endpoint: String,
+        endpoints: EndpointList,
         worker_addr: String,
         initial_reader: BufReader<TcpStream>,
         shared: Arc<Shared>,
@@ -464,6 +485,7 @@ impl StratumClient {
         std::thread::Builder::new()
             .name("stratum-reader".to_string())
             .spawn(move || {
+                let mut endpoints = endpoints;
                 let mut reader = initial_reader;
                 let mut backoff = BACKOFF_MIN;
                 let mut line = String::new();
@@ -500,18 +522,19 @@ impl StratumClient {
                             if shared.shutdown.load(Ordering::Relaxed) {
                                 return;
                             }
+                            let current = endpoints.current().to_string();
                             if let Err(e) = &read {
                                 tracing::warn!(
-                                    "stratum: read error from {endpoint}: {e}; reconnecting"
+                                    "stratum: read error from {current}: {e}; reconnecting"
                                 );
                             } else {
                                 tracing::warn!(
-                                    "stratum: connection closed by {endpoint}, reconnecting"
+                                    "stratum: connection closed by {current}, reconnecting"
                                 );
                             }
                             line.clear();
                             if !reconnect(
-                                &endpoint,
+                                &mut endpoints,
                                 &worker_addr,
                                 &shared,
                                 &writer,
@@ -722,10 +745,14 @@ fn dispatch_frame(line: &str, shared: &Shared) {
 /// session extranonce1/size. Returns `false` iff shutdown was requested (so the
 /// reader loop should exit); `true` once reconnected.
 ///
-/// The backoff doubles each failed attempt up to [`BACKOFF_MAX`]; a successful
-/// reconnect resets it (the caller also resets on the next healthy read).
+/// Failover: each attempt dials `endpoints.current()`. A failed handshake
+/// rotates to the next pool via [`EndpointList::advance`] (a no-op for a single
+/// endpoint); after a quiet interval on a backup, [`EndpointList::maybe_failback`]
+/// brings the next attempt back to the primary. The backoff doubles each failed
+/// attempt up to [`BACKOFF_MAX`]; a successful reconnect resets it (the caller
+/// also resets on the next healthy read).
 fn reconnect(
-    endpoint: &str,
+    endpoints: &mut EndpointList,
     worker_addr: &str,
     shared: &Arc<Shared>,
     writer: &Arc<Mutex<TcpStream>>,
@@ -743,7 +770,15 @@ fn reconnect(
             return false;
         }
 
-        match StratumClient::handshake(endpoint, worker_addr) {
+        // If we've been parked on a backup long enough, prefer the primary again
+        // before this attempt (a quiet-period failback). On the primary this is
+        // a no-op that just keeps the failback clock fresh.
+        if endpoints.maybe_failback(now_unix_ms(), FAILBACK_MS) {
+            tracing::info!("stratum: failback — retrying primary {}", endpoints.current());
+        }
+        let ep = endpoints.current().to_string();
+
+        match StratumClient::handshake(&ep, worker_addr) {
             Ok(hs) => {
                 // Refresh session params the bridge may have rotated.
                 if let Ok(mut x) = shared.extranonce1_hex.lock() {
@@ -774,11 +809,14 @@ fn reconnect(
                     shared.stats.consecutive_unacked.store(0, Ordering::Relaxed);
                 }
                 *backoff = BACKOFF_MIN;
-                tracing::info!("stratum: reconnected to {endpoint}");
+                tracing::info!("stratum: reconnected to {ep}");
                 return true;
             }
             Err(e) => {
-                tracing::warn!("stratum: reconnect to {endpoint} failed: {e}");
+                tracing::warn!("stratum: reconnect to {ep} failed: {e}; trying next endpoint");
+                // Rotate to the next pool in the failover list (no-op for a
+                // single endpoint) so the next attempt dials a different one.
+                endpoints.advance();
             }
         }
 
@@ -1114,5 +1152,127 @@ mod tests {
 
         drop(client);
         let _ = server.join();
+    }
+
+    /// Play the bridge side of one subscribe/authorize handshake on `sock`:
+    /// read the two requests, then reply subscribe-result + authorize-true.
+    /// Shared by the failover test's two fake pools. Returns once the handshake
+    /// is written (the caller decides whether to keep the socket open or drop it).
+    fn serve_handshake(sock: &mut TcpStream) {
+        let mut br = BufReader::new(sock.try_clone().unwrap());
+        let mut req = String::new();
+        br.read_line(&mut req).unwrap(); // subscribe (id=1)
+        req.clear();
+        br.read_line(&mut req).unwrap(); // authorize (id=2)
+        sock.write_all(
+            b"{\"id\":1,\"result\":[[[\"mining.notify\",\"1\"]],\"abcd1234\",4],\"error\":null}\n",
+        )
+        .unwrap();
+        sock.write_all(b"{\"id\":2,\"result\":true,\"error\":null}\n")
+            .unwrap();
+        sock.flush().unwrap();
+    }
+
+    /// Failover: when the PRIMARY pool dies after the handshake, the reader must
+    /// rotate to the BACKUP via `EndpointList::advance` and re-handshake there.
+    ///
+    /// Two listeners stand in for pool A (primary) and pool B (backup). A
+    /// accepts the first connection, completes the handshake, then drops the
+    /// socket → the reader sees EOF (`ReadAction::Reconnect`). B accepts a
+    /// connection and completes a full handshake, signalling (via a channel)
+    /// that it received a `mining.subscribe` — i.e. the reader rotated off the
+    /// dead primary onto the backup. Asserts B is reached within a bounded wait
+    /// (no fixed long sleeps).
+    #[test]
+    fn reconnect_rotates_to_backup_on_primary_failure() {
+        let listener_a = TcpListener::bind("127.0.0.1:0").expect("bind A");
+        let listener_b = TcpListener::bind("127.0.0.1:0").expect("bind B");
+        let addr_a = listener_a.local_addr().unwrap().to_string();
+        let addr_b = listener_b.local_addr().unwrap().to_string();
+
+        // A `done` flag lets the server threads exit once the assertion is made,
+        // so neither leaks past the test.
+        let done = Arc::new(AtomicBool::new(false));
+
+        // Server A (primary): handshake the FIRST connection, then drop it so the
+        // reader hits EOF and must reconnect. Crucially, keep the listener ALIVE
+        // and keep accepting: the reconnect path dials A again (it's still the
+        // `current` endpoint until a failed handshake advances off it), and we
+        // give every such attempt an immediate EOF (accept + drop). That makes
+        // A's failure FAST and deterministic — the reader can't stall on a
+        // 15s connect-timeout to a closed port under parallel-test load (the
+        // source of a flaky 100s+ run), it just gets EOF and advances to B.
+        let done_a = Arc::clone(&done);
+        let server_a = std::thread::spawn(move || {
+            listener_a
+                .set_nonblocking(true)
+                .expect("A set_nonblocking");
+            let mut first = true;
+            while !done_a.load(Ordering::Relaxed) {
+                match listener_a.accept() {
+                    Ok((mut sock, _)) => {
+                        // Accepted sockets can inherit the listener's non-blocking
+                        // flag (esp. on Windows); force blocking so the handshake's
+                        // read_line waits for the client's bytes instead of
+                        // returning WouldBlock (a parallel-run flake source).
+                        sock.set_nonblocking(false).ok();
+                        if first {
+                            // First connection: complete the handshake, then drop
+                            // → the established session sees EOF and reconnects.
+                            serve_handshake(&mut sock);
+                            first = false;
+                        }
+                        // Drop `sock` (handshake socket OR any reconnect attempt)
+                        // → immediate EOF for the client, no timeout wait.
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Server B (backup): accept a connection and complete the handshake,
+        // reporting back (via a channel) that it received a subscribe — i.e. the
+        // reader rotated off the dead primary onto the backup.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let done_b = Arc::clone(&done);
+        let server_b = std::thread::spawn(move || {
+            let (mut sock, _) = listener_b.accept().expect("B accept");
+            serve_handshake(&mut sock);
+            let _ = tx.send(()); // B got a subscribe → reader rotated here
+                                 // Hold the socket open until the test is done so the client doesn't
+                                 // immediately EOF-and-reconnect away mid-assertion.
+            while !done_b.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        // Connect with A as primary and B as the failover backup.
+        let client = StratumClient::connect_failover(
+            &[addr_a.clone(), addr_b.clone()],
+            "csd1testworker",
+        )
+        .expect("connect to primary A ok");
+
+        // The reader should rotate from the dead A to B and handshake there.
+        // Bounded wait for B to report it received a subscribe. The path is:
+        // EOF on A → reconnect: sleep BACKOFF_MIN(1s) → dial A (immediate EOF as
+        // A keeps accepting+dropping) → advance() to B → sleep ~2s → handshake
+        // B. So ~3s typical; the channel returns the instant B is hit (no fixed
+        // sleep here). An 8s ceiling is generous slack so it never flakes.
+        let reached_b = rx.recv_timeout(Duration::from_secs(8)).is_ok();
+        // Release the server threads before asserting (so they exit even on
+        // failure) — the join below then returns promptly.
+        done.store(true, Ordering::Relaxed);
+        assert!(
+            reached_b,
+            "reader must rotate from the dead primary A to backup B and re-subscribe"
+        );
+
+        drop(client);
+        let _ = server_a.join();
+        let _ = server_b.join();
     }
 }

@@ -355,7 +355,10 @@ fn main() -> Result<()> {
         );
     }
     tracing::info!("csd-pool-miner: connecting to pool {endpoint} as address {address}");
-    let client = StratumClient::connect(&endpoint, &address)
+    // Hand the full ordered list to the client so the reader's reconnect path can
+    // fail over to a backup pool (and fail back to the primary). With one
+    // endpoint this is the same single-pool, no-failover behavior as before.
+    let client = StratumClient::connect_failover(&endpoints, &address)
         .map_err(|e| anyhow::anyhow!("failed to connect to pool {endpoint}: {e}"))?;
 
     let stop = Arc::new(AtomicBool::new(false));
