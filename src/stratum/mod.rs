@@ -9,11 +9,13 @@
 //!     (byte-locked against the bridge's `verify_submit`).
 //!   - [`loop_stratum`] — the pooled mining loop [`run_stratum`] that drives a
 //!     connected client: poll job → map → hash → submit shares.
+//!   - [`watchdog`]     — pure reliability-watchdog decision logic (P1 §2).
 
 pub mod client;
 pub mod loop_stratum;
 pub mod mapping;
 pub mod protocol;
+pub mod watchdog;
 
 pub use client::{StratumClient, StratumJob};
 pub use loop_stratum::run_stratum;

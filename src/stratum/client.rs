@@ -23,14 +23,16 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 
+use crate::endpoint::EndpointList;
 use super::protocol::{
     authorize_request, serialize_line, subscribe_request, submit_request, NotifyParams,
     Notification, Response, SubscribeResult,
 };
+use super::watchdog::{WatchdogSnapshot, WatchdogView};
 
 /// How long to wait on `connect()` for the TCP three-way handshake.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -43,6 +45,9 @@ const READ_TIMEOUT: Duration = Duration::from_secs(120);
 /// Reconnect backoff bounds.
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// After failing over to a backup pool, how long to stay there before the
+/// reconnect path retries the primary again (a quiet-period failback).
+const FAILBACK_MS: u64 = 30 * 60 * 1000; // 30 min
 
 /// What the reader thread should do with the outcome of one `read_line`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +80,147 @@ fn classify_read(read: &io::Result<usize>) -> ReadAction {
     }
 }
 
+/// The outcome of a `mining.submit`, parsed from the pool's JSON-RPC response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Ack {
+    /// Pool accepted the share (`result: true`).
+    Accepted,
+    /// Pool rejected the share; carries the reason text for the log.
+    Rejected(String),
+    /// A reject whose reason is staleness / job-not-found — a timing loss, not a
+    /// bad share — tracked separately so it doesn't read as a hardware fault.
+    Stale,
+}
+
+/// Per-session share counters, written by the reader thread on each ack and read
+/// (lock-free) by the loop / heartbeat. (Grows in later P1 steps: unacked
+/// streak + last-accept timestamp for the watchdogs.)
+#[derive(Default)]
+struct SessionStats {
+    accepted: AtomicU64,
+    rejected: AtomicU64,
+    stale: AtomicU64,
+    /// Total shares written to the socket (for shares_10m + the submit-ack wd).
+    submitted: AtomicU64,
+    /// Consecutive submits with no ack of any kind; reset by ANY ack. Drives the
+    /// submit-ack watchdog (a half-open socket gets jobs but drops shares).
+    consecutive_unacked: AtomicU64,
+    /// Unix-ms of the last ACCEPTED share (0 = none yet); accepted-share dead-man.
+    last_accept_ms: AtomicU64,
+    /// Unix-ms a *new* job_id last arrived (0 = none yet); job-staleness wd. Only
+    /// advanced on a changed id, so a same-id resend can't mask a stalled pool.
+    last_new_job_ms: AtomicU64,
+}
+
+/// Current wall-clock time as milliseconds since the Unix epoch (0 if the clock
+/// predates the epoch — never panics). Stamps share/job timestamps for the
+/// staleness watchdogs.
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Classify a received line as a `mining.submit` response, if it is one.
+///
+/// A submit ack is a JSON-RPC *response*: a numeric `id` plus a top-level
+/// `result`/`error`, and crucially **no `method`** (server pushes like
+/// `mining.notify` always carry `method`). Submit ids start at 100
+/// ([`StratumClient::send_submit`] seeds `next_id` at 100); subscribe/authorize
+/// use ids 1/2 and only ever occur inside the handshake loop, never on the
+/// reader thread — so an `id >= 100` response the reader sees is a submit ack.
+/// Returns `None` for pushes / handshake replies / junk so the caller falls
+/// through to [`dispatch_frame`]. Pure → unit-tested directly.
+fn classify_ack(line: &str) -> Option<Ack> {
+    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    let obj = v.as_object()?;
+    // A server push (notify/set_difficulty/…) carries `method` — not an ack.
+    if obj.get("method").and_then(|m| m.as_str()).is_some() {
+        return None;
+    }
+    // Must be a JSON-RPC response carrying a submit id (>= 100).
+    let id = obj.get("id").and_then(|i| i.as_u64())?;
+    if id < 100 {
+        return None; // subscribe/authorize handshake reply, not a submit ack
+    }
+    if obj.get("result").and_then(|r| r.as_bool()) == Some(true) {
+        return Some(Ack::Accepted);
+    }
+    // Anything else is a reject; pull a reason and sub-classify staleness.
+    let reason = obj
+        .get("error")
+        .filter(|e| !e.is_null())
+        .map(reason_from_error)
+        .unwrap_or_else(|| "rejected".to_string());
+    let low = reason.to_ascii_lowercase();
+    if low.contains("stale") || low.contains("job not found") || low.contains("unknown job") {
+        Some(Ack::Stale)
+    } else {
+        Some(Ack::Rejected(reason))
+    }
+}
+
+/// Pull a human reason out of a JSON-RPC `error` value. Stratum sends
+/// `[code, "message", data]`; some pools send a bare string or an object.
+fn reason_from_error(err: &serde_json::Value) -> String {
+    if let Some(msg) = err
+        .as_array()
+        .and_then(|a| a.get(1))
+        .and_then(|m| m.as_str())
+    {
+        return msg.to_string();
+    }
+    if let Some(s) = err.as_str() {
+        return s.to_string();
+    }
+    err.to_string()
+}
+
+/// Record `line` as a submit ack into `stats` if it is one. Returns `true` if it
+/// was an ack (counted here); `false` if the caller should hand it to
+/// [`dispatch_frame`] as a server push.
+fn record_ack(line: &str, stats: &SessionStats) -> bool {
+    let ack = match classify_ack(line) {
+        Some(a) => a,
+        None => return false,
+    };
+    // ANY ack — accept or reject — proves the connection is alive and
+    // responding, so the unacked streak resets (submit-ack watchdog).
+    stats.consecutive_unacked.store(0, Ordering::Relaxed);
+    match ack {
+        Ack::Accepted => {
+            stats.accepted.fetch_add(1, Ordering::Relaxed);
+            stats.last_accept_ms.store(now_unix_ms(), Ordering::Relaxed);
+        }
+        Ack::Rejected(reason) => {
+            stats.rejected.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!("stratum: share REJECTED by pool: {reason}");
+        }
+        Ack::Stale => {
+            stats.stale.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!("stratum: share STALE (too late / job not found)");
+        }
+    }
+    true
+}
+
+/// A point-in-time view of the miner's liveness + share accounting, for the INFO
+/// heartbeat. Empty default for sources without a live connection (the mock / a
+/// future solo source).
+#[derive(Debug, Clone, Default)]
+pub struct HealthSnapshot {
+    pub accepted: u64,
+    pub rejected: u64,
+    pub stale: u64,
+    pub submitted: u64,
+    /// Seconds since the last *new* job (`None` = no job received yet).
+    pub job_age_s: Option<u64>,
+    /// The pool endpoint (the configured primary; v0.1.8 doesn't reflect a
+    /// failover here — the heartbeat's value is the share counts + job age).
+    pub endpoint: String,
+}
+
 /// A job pushed by the pool via `mining.notify`, paired with the session
 /// `extranonce1` captured at subscribe time. The notify→header mapping is
 /// Task 3; this is the raw material that mapping will consume.
@@ -100,6 +246,8 @@ struct Shared {
     extranonce2_size: AtomicU64,
     /// Set on shutdown so the reader loop exits instead of reconnecting.
     shutdown: AtomicBool,
+    /// Accept/reject/stale share counters, written by the reader on each ack.
+    stats: SessionStats,
 }
 
 impl Shared {
@@ -147,10 +295,24 @@ struct Handshake {
 }
 
 impl StratumClient {
-    /// Connect to `endpoint` (`host:port`), run the subscribe + authorize
-    /// handshake, capture `extranonce1`/`extranonce2_size`, confirm authorize
-    /// returned `true` (bail otherwise), then spawn the reader thread.
+    /// Connect to a single `endpoint` (`host:port`) with no failover. Thin shim
+    /// over [`connect_failover`](Self::connect_failover) on a one-element list,
+    /// preserving every existing caller/test on a no-failover path.
     pub fn connect(endpoint: &str, worker_addr: &str) -> Result<Self> {
+        Self::connect_failover(&[endpoint.to_string()], worker_addr)
+    }
+
+    /// Connect to the PRIMARY pool (`endpoints.first()`), run the subscribe +
+    /// authorize handshake, capture `extranonce1`/`extranonce2_size`, confirm
+    /// authorize returned `true` (bail otherwise), then spawn the reader thread
+    /// with the full failover [`EndpointList`]. On a dropped connection the
+    /// reader rotates through `endpoints` (and fails back to the primary after a
+    /// quiet interval); a single-element list is the no-failover path.
+    pub fn connect_failover(endpoints: &[String], worker_addr: &str) -> Result<Self> {
+        let endpoint = endpoints
+            .first()
+            .ok_or_else(|| anyhow!("connect_failover needs at least one endpoint"))?;
+
         let hs = Self::handshake(endpoint, worker_addr)
             .with_context(|| format!("stratum handshake to {endpoint}"))?;
 
@@ -160,6 +322,7 @@ impl StratumClient {
             extranonce1_hex: Mutex::new(hs.subscribe.extranonce1_hex.clone()),
             extranonce2_size: AtomicU64::new(hs.subscribe.extranonce2_size as u64),
             shutdown: AtomicBool::new(false),
+            stats: SessionStats::default(),
         });
 
         let extranonce1 = hs.subscribe.extranonce1_hex.clone();
@@ -178,8 +341,11 @@ impl StratumClient {
             dispatch_frame(push, &shared);
         }
 
+        // Hand the reader the FULL ordered endpoint list (index 0 = primary it
+        // is already connected to) so its reconnect path can rotate to a backup
+        // and fail back. A one-element list is a no-op rotation.
         let reader = Self::spawn_reader(
-            endpoint.to_string(),
+            EndpointList::new(endpoints.to_vec()),
             worker_addr.to_string(),
             hs.reader,
             Arc::clone(&shared),
@@ -326,7 +492,7 @@ impl StratumClient {
     /// difficulty. On any read error/timeout/EOF it reconnects with capped
     /// backoff (re-subscribe/re-authorize) unless shutdown was signalled.
     fn spawn_reader(
-        endpoint: String,
+        endpoints: EndpointList,
         worker_addr: String,
         initial_reader: BufReader<TcpStream>,
         shared: Arc<Shared>,
@@ -335,6 +501,7 @@ impl StratumClient {
         std::thread::Builder::new()
             .name("stratum-reader".to_string())
             .spawn(move || {
+                let mut endpoints = endpoints;
                 let mut reader = initial_reader;
                 let mut backoff = BACKOFF_MIN;
                 let mut line = String::new();
@@ -351,7 +518,13 @@ impl StratumClient {
                     let read = reader.read_line(&mut line);
                     match classify_read(&read) {
                         ReadAction::Frame => {
-                            dispatch_frame(line.trim(), &shared);
+                            // A submit ack (accepted/rejected/stale) is counted
+                            // here; anything else is a server push handed to
+                            // dispatch_frame (jobs / difficulty).
+                            let frame = line.trim();
+                            if !record_ack(frame, &shared.stats) {
+                                dispatch_frame(frame, &shared);
+                            }
                             line.clear();
                             backoff = BACKOFF_MIN; // healthy read resets backoff
                         }
@@ -365,18 +538,19 @@ impl StratumClient {
                             if shared.shutdown.load(Ordering::Relaxed) {
                                 return;
                             }
+                            let current = endpoints.current().to_string();
                             if let Err(e) = &read {
                                 tracing::warn!(
-                                    "stratum: read error from {endpoint}: {e}; reconnecting"
+                                    "stratum: read error from {current}: {e}; reconnecting"
                                 );
                             } else {
                                 tracing::warn!(
-                                    "stratum: connection closed by {endpoint}, reconnecting"
+                                    "stratum: connection closed by {current}, reconnecting"
                                 );
                             }
                             line.clear();
                             if !reconnect(
-                                &endpoint,
+                                &mut endpoints,
                                 &worker_addr,
                                 &shared,
                                 &writer,
@@ -430,6 +604,31 @@ impl StratumClient {
         &self.worker_addr
     }
 
+    /// A `'static` [`WatchdogView`] handle for the reliability-watchdog thread:
+    /// reads the session counters and can force a reconnect by shutting the
+    /// socket (so the reader's af8c236 reconnect path fires).
+    pub fn watchdog_handle(&self) -> Arc<dyn WatchdogView> {
+        Arc::new(ClientWatchdog {
+            shared: Arc::clone(&self.shared),
+            writer: Arc::clone(&self.writer),
+        })
+    }
+
+    /// Snapshot the session's share counters + job age for the heartbeat.
+    pub fn health_snapshot(&self) -> HealthSnapshot {
+        let s = &self.shared.stats;
+        let last_job = s.last_new_job_ms.load(Ordering::Relaxed);
+        let job_age_s = (last_job != 0).then(|| now_unix_ms().saturating_sub(last_job) / 1000);
+        HealthSnapshot {
+            accepted: s.accepted.load(Ordering::Relaxed),
+            rejected: s.rejected.load(Ordering::Relaxed),
+            stale: s.stale.load(Ordering::Relaxed),
+            submitted: s.submitted.load(Ordering::Relaxed),
+            job_age_s,
+            endpoint: self.endpoint.clone(),
+        }
+    }
+
     /// Send a `mining.submit` line for a found share. Serializes writes through
     /// the writer mutex. Errors bubble up so the caller can log/account them.
     pub fn send_submit(
@@ -450,6 +649,13 @@ impl StratumClient {
         w.write_all(line.as_bytes())
             .context("writing mining.submit")?;
         w.flush().ok();
+        // Account the submit: one more pending share until an ack resets the
+        // streak (the submit-ack watchdog watches `consecutive_unacked`).
+        self.shared.stats.submitted.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .stats
+            .consecutive_unacked
+            .fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -465,6 +671,30 @@ impl Drop for StratumClient {
         if let Some(h) = self.reader.take() {
             let _ = h.join();
         }
+    }
+}
+
+/// Watchdog handle backed by the live client's shared state + writer socket.
+struct ClientWatchdog {
+    shared: Arc<Shared>,
+    writer: Arc<Mutex<TcpStream>>,
+}
+
+impl WatchdogView for ClientWatchdog {
+    fn snapshot(&self) -> WatchdogSnapshot {
+        WatchdogSnapshot {
+            consecutive_unacked: self.shared.stats.consecutive_unacked.load(Ordering::Relaxed),
+            last_new_job_ms: self.shared.stats.last_new_job_ms.load(Ordering::Relaxed),
+        }
+    }
+    fn request_reconnect(&self) {
+        // Shut the socket so the reader's existing reconnect path (the
+        // af8c236-blessed classify_read → reconnect) fires promptly — never a
+        // forked reconnect.
+        if let Ok(w) = self.writer.lock() {
+            let _ = w.shutdown(std::net::Shutdown::Both);
+        }
+        tracing::warn!("stratum: watchdog requested reconnect (shutting socket)");
     }
 }
 
@@ -497,10 +727,22 @@ fn dispatch_frame(line: &str, shared: &Shared) {
                 let job_id = notify.job_id.clone();
                 let clean = notify.clean_jobs;
                 if let Ok(mut slot) = shared.latest_job.lock() {
+                    // Stamp the staleness clock only on a *changed* job_id: a
+                    // same-id resend must not mask a stalled pool (G3).
+                    let changed = slot
+                        .as_ref()
+                        .map(|j| j.notify.job_id != job_id)
+                        .unwrap_or(true);
                     *slot = Some(StratumJob {
                         notify,
                         extranonce1_hex,
                     });
+                    if changed {
+                        shared
+                            .stats
+                            .last_new_job_ms
+                            .store(now_unix_ms(), Ordering::Relaxed);
+                    }
                 }
                 tracing::debug!("stratum: new job {job_id} (clean_jobs={clean})");
             }
@@ -534,10 +776,14 @@ fn dispatch_frame(line: &str, shared: &Shared) {
 /// session extranonce1/size. Returns `false` iff shutdown was requested (so the
 /// reader loop should exit); `true` once reconnected.
 ///
-/// The backoff doubles each failed attempt up to [`BACKOFF_MAX`]; a successful
-/// reconnect resets it (the caller also resets on the next healthy read).
+/// Failover: each attempt dials `endpoints.current()`. A failed handshake
+/// rotates to the next pool via [`EndpointList::advance`] (a no-op for a single
+/// endpoint); after a quiet interval on a backup, [`EndpointList::maybe_failback`]
+/// brings the next attempt back to the primary. The backoff doubles each failed
+/// attempt up to [`BACKOFF_MAX`]; a successful reconnect resets it (the caller
+/// also resets on the next healthy read).
 fn reconnect(
-    endpoint: &str,
+    endpoints: &mut EndpointList,
     worker_addr: &str,
     shared: &Arc<Shared>,
     writer: &Arc<Mutex<TcpStream>>,
@@ -555,7 +801,15 @@ fn reconnect(
             return false;
         }
 
-        match StratumClient::handshake(endpoint, worker_addr) {
+        // If we've been parked on a backup long enough, prefer the primary again
+        // before this attempt (a quiet-period failback). On the primary this is
+        // a no-op that just keeps the failback clock fresh.
+        if endpoints.maybe_failback(now_unix_ms(), FAILBACK_MS) {
+            tracing::info!("stratum: failback — retrying primary {}", endpoints.current());
+        }
+        let ep = endpoints.current().to_string();
+
+        match StratumClient::handshake(&ep, worker_addr) {
             Ok(hs) => {
                 // Refresh session params the bridge may have rotated.
                 if let Ok(mut x) = shared.extranonce1_hex.lock() {
@@ -580,13 +834,20 @@ fn reconnect(
                     // Best-effort close of the dead socket before swap.
                     let _ = w.shutdown(std::net::Shutdown::Both);
                     *w = hs.write_stream;
+                    // Reset the un-acked streak under the SAME writer lock the
+                    // watchdog must hold to shut the socket, so a stale streak
+                    // can't tear down the brand-new connection (review M1).
+                    shared.stats.consecutive_unacked.store(0, Ordering::Relaxed);
                 }
                 *backoff = BACKOFF_MIN;
-                tracing::info!("stratum: reconnected to {endpoint}");
+                tracing::info!("stratum: reconnected to {ep}");
                 return true;
             }
             Err(e) => {
-                tracing::warn!("stratum: reconnect to {endpoint} failed: {e}");
+                tracing::warn!("stratum: reconnect to {ep} failed: {e}; trying next endpoint");
+                // Rotate to the next pool in the failover list (no-op for a
+                // single endpoint) so the next attempt dials a different one.
+                endpoints.advance();
             }
         }
 
@@ -608,6 +869,7 @@ mod tests {
             extranonce1_hex: Mutex::new(xn1.to_string()),
             extranonce2_size: AtomicU64::new(xn2_size),
             shutdown: AtomicBool::new(false),
+            stats: SessionStats::default(),
         })
     }
 
@@ -653,6 +915,81 @@ mod tests {
     }
 
     #[test]
+    fn classify_ack_accepts_rejects_and_stale() {
+        assert_eq!(
+            classify_ack(r#"{"id":101,"result":true,"error":null}"#),
+            Some(Ack::Accepted)
+        );
+        // result:false with no error → generic reject.
+        assert_eq!(
+            classify_ack(r#"{"id":102,"result":false,"error":null}"#),
+            Some(Ack::Rejected("rejected".to_string()))
+        );
+        // error array [code, message, data] → reject carrying the message.
+        assert_eq!(
+            classify_ack(r#"{"id":103,"result":null,"error":[23,"Low difficulty share",null]}"#),
+            Some(Ack::Rejected("Low difficulty share".to_string()))
+        );
+        // stale / job-not-found → Stale sub-class.
+        assert_eq!(
+            classify_ack(r#"{"id":104,"result":null,"error":[21,"Job not found",null]}"#),
+            Some(Ack::Stale)
+        );
+        assert_eq!(
+            classify_ack(r#"{"id":105,"result":null,"error":[21,"stale share",null]}"#),
+            Some(Ack::Stale)
+        );
+        // Not submit acks: a server push (has `method`)…
+        assert_eq!(
+            classify_ack(r#"{"id":null,"method":"mining.notify","params":[]}"#),
+            None
+        );
+        // …a handshake reply (id < 100)…
+        assert_eq!(classify_ack(r#"{"id":2,"result":true}"#), None);
+        // …and junk / blank.
+        assert_eq!(classify_ack("not json"), None);
+        assert_eq!(classify_ack(""), None);
+    }
+
+    #[test]
+    fn record_ack_counts_into_stats() {
+        let stats = SessionStats::default();
+        assert!(record_ack(r#"{"id":101,"result":true}"#, &stats));
+        assert!(record_ack(r#"{"id":102,"result":true}"#, &stats));
+        assert!(record_ack(
+            r#"{"id":103,"result":false,"error":[20,"bad",null]}"#,
+            &stats
+        ));
+        assert!(record_ack(
+            r#"{"id":104,"error":[21,"stale share",null]}"#,
+            &stats
+        ));
+        // A server push is NOT an ack → false (caller will dispatch it).
+        assert!(!record_ack(
+            r#"{"id":null,"method":"mining.notify","params":[]}"#,
+            &stats
+        ));
+        assert_eq!(stats.accepted.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.rejected.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.stale.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn record_ack_resets_unacked_and_stamps_accept() {
+        let stats = SessionStats::default();
+        // An accept clears a pending streak AND stamps the accept clock.
+        stats.consecutive_unacked.store(7, Ordering::Relaxed);
+        assert!(record_ack(r#"{"id":101,"result":true}"#, &stats));
+        assert_eq!(stats.consecutive_unacked.load(Ordering::Relaxed), 0);
+        assert!(stats.last_accept_ms.load(Ordering::Relaxed) > 0);
+        // A reject ALSO resets the streak (the pool is responding) but does not
+        // stamp last_accept.
+        stats.consecutive_unacked.store(3, Ordering::Relaxed);
+        assert!(record_ack(r#"{"id":102,"result":false}"#, &stats));
+        assert_eq!(stats.consecutive_unacked.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn dispatch_notify_updates_latest_job() {
         let shared = fresh_shared("cafef00d", 4);
         let line = r#"{"id":null,"method":"mining.notify","params":["jX","00ff","aa","bb",["cc"],"01000000","1d00ffff","60c0babe",true]}"#;
@@ -671,6 +1008,26 @@ mod tests {
         let line = r#"{"id":null,"method":"mining.set_difficulty","params":[2048.5]}"#;
         dispatch_frame(line, &shared);
         assert_eq!(shared.difficulty(), 2048.5);
+    }
+
+    #[test]
+    fn dispatch_stamps_last_new_job_only_on_changed_id() {
+        let shared = fresh_shared("00", 4);
+        let job_a = r#"{"id":null,"method":"mining.notify","params":["A","p","a","b",[],"01000000","1d00ffff","60c0babe",true]}"#;
+        dispatch_frame(job_a, &shared);
+        let t1 = shared.stats.last_new_job_ms.load(Ordering::Relaxed);
+        assert!(t1 > 0, "a new job stamps the staleness clock");
+        // Same job_id again → the clock must NOT move (a resend can't mask a
+        // stalled pool).
+        dispatch_frame(job_a, &shared);
+        assert_eq!(shared.stats.last_new_job_ms.load(Ordering::Relaxed), t1);
+        // A different job_id is stored (the `changed` branch is taken).
+        let job_b = r#"{"id":null,"method":"mining.notify","params":["B","p","a","b",[],"01000000","1d00ffff","60c0babe",true]}"#;
+        dispatch_frame(job_b, &shared);
+        assert_eq!(
+            shared.latest_job.lock().unwrap().as_ref().unwrap().notify.job_id,
+            "B"
+        );
     }
 
     #[test]
@@ -826,5 +1183,127 @@ mod tests {
 
         drop(client);
         let _ = server.join();
+    }
+
+    /// Play the bridge side of one subscribe/authorize handshake on `sock`:
+    /// read the two requests, then reply subscribe-result + authorize-true.
+    /// Shared by the failover test's two fake pools. Returns once the handshake
+    /// is written (the caller decides whether to keep the socket open or drop it).
+    fn serve_handshake(sock: &mut TcpStream) {
+        let mut br = BufReader::new(sock.try_clone().unwrap());
+        let mut req = String::new();
+        br.read_line(&mut req).unwrap(); // subscribe (id=1)
+        req.clear();
+        br.read_line(&mut req).unwrap(); // authorize (id=2)
+        sock.write_all(
+            b"{\"id\":1,\"result\":[[[\"mining.notify\",\"1\"]],\"abcd1234\",4],\"error\":null}\n",
+        )
+        .unwrap();
+        sock.write_all(b"{\"id\":2,\"result\":true,\"error\":null}\n")
+            .unwrap();
+        sock.flush().unwrap();
+    }
+
+    /// Failover: when the PRIMARY pool dies after the handshake, the reader must
+    /// rotate to the BACKUP via `EndpointList::advance` and re-handshake there.
+    ///
+    /// Two listeners stand in for pool A (primary) and pool B (backup). A
+    /// accepts the first connection, completes the handshake, then drops the
+    /// socket → the reader sees EOF (`ReadAction::Reconnect`). B accepts a
+    /// connection and completes a full handshake, signalling (via a channel)
+    /// that it received a `mining.subscribe` — i.e. the reader rotated off the
+    /// dead primary onto the backup. Asserts B is reached within a bounded wait
+    /// (no fixed long sleeps).
+    #[test]
+    fn reconnect_rotates_to_backup_on_primary_failure() {
+        let listener_a = TcpListener::bind("127.0.0.1:0").expect("bind A");
+        let listener_b = TcpListener::bind("127.0.0.1:0").expect("bind B");
+        let addr_a = listener_a.local_addr().unwrap().to_string();
+        let addr_b = listener_b.local_addr().unwrap().to_string();
+
+        // A `done` flag lets the server threads exit once the assertion is made,
+        // so neither leaks past the test.
+        let done = Arc::new(AtomicBool::new(false));
+
+        // Server A (primary): handshake the FIRST connection, then drop it so the
+        // reader hits EOF and must reconnect. Crucially, keep the listener ALIVE
+        // and keep accepting: the reconnect path dials A again (it's still the
+        // `current` endpoint until a failed handshake advances off it), and we
+        // give every such attempt an immediate EOF (accept + drop). That makes
+        // A's failure FAST and deterministic — the reader can't stall on a
+        // 15s connect-timeout to a closed port under parallel-test load (the
+        // source of a flaky 100s+ run), it just gets EOF and advances to B.
+        let done_a = Arc::clone(&done);
+        let server_a = std::thread::spawn(move || {
+            listener_a
+                .set_nonblocking(true)
+                .expect("A set_nonblocking");
+            let mut first = true;
+            while !done_a.load(Ordering::Relaxed) {
+                match listener_a.accept() {
+                    Ok((mut sock, _)) => {
+                        // Accepted sockets can inherit the listener's non-blocking
+                        // flag (esp. on Windows); force blocking so the handshake's
+                        // read_line waits for the client's bytes instead of
+                        // returning WouldBlock (a parallel-run flake source).
+                        sock.set_nonblocking(false).ok();
+                        if first {
+                            // First connection: complete the handshake, then drop
+                            // → the established session sees EOF and reconnects.
+                            serve_handshake(&mut sock);
+                            first = false;
+                        }
+                        // Drop `sock` (handshake socket OR any reconnect attempt)
+                        // → immediate EOF for the client, no timeout wait.
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Server B (backup): accept a connection and complete the handshake,
+        // reporting back (via a channel) that it received a subscribe — i.e. the
+        // reader rotated off the dead primary onto the backup.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let done_b = Arc::clone(&done);
+        let server_b = std::thread::spawn(move || {
+            let (mut sock, _) = listener_b.accept().expect("B accept");
+            serve_handshake(&mut sock);
+            let _ = tx.send(()); // B got a subscribe → reader rotated here
+                                 // Hold the socket open until the test is done so the client doesn't
+                                 // immediately EOF-and-reconnect away mid-assertion.
+            while !done_b.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        // Connect with A as primary and B as the failover backup.
+        let client = StratumClient::connect_failover(
+            &[addr_a.clone(), addr_b.clone()],
+            "csd1testworker",
+        )
+        .expect("connect to primary A ok");
+
+        // The reader should rotate from the dead A to B and handshake there.
+        // Bounded wait for B to report it received a subscribe. The path is:
+        // EOF on A → reconnect: sleep BACKOFF_MIN(1s) → dial A (immediate EOF as
+        // A keeps accepting+dropping) → advance() to B → sleep ~2s → handshake
+        // B. So ~3s typical; the channel returns the instant B is hit (no fixed
+        // sleep here). An 8s ceiling is generous slack so it never flakes.
+        let reached_b = rx.recv_timeout(Duration::from_secs(8)).is_ok();
+        // Release the server threads before asserting (so they exit even on
+        // failure) — the join below then returns promptly.
+        done.store(true, Ordering::Relaxed);
+        assert!(
+            reached_b,
+            "reader must rotate from the dead primary A to backup B and re-subscribe"
+        );
+
+        drop(client);
+        let _ = server_a.join();
+        let _ = server_b.join();
     }
 }
