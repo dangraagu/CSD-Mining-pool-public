@@ -75,6 +75,106 @@ fn classify_read(read: &io::Result<usize>) -> ReadAction {
     }
 }
 
+/// The outcome of a `mining.submit`, parsed from the pool's JSON-RPC response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Ack {
+    /// Pool accepted the share (`result: true`).
+    Accepted,
+    /// Pool rejected the share; carries the reason text for the log.
+    Rejected(String),
+    /// A reject whose reason is staleness / job-not-found — a timing loss, not a
+    /// bad share — tracked separately so it doesn't read as a hardware fault.
+    Stale,
+}
+
+/// Per-session share counters, written by the reader thread on each ack and read
+/// (lock-free) by the loop / heartbeat. (Grows in later P1 steps: unacked
+/// streak + last-accept timestamp for the watchdogs.)
+#[derive(Default)]
+struct SessionStats {
+    accepted: AtomicU64,
+    rejected: AtomicU64,
+    stale: AtomicU64,
+}
+
+/// Classify a received line as a `mining.submit` response, if it is one.
+///
+/// A submit ack is a JSON-RPC *response*: a numeric `id` plus a top-level
+/// `result`/`error`, and crucially **no `method`** (server pushes like
+/// `mining.notify` always carry `method`). Submit ids start at 100
+/// ([`StratumClient::send_submit`] seeds `next_id` at 100); subscribe/authorize
+/// use ids 1/2 and only ever occur inside the handshake loop, never on the
+/// reader thread — so an `id >= 100` response the reader sees is a submit ack.
+/// Returns `None` for pushes / handshake replies / junk so the caller falls
+/// through to [`dispatch_frame`]. Pure → unit-tested directly.
+fn classify_ack(line: &str) -> Option<Ack> {
+    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    let obj = v.as_object()?;
+    // A server push (notify/set_difficulty/…) carries `method` — not an ack.
+    if obj.get("method").and_then(|m| m.as_str()).is_some() {
+        return None;
+    }
+    // Must be a JSON-RPC response carrying a submit id (>= 100).
+    let id = obj.get("id").and_then(|i| i.as_u64())?;
+    if id < 100 {
+        return None; // subscribe/authorize handshake reply, not a submit ack
+    }
+    if obj.get("result").and_then(|r| r.as_bool()) == Some(true) {
+        return Some(Ack::Accepted);
+    }
+    // Anything else is a reject; pull a reason and sub-classify staleness.
+    let reason = obj
+        .get("error")
+        .filter(|e| !e.is_null())
+        .map(reason_from_error)
+        .unwrap_or_else(|| "rejected".to_string());
+    let low = reason.to_ascii_lowercase();
+    if low.contains("stale") || low.contains("job not found") || low.contains("unknown job") {
+        Some(Ack::Stale)
+    } else {
+        Some(Ack::Rejected(reason))
+    }
+}
+
+/// Pull a human reason out of a JSON-RPC `error` value. Stratum sends
+/// `[code, "message", data]`; some pools send a bare string or an object.
+fn reason_from_error(err: &serde_json::Value) -> String {
+    if let Some(msg) = err
+        .as_array()
+        .and_then(|a| a.get(1))
+        .and_then(|m| m.as_str())
+    {
+        return msg.to_string();
+    }
+    if let Some(s) = err.as_str() {
+        return s.to_string();
+    }
+    err.to_string()
+}
+
+/// Record `line` as a submit ack into `stats` if it is one. Returns `true` if it
+/// was an ack (counted here); `false` if the caller should hand it to
+/// [`dispatch_frame`] as a server push.
+fn record_ack(line: &str, stats: &SessionStats) -> bool {
+    match classify_ack(line) {
+        Some(Ack::Accepted) => {
+            stats.accepted.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        Some(Ack::Rejected(reason)) => {
+            stats.rejected.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!("stratum: share REJECTED by pool: {reason}");
+            true
+        }
+        Some(Ack::Stale) => {
+            stats.stale.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!("stratum: share STALE (too late / job not found)");
+            true
+        }
+        None => false,
+    }
+}
+
 /// A job pushed by the pool via `mining.notify`, paired with the session
 /// `extranonce1` captured at subscribe time. The notify→header mapping is
 /// Task 3; this is the raw material that mapping will consume.
@@ -100,6 +200,8 @@ struct Shared {
     extranonce2_size: AtomicU64,
     /// Set on shutdown so the reader loop exits instead of reconnecting.
     shutdown: AtomicBool,
+    /// Accept/reject/stale share counters, written by the reader on each ack.
+    stats: SessionStats,
 }
 
 impl Shared {
@@ -160,6 +262,7 @@ impl StratumClient {
             extranonce1_hex: Mutex::new(hs.subscribe.extranonce1_hex.clone()),
             extranonce2_size: AtomicU64::new(hs.subscribe.extranonce2_size as u64),
             shutdown: AtomicBool::new(false),
+            stats: SessionStats::default(),
         });
 
         let extranonce1 = hs.subscribe.extranonce1_hex.clone();
@@ -351,7 +454,13 @@ impl StratumClient {
                     let read = reader.read_line(&mut line);
                     match classify_read(&read) {
                         ReadAction::Frame => {
-                            dispatch_frame(line.trim(), &shared);
+                            // A submit ack (accepted/rejected/stale) is counted
+                            // here; anything else is a server push handed to
+                            // dispatch_frame (jobs / difficulty).
+                            let frame = line.trim();
+                            if !record_ack(frame, &shared.stats) {
+                                dispatch_frame(frame, &shared);
+                            }
                             line.clear();
                             backoff = BACKOFF_MIN; // healthy read resets backoff
                         }
@@ -608,6 +717,7 @@ mod tests {
             extranonce1_hex: Mutex::new(xn1.to_string()),
             extranonce2_size: AtomicU64::new(xn2_size),
             shutdown: AtomicBool::new(false),
+            stats: SessionStats::default(),
         })
     }
 
@@ -650,6 +760,66 @@ mod tests {
     #[test]
     fn full_frame_is_processed() {
         assert_eq!(classify_read(&Ok(42)), ReadAction::Frame);
+    }
+
+    #[test]
+    fn classify_ack_accepts_rejects_and_stale() {
+        assert_eq!(
+            classify_ack(r#"{"id":101,"result":true,"error":null}"#),
+            Some(Ack::Accepted)
+        );
+        // result:false with no error → generic reject.
+        assert_eq!(
+            classify_ack(r#"{"id":102,"result":false,"error":null}"#),
+            Some(Ack::Rejected("rejected".to_string()))
+        );
+        // error array [code, message, data] → reject carrying the message.
+        assert_eq!(
+            classify_ack(r#"{"id":103,"result":null,"error":[23,"Low difficulty share",null]}"#),
+            Some(Ack::Rejected("Low difficulty share".to_string()))
+        );
+        // stale / job-not-found → Stale sub-class.
+        assert_eq!(
+            classify_ack(r#"{"id":104,"result":null,"error":[21,"Job not found",null]}"#),
+            Some(Ack::Stale)
+        );
+        assert_eq!(
+            classify_ack(r#"{"id":105,"result":null,"error":[21,"stale share",null]}"#),
+            Some(Ack::Stale)
+        );
+        // Not submit acks: a server push (has `method`)…
+        assert_eq!(
+            classify_ack(r#"{"id":null,"method":"mining.notify","params":[]}"#),
+            None
+        );
+        // …a handshake reply (id < 100)…
+        assert_eq!(classify_ack(r#"{"id":2,"result":true}"#), None);
+        // …and junk / blank.
+        assert_eq!(classify_ack("not json"), None);
+        assert_eq!(classify_ack(""), None);
+    }
+
+    #[test]
+    fn record_ack_counts_into_stats() {
+        let stats = SessionStats::default();
+        assert!(record_ack(r#"{"id":101,"result":true}"#, &stats));
+        assert!(record_ack(r#"{"id":102,"result":true}"#, &stats));
+        assert!(record_ack(
+            r#"{"id":103,"result":false,"error":[20,"bad",null]}"#,
+            &stats
+        ));
+        assert!(record_ack(
+            r#"{"id":104,"error":[21,"stale share",null]}"#,
+            &stats
+        ));
+        // A server push is NOT an ack → false (caller will dispatch it).
+        assert!(!record_ack(
+            r#"{"id":null,"method":"mining.notify","params":[]}"#,
+            &stats
+        ));
+        assert_eq!(stats.accepted.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.rejected.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.stale.load(Ordering::Relaxed), 1);
     }
 
     #[test]
