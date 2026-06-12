@@ -22,7 +22,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 
@@ -206,6 +206,30 @@ fn format_health_line(h: &HealthSnapshot, difficulty: f64) -> String {
     )
 }
 
+/// Pure FNV-1a mix of a process id + an entropy word into a starting `xn2`, so
+/// two rigs mining the SAME address (one process per GPU, or across machines)
+/// begin at different coinbase regions instead of both sweeping `xn2=0..` and
+/// duplicating work. Deterministic for a given `(pid, entropy)`.
+fn mix_xn2_seed(pid: u32, entropy: u32) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in pid.to_le_bytes().iter().chain(entropy.to_le_bytes().iter()) {
+        h ^= u32::from(*b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
+/// Seed `xn2` from this process's id + sub-second startup entropy. Wire-safe:
+/// the bridge accepts any 4-byte xn2 (see [`crate::stratum::mapping::build_submit`]).
+fn seed_xn2() -> u32 {
+    let pid = std::process::id();
+    let entropy = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    mix_xn2_seed(pid, entropy)
+}
+
 /// Run the pooled Stratum mining loop until `stop` is set.
 ///
 /// `client` must already be connected (handshake done, reader thread running).
@@ -236,7 +260,9 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
 
     // The miner-rolled high half of the coinbase extranonce. Bumped once per
     // exhausted launch. The low half (xn1) is pool-fixed and NEVER rolled here.
-    let mut xn2: u32 = 0;
+    // Seeded per-process so co-fleet rigs (same address, one process per GPU)
+    // sweep DIFFERENT coinbase regions instead of duplicating xn2=0.. work.
+    let mut xn2: u32 = seed_xn2();
 
     if cfg.cpu_threads > 0 && cfg.cpu_share > 0.0 {
         tracing::info!(
@@ -1030,6 +1056,17 @@ mod tests {
         let line2 = format_health_line(&h2, 1.0);
         assert!(line2.contains("job_age=n/a"));
         assert!(line2.contains("pool=?"));
+    }
+
+    #[test]
+    fn xn2_seed_diverges_by_pid_and_entropy() {
+        // Deterministic for fixed inputs.
+        assert_eq!(mix_xn2_seed(1234, 5678), mix_xn2_seed(1234, 5678));
+        // A different pid OR different entropy → a different seed.
+        assert_ne!(mix_xn2_seed(1234, 5678), mix_xn2_seed(1235, 5678));
+        assert_ne!(mix_xn2_seed(1234, 5678), mix_xn2_seed(1234, 5679));
+        // Two distinct co-fleet rigs (distinct pids) get distinct seeds.
+        assert_ne!(mix_xn2_seed(1000, 42), mix_xn2_seed(2000, 42));
     }
 
     /// Drive the REAL `run_stratum` with a mock work source + a never-finds
