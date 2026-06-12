@@ -13,11 +13,16 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
 use crate::consensus_types::{WorkSubmission, WorkTemplate};
+use crate::stratum::client::{HealthSnapshot, StratumJob};
+use crate::stratum::loop_stratum::{LoopWork, WorkIntake, WorkSource};
 
 /// The multi-slot node build wraps templates in `{ "templates": [T?, …] }`; the
 /// flat compute-substrate build returns a bare `WorkTemplate`. We only need to
@@ -168,6 +173,301 @@ pub fn http_post_json(url: &str, body: &str) -> Result<(u16, String), String> {
     http_request("POST", url, Some(body))
 }
 
+// ---------------------------------------------------------------------------
+// NodeWorkSource — the solo-mining `WorkSource`.
+//
+// Talks DIRECTLY to a csd-node (no pool/bridge): a background poller GETs
+// `/work/get`, and the loop pulls work via `next_work` + submits solved blocks
+// via `submit_solution` (POST `/work/submit`). It slots into the SAME
+// `run_stratum` loop as the pool `StratumClient` through the `WorkSource` seam.
+// ---------------------------------------------------------------------------
+
+/// Monotonic milliseconds since the Unix epoch (saturating; never panics).
+/// Mirrors `client.rs::now_unix_ms` (which isn't `pub`) so the poller can stamp
+/// `last_template_ms` and `health()` can age it without reaching into the client
+/// module's internals.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Solo share accounting for `health()` / the stats endpoint. All `AtomicU64`
+/// so the poller, the submit path, and the heartbeat read them lock-free — same
+/// spirit as the Stratum client's `SessionStats`.
+#[derive(Default)]
+struct SoloStats {
+    /// Blocks the node ACCEPTED (`{"accepted":true}` on POST `/work/submit`).
+    accepted: AtomicU64,
+    /// Blocks the node REJECTED (HTTP 200 but `accepted != true`).
+    rejected: AtomicU64,
+    /// Total `/work/submit` POSTs attempted (incremented before the POST).
+    submitted: AtomicU64,
+    /// `now_ms()` at the last *new* template (prev/height change). 0 = none yet.
+    last_template_ms: AtomicU64,
+}
+
+/// A solo-mining [`WorkSource`] backed by a csd-node's `/work/get` + `/work/submit`.
+///
+/// Construct with [`NodeWorkSource::connect`] (validates the URL, spawns the
+/// poller). `Drop` stops + joins the poller. There is no Stratum socket, no pool
+/// vardiff, and no notify: `latest_job` is always `None` and `current_difficulty`
+/// is a fixed `1.0` — the real gate target rides in `template.target` (the
+/// network target the node serves verbatim).
+pub struct NodeWorkSource {
+    /// `http://host:port` (validated cleartext-only; HTTPS is rejected).
+    base_url: String,
+    /// Payout addr20 hex — the `?addr=` query AND the coinbase payout.
+    addr_hex: String,
+    /// Latest template the poller published. `None` = no mineable work yet (just
+    /// started, or the node returned 503) ⇒ the loop idles.
+    latest: Arc<Mutex<Option<WorkTemplate>>>,
+    stats: Arc<SoloStats>,
+    shutdown: Arc<AtomicBool>,
+    /// The poller thread handle (joined on `Drop`). `None` for a test-only idle
+    /// source built without a poller.
+    poller: Option<JoinHandle<()>>,
+}
+
+impl NodeWorkSource {
+    /// Connect to a csd-node and start polling `/work/get`.
+    ///
+    /// `node_url` must be a plain-HTTP `http://host:port` (validated up front —
+    /// a bad or `https://` URL is an `Err`, no thread is spawned). `addr_hex` is
+    /// the payout addr20 (hex, no `0x`) used as the `?addr=` query and the
+    /// coinbase payout. The poller runs until `Drop`.
+    pub fn connect(node_url: &str, addr_hex: &str) -> anyhow::Result<NodeWorkSource> {
+        // Validate the URL shape now (fail fast, before spawning a thread).
+        parse_http_url(node_url).map_err(|e| anyhow::anyhow!("invalid --node url: {e}"))?;
+
+        let base_url = node_url.to_string();
+        let addr_hex = addr_hex.to_string();
+        let latest: Arc<Mutex<Option<WorkTemplate>>> = Arc::new(Mutex::new(None));
+        let stats = Arc::new(SoloStats::default());
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let poller = spawn_poller(
+            base_url.clone(),
+            addr_hex.clone(),
+            Arc::clone(&latest),
+            Arc::clone(&stats),
+            Arc::clone(&shutdown),
+        );
+
+        Ok(NodeWorkSource {
+            base_url,
+            addr_hex,
+            latest,
+            stats,
+            shutdown,
+            poller: Some(poller),
+        })
+    }
+
+    /// Test-only constructor: an idle source (no poller, `latest = None`) so
+    /// `next_work()` yields `Idle` deterministically without a live node.
+    #[cfg(test)]
+    fn idle_for_test(node_url: &str) -> NodeWorkSource {
+        NodeWorkSource {
+            base_url: node_url.to_string(),
+            addr_hex: "deadbeef".to_string(),
+            latest: Arc::new(Mutex::new(None)),
+            stats: Arc::new(SoloStats::default()),
+            shutdown: Arc::new(AtomicBool::new(true)),
+            poller: None,
+        }
+    }
+}
+
+/// Spawn the background poller. Mirrors the spirit of the Stratum client's
+/// reader thread, but pulls over HTTP instead of a pushed socket:
+///   - `GET /work/get?addr=…`.
+///   - **200 + parseable + (prev,height) changed** ⇒ publish the new template +
+///     stamp `last_template_ms`. (Mint a new job ONLY on a prev/height change —
+///     the same discipline as the bridge poller, so we don't churn jobs while
+///     the node re-serves the same tip.)
+///   - **503** ⇒ the node says NOT mineable ⇒ clear `latest` (idle; never mine a
+///     stale prev).
+///   - **any other status / transport `Err`** ⇒ leave `latest` unchanged (mine
+///     through a transient blip).
+///
+/// Sleeps ~1 s between polls, but in ≤200 ms slices so `Drop` (which sets
+/// `shutdown`) joins promptly.
+fn spawn_poller(
+    base_url: String,
+    addr_hex: String,
+    latest: Arc<Mutex<Option<WorkTemplate>>>,
+    stats: Arc<SoloStats>,
+    shutdown: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        // Last (prev, height) we published — so we only re-publish on a change.
+        let mut last_seen: Option<([u8; 32], u64)> = None;
+        let url = format!("{base_url}/work/get?addr={addr_hex}");
+
+        while !shutdown.load(Ordering::Relaxed) {
+            match http_get(&url) {
+                Ok((200, body)) => match parse_node_template(&body) {
+                    Ok(tmpl) => {
+                        let key = (tmpl.prev, tmpl.height);
+                        if last_seen != Some(key) {
+                            last_seen = Some(key);
+                            *latest.lock().unwrap() = Some(tmpl);
+                            stats.last_template_ms.store(now_ms(), Ordering::Relaxed);
+                        }
+                    }
+                    Err(e) => {
+                        // A 200 that won't parse is a node/version mismatch, not
+                        // a "stop mining" signal — log + keep the last good job.
+                        tracing::warn!("solo: /work/get 200 but unparseable: {e}");
+                    }
+                },
+                Ok((503, _)) => {
+                    // Node not mineable (no tip / stale / drift ceiling). Idle —
+                    // never mine a stale prev. Reset last_seen so the next
+                    // mineable template (even the same tip) re-publishes.
+                    *latest.lock().unwrap() = None;
+                    last_seen = None;
+                }
+                Ok((code, _)) => {
+                    // Some other status — transient; mine through it.
+                    tracing::debug!("solo: /work/get unexpected status {code}; keeping last job");
+                }
+                Err(e) => {
+                    tracing::debug!("solo: /work/get transport error: {e}; keeping last job");
+                }
+            }
+
+            // Sleep ~1s total, but wake every ≤200ms to check shutdown so Drop
+            // joins promptly.
+            let mut slept = Duration::ZERO;
+            let total = Duration::from_secs(1);
+            let slice = Duration::from_millis(200);
+            while slept < total && !shutdown.load(Ordering::Relaxed) {
+                std::thread::sleep(slice);
+                slept += slice;
+            }
+        }
+    })
+}
+
+impl WorkSource for NodeWorkSource {
+    /// Solo has no Stratum notify — there is no pushed job.
+    fn latest_job(&self) -> Option<StratumJob> {
+        None
+    }
+
+    /// No pool vardiff in solo; the network target rides in `template.target`.
+    /// A fixed 1.0 keeps the heartbeat's `diff=` field sane.
+    fn current_difficulty(&self) -> f64 {
+        1.0
+    }
+
+    /// The payout addr20 (also the `?addr=` query). Solo mines straight to it.
+    fn worker_addr(&self) -> &str {
+        &self.addr_hex
+    }
+
+    /// Defensive: the loop submits solo finds via `submit_solution` (overridden
+    /// below), never via `send_submit`. If something ever routes here it's a bug,
+    /// so surface it loudly rather than silently mis-encoding.
+    fn send_submit(
+        &self,
+        _worker: &str,
+        _job_id: &str,
+        _xn2_hex: &str,
+        _ntime_hex: &str,
+        _nonce_hex: &str,
+    ) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!(
+            "solo NodeWorkSource submits via submit_solution, not send_submit"
+        ))
+    }
+
+    /// Poll the latest node template. `Some` ⇒ a job whose `template.target` is
+    /// the NETWORK target; solo owns the whole 8-byte extranonce so `xn1_low=0`.
+    /// `None` ⇒ idle (no work / node 503).
+    fn next_work(&self) -> WorkIntake {
+        match self.latest.lock().unwrap().clone() {
+            Some(tmpl) => {
+                let job_id = format!("node-{}", tmpl.id);
+                WorkIntake::Job(LoopWork {
+                    template: tmpl,
+                    job_id,
+                    xn1_low: 0,
+                })
+            }
+            None => WorkIntake::Idle,
+        }
+    }
+
+    /// POST the solved block to `/work/submit` as `{id,nonce,extranonce,time}`.
+    /// Returns `Ok` on HTTP 200 (whether the node accepted or rejected — the
+    /// reject is accounted + logged, not an error), `Err` on a non-200 status or
+    /// a transport failure. Never panics.
+    fn submit_solution(&self, sol: &Solution) -> anyhow::Result<()> {
+        self.stats.submitted.fetch_add(1, Ordering::Relaxed);
+        let body = serde_json::to_string(&solution_to_submission(sol))?;
+        let url = format!("{}/work/submit", self.base_url);
+        match http_post_json(&url, &body) {
+            Ok((200, resp)) => {
+                // Parse the node's verdict; a non-JSON body is treated as a
+                // (logged) reject rather than a hard error — the POST did land.
+                let v: serde_json::Value = serde_json::from_str(&resp).unwrap_or(serde_json::Value::Null);
+                if v.get("accepted").and_then(|a| a.as_bool()) == Some(true) {
+                    self.stats.accepted.fetch_add(1, Ordering::Relaxed);
+                    tracing::info!(
+                        "solo: BLOCK ACCEPTED height={} hash={}",
+                        v.get("height").unwrap_or(&serde_json::Value::Null),
+                        v.get("block_hash").unwrap_or(&serde_json::Value::Null),
+                    );
+                } else {
+                    self.stats.rejected.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        "solo: submit rejected: {}",
+                        v.get("error").unwrap_or(&serde_json::Value::Null)
+                    );
+                }
+                Ok(())
+            }
+            Ok((code, resp)) => Err(anyhow::anyhow!(
+                "solo: /work/submit returned HTTP {code}: {resp}"
+            )),
+            Err(e) => Err(anyhow::anyhow!("solo: /work/submit transport error: {e}")),
+        }
+    }
+
+    /// Liveness/share snapshot for the INFO heartbeat + stats endpoint, built
+    /// from `SoloStats`. `stale` is always 0 (solo has no pool stale concept);
+    /// `job_age_s` ages `last_template_ms` (None until the first template).
+    fn health(&self) -> HealthSnapshot {
+        let last = self.stats.last_template_ms.load(Ordering::Relaxed);
+        let job_age_s = if last == 0 {
+            None
+        } else {
+            Some(now_ms().saturating_sub(last) / 1000)
+        };
+        HealthSnapshot {
+            accepted: self.stats.accepted.load(Ordering::Relaxed),
+            rejected: self.stats.rejected.load(Ordering::Relaxed),
+            stale: 0,
+            submitted: self.stats.submitted.load(Ordering::Relaxed),
+            job_age_s,
+            endpoint: self.base_url.clone(),
+        }
+    }
+}
+
+impl Drop for NodeWorkSource {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(h) = self.poller.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,5 +602,220 @@ mod tests {
         assert_eq!(code, 200);
         assert_eq!(body, "{\"work\":true}");
         server.join().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // NodeWorkSource integration tests against a localhost mock csd-node.
+    // -----------------------------------------------------------------------
+
+    use crate::stratum::loop_stratum::{WorkIntake, WorkSource};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// A localhost mock csd-node: a `TcpListener` accept loop in a background
+    /// thread that routes `GET /work/get…` → 200 + a canned `WorkTemplate`, and
+    /// `POST /work/submit` → stash the body + 200 `{"accepted":true,…}`. Handles
+    /// MANY connections (the poller hammers GET while the test submits). Stops
+    /// when its `shutdown` flag is set (set on drop).
+    struct MockNode {
+        base_url: String,
+        submits: Arc<Mutex<Vec<String>>>,
+        shutdown: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl MockNode {
+        fn start(template: &WorkTemplate) -> MockNode {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let base_url = format!("http://127.0.0.1:{}", addr.port());
+            let submits: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let tmpl_json = serde_json::to_string(template).unwrap();
+
+            let submits_t = Arc::clone(&submits);
+            let shutdown_t = Arc::clone(&shutdown);
+            // Non-blocking accept + a short sleep on WouldBlock so the loop wakes
+            // to re-check `shutdown` (set on drop) instead of parking forever in
+            // a blocking accept after the test's last request.
+            listener
+                .set_nonblocking(true)
+                .expect("listener nonblocking");
+            let handle = std::thread::spawn(move || {
+                while !shutdown_t.load(Ordering::Relaxed) {
+                    let (mut sock, _peer) = match listener.accept() {
+                        Ok(pair) => pair,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(_) => break,
+                    };
+                    sock.set_read_timeout(Some(Duration::from_millis(500))).ok();
+                    sock.set_write_timeout(Some(Duration::from_millis(500))).ok();
+                    // Read the full request (head + any body) until we have the
+                    // headers, then drain Content-Length bytes for POST.
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 2048];
+                    // First read.
+                    let n = match sock.read(&mut tmp) {
+                        Ok(0) | Err(_) => {
+                            continue;
+                        }
+                        Ok(n) => n,
+                    };
+                    buf.extend_from_slice(&tmp[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    let first_line = text.lines().next().unwrap_or("").to_string();
+
+                    if first_line.starts_with("GET /work/get") {
+                        let body = tmpl_json.as_bytes();
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = sock.write_all(resp.as_bytes());
+                        let _ = sock.write_all(body);
+                    } else if first_line.starts_with("POST /work/submit") {
+                        // Make sure we have the whole body: parse Content-Length
+                        // and keep reading until we've got it (header + body may
+                        // arrive in separate TCP segments).
+                        let want: usize = text
+                            .split("\r\n")
+                            .find_map(|l| {
+                                let l = l.to_ascii_lowercase();
+                                l.strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        // Bytes of body already in `buf` (after the blank line).
+                        let header_end = text.find("\r\n\r\n").map(|i| i + 4);
+                        let mut body_bytes = match header_end {
+                            Some(he) => buf[he..].to_vec(),
+                            None => Vec::new(),
+                        };
+                        while body_bytes.len() < want {
+                            match sock.read(&mut tmp) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => body_bytes.extend_from_slice(&tmp[..n]),
+                            }
+                        }
+                        let body_str = String::from_utf8_lossy(&body_bytes).to_string();
+                        submits_t.lock().unwrap().push(body_str);
+                        let resp_body = b"{\"accepted\":true,\"height\":1,\"block_hash\":\"ab\"}";
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            resp_body.len()
+                        );
+                        let _ = sock.write_all(resp.as_bytes());
+                        let _ = sock.write_all(resp_body);
+                    } else {
+                        let _ = sock.write_all(
+                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                    }
+                }
+            });
+
+            MockNode {
+                base_url,
+                submits,
+                shutdown,
+                handle: Some(handle),
+            }
+        }
+    }
+
+    impl Drop for MockNode {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::Relaxed);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    #[test]
+    fn node_work_source_poller_populates_next_work() {
+        let tmpl = sample_template();
+        let node = MockNode::start(&tmpl);
+        let src = NodeWorkSource::connect(&node.base_url, "1122334455667788990011223344556677889900")
+            .expect("connect");
+
+        // Poll up to ~3s in 10ms steps for the poller to land a template.
+        let mut got = None;
+        for _ in 0..300 {
+            if let WorkIntake::Job(w) = src.next_work() {
+                got = Some(w);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let work = got.expect("poller should have populated a job within 3s");
+        assert_eq!(work.template.id, tmpl.id, "job carries the canned template id");
+        assert_eq!(work.xn1_low, 0, "solo owns the whole extranonce → xn1_low=0");
+        assert_eq!(work.job_id, format!("node-{}", tmpl.id));
+    }
+
+    #[test]
+    fn node_work_source_submit_posts_worksubmission() {
+        let tmpl = sample_template();
+        let node = MockNode::start(&tmpl);
+        let src = NodeWorkSource::connect(&node.base_url, "1122334455667788990011223344556677889900")
+            .expect("connect");
+
+        // Wait for a template so the source is live (not strictly required for
+        // submit, but mirrors real flow).
+        for _ in 0..300 {
+            if matches!(src.next_work(), WorkIntake::Job(_)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let sol = Solution {
+            template_id: tmpl.id,
+            job_id: format!("node-{}", tmpl.id),
+            xn2: 0,
+            extranonce: 0x0102_0304_0506_0708,
+            time: 1_700_000_123,
+            nonce: 0x00C0_FFEE,
+        };
+        src.submit_solution(&sol).expect("submit returns Ok on HTTP 200 accepted");
+
+        // The mock recorded a POST body that parses to {id,nonce,extranonce,time}.
+        // Give the body a moment in case of scheduling (it's synchronous, but be
+        // defensive against the accept loop's slice timing).
+        let mut recorded = None;
+        for _ in 0..100 {
+            if let Some(b) = node.submits.lock().unwrap().first().cloned() {
+                recorded = Some(b);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let body = recorded.expect("mock recorded a /work/submit POST body");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("body is JSON");
+        assert_eq!(v["id"], tmpl.id);
+        assert_eq!(v["nonce"], 0x00C0_FFEEu32);
+        assert_eq!(v["extranonce"], 0x0102_0304_0506_0708u64);
+        assert_eq!(v["time"], 1_700_000_123u64);
+
+        let h = src.health();
+        assert_eq!(h.accepted, 1, "an accepted submit bumps accepted");
+        assert_eq!(h.submitted, 1, "submit bumps submitted");
+        assert_eq!(h.rejected, 0);
+        assert_eq!(h.endpoint, node.base_url);
+    }
+
+    #[test]
+    fn node_work_source_next_work_idle_before_template() {
+        // A source whose `latest` is None yields Idle (no poller needed).
+        let src = NodeWorkSource::idle_for_test("http://127.0.0.1:1");
+        assert!(matches!(src.next_work(), WorkIntake::Idle));
+        // current_difficulty is the no-vardiff sentinel; worker_addr echoes addr.
+        assert_eq!(src.current_difficulty(), 1.0);
+        assert_eq!(src.worker_addr(), "deadbeef");
     }
 }
