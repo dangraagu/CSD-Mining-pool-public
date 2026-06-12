@@ -23,7 +23,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 
@@ -95,6 +95,26 @@ struct SessionStats {
     accepted: AtomicU64,
     rejected: AtomicU64,
     stale: AtomicU64,
+    /// Total shares written to the socket (for shares_10m + the submit-ack wd).
+    submitted: AtomicU64,
+    /// Consecutive submits with no ack of any kind; reset by ANY ack. Drives the
+    /// submit-ack watchdog (a half-open socket gets jobs but drops shares).
+    consecutive_unacked: AtomicU64,
+    /// Unix-ms of the last ACCEPTED share (0 = none yet); accepted-share dead-man.
+    last_accept_ms: AtomicU64,
+    /// Unix-ms a *new* job_id last arrived (0 = none yet); job-staleness wd. Only
+    /// advanced on a changed id, so a same-id resend can't mask a stalled pool.
+    last_new_job_ms: AtomicU64,
+}
+
+/// Current wall-clock time as milliseconds since the Unix epoch (0 if the clock
+/// predates the epoch — never panics). Stamps share/job timestamps for the
+/// staleness watchdogs.
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Classify a received line as a `mining.submit` response, if it is one.
@@ -156,23 +176,28 @@ fn reason_from_error(err: &serde_json::Value) -> String {
 /// was an ack (counted here); `false` if the caller should hand it to
 /// [`dispatch_frame`] as a server push.
 fn record_ack(line: &str, stats: &SessionStats) -> bool {
-    match classify_ack(line) {
-        Some(Ack::Accepted) => {
+    let ack = match classify_ack(line) {
+        Some(a) => a,
+        None => return false,
+    };
+    // ANY ack — accept or reject — proves the connection is alive and
+    // responding, so the unacked streak resets (submit-ack watchdog).
+    stats.consecutive_unacked.store(0, Ordering::Relaxed);
+    match ack {
+        Ack::Accepted => {
             stats.accepted.fetch_add(1, Ordering::Relaxed);
-            true
+            stats.last_accept_ms.store(now_unix_ms(), Ordering::Relaxed);
         }
-        Some(Ack::Rejected(reason)) => {
+        Ack::Rejected(reason) => {
             stats.rejected.fetch_add(1, Ordering::Relaxed);
             tracing::warn!("stratum: share REJECTED by pool: {reason}");
-            true
         }
-        Some(Ack::Stale) => {
+        Ack::Stale => {
             stats.stale.fetch_add(1, Ordering::Relaxed);
             tracing::warn!("stratum: share STALE (too late / job not found)");
-            true
         }
-        None => false,
     }
+    true
 }
 
 /// A job pushed by the pool via `mining.notify`, paired with the session
@@ -559,6 +584,13 @@ impl StratumClient {
         w.write_all(line.as_bytes())
             .context("writing mining.submit")?;
         w.flush().ok();
+        // Account the submit: one more pending share until an ack resets the
+        // streak (the submit-ack watchdog watches `consecutive_unacked`).
+        self.shared.stats.submitted.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .stats
+            .consecutive_unacked
+            .fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -606,10 +638,22 @@ fn dispatch_frame(line: &str, shared: &Shared) {
                 let job_id = notify.job_id.clone();
                 let clean = notify.clean_jobs;
                 if let Ok(mut slot) = shared.latest_job.lock() {
+                    // Stamp the staleness clock only on a *changed* job_id: a
+                    // same-id resend must not mask a stalled pool (G3).
+                    let changed = slot
+                        .as_ref()
+                        .map(|j| j.notify.job_id != job_id)
+                        .unwrap_or(true);
                     *slot = Some(StratumJob {
                         notify,
                         extranonce1_hex,
                     });
+                    if changed {
+                        shared
+                            .stats
+                            .last_new_job_ms
+                            .store(now_unix_ms(), Ordering::Relaxed);
+                    }
                 }
                 tracing::debug!("stratum: new job {job_id} (clean_jobs={clean})");
             }
@@ -823,6 +867,21 @@ mod tests {
     }
 
     #[test]
+    fn record_ack_resets_unacked_and_stamps_accept() {
+        let stats = SessionStats::default();
+        // An accept clears a pending streak AND stamps the accept clock.
+        stats.consecutive_unacked.store(7, Ordering::Relaxed);
+        assert!(record_ack(r#"{"id":101,"result":true}"#, &stats));
+        assert_eq!(stats.consecutive_unacked.load(Ordering::Relaxed), 0);
+        assert!(stats.last_accept_ms.load(Ordering::Relaxed) > 0);
+        // A reject ALSO resets the streak (the pool is responding) but does not
+        // stamp last_accept.
+        stats.consecutive_unacked.store(3, Ordering::Relaxed);
+        assert!(record_ack(r#"{"id":102,"result":false}"#, &stats));
+        assert_eq!(stats.consecutive_unacked.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn dispatch_notify_updates_latest_job() {
         let shared = fresh_shared("cafef00d", 4);
         let line = r#"{"id":null,"method":"mining.notify","params":["jX","00ff","aa","bb",["cc"],"01000000","1d00ffff","60c0babe",true]}"#;
@@ -841,6 +900,26 @@ mod tests {
         let line = r#"{"id":null,"method":"mining.set_difficulty","params":[2048.5]}"#;
         dispatch_frame(line, &shared);
         assert_eq!(shared.difficulty(), 2048.5);
+    }
+
+    #[test]
+    fn dispatch_stamps_last_new_job_only_on_changed_id() {
+        let shared = fresh_shared("00", 4);
+        let job_a = r#"{"id":null,"method":"mining.notify","params":["A","p","a","b",[],"01000000","1d00ffff","60c0babe",true]}"#;
+        dispatch_frame(job_a, &shared);
+        let t1 = shared.stats.last_new_job_ms.load(Ordering::Relaxed);
+        assert!(t1 > 0, "a new job stamps the staleness clock");
+        // Same job_id again → the clock must NOT move (a resend can't mask a
+        // stalled pool).
+        dispatch_frame(job_a, &shared);
+        assert_eq!(shared.stats.last_new_job_ms.load(Ordering::Relaxed), t1);
+        // A different job_id is stored (the `changed` branch is taken).
+        let job_b = r#"{"id":null,"method":"mining.notify","params":["B","p","a","b",[],"01000000","1d00ffff","60c0babe",true]}"#;
+        dispatch_frame(job_b, &shared);
+        assert_eq!(
+            shared.latest_job.lock().unwrap().as_ref().unwrap().notify.job_id,
+            "B"
+        );
     }
 
     #[test]
