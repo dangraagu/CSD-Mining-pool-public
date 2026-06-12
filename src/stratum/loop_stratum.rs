@@ -189,7 +189,7 @@ impl WorkSource for StratumClient {
 
 /// Format the one-line INFO heartbeat from a [`HealthSnapshot`] + the current
 /// difficulty. Pure → unit-tested.
-fn format_health_line(h: &HealthSnapshot, difficulty: f64) -> String {
+fn format_health_line(h: &HealthSnapshot, difficulty: f64, hw_err: u64) -> String {
     let job_age = match h.job_age_s {
         Some(s) => format!("{s}s"),
         None => "n/a".to_string(),
@@ -201,7 +201,7 @@ fn format_health_line(h: &HealthSnapshot, difficulty: f64) -> String {
     };
     format!(
         "health pool={pool} job_age={job_age} diff={difficulty:.2} \
-         submitted={} acc={} rej={} stale={}",
+         submitted={} acc={} rej={} stale={} hw_err={hw_err}",
         h.submitted, h.accepted, h.rejected, h.stale,
     )
 }
@@ -249,6 +249,10 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
     // Hashrate tracking (mirrors the node loop's 10s cadence).
     let mut last_hashrate_log = Instant::now();
     let mut last_heartbeat = Instant::now();
+    // Backend hash-mismatch count (a kernel/driver/overclock fault caught by the
+    // pre-submit gate) — surfaced in the heartbeat so operators can spot an
+    // unstable overclock (B3 bad-OC signal).
+    let mut hash_mismatches: u64 = 0;
     let mut gpu_nonces_since_log: u128 = 0;
     let mut cpu_nonces_since_log: u128 = 0;
 
@@ -291,7 +295,11 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
         if last_heartbeat.elapsed() >= Duration::from_secs(30) {
             tracing::info!(
                 "{}",
-                format_health_line(&client.health(), client.current_difficulty())
+                format_health_line(
+                    &client.health(),
+                    client.current_difficulty(),
+                    hash_mismatches
+                )
             );
             last_heartbeat = Instant::now();
         }
@@ -525,6 +533,7 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
                             hex::encode(claimed_hash),
                             hex::encode(cpu_hash),
                         );
+                        hash_mismatches += 1; // bad-OC / kernel-fault signal (B3)
                         xn2 = xn2.wrapping_add(1);
                         continue;
                     }
@@ -1036,7 +1045,7 @@ mod tests {
             job_age_s: Some(42),
             endpoint: "pool.test:3333".to_string(),
         };
-        let line = format_health_line(&h, 1024.0);
+        let line = format_health_line(&h, 1024.0, 7);
         for needle in [
             "pool=pool.test:3333",
             "job_age=42s",
@@ -1045,6 +1054,7 @@ mod tests {
             "acc=5",
             "rej=1",
             "stale=2",
+            "hw_err=7",
         ] {
             assert!(line.contains(needle), "missing {needle:?} in {line:?}");
         }
@@ -1054,9 +1064,10 @@ mod tests {
             endpoint: String::new(),
             ..h
         };
-        let line2 = format_health_line(&h2, 1.0);
+        let line2 = format_health_line(&h2, 1.0, 0);
         assert!(line2.contains("job_age=n/a"));
         assert!(line2.contains("pool=?"));
+        assert!(line2.contains("hw_err=0"));
     }
 
     #[test]
