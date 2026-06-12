@@ -96,6 +96,67 @@ fn is_valid_host_port(s: &str) -> bool {
     }
 }
 
+/// An ordered list of pool endpoints with a current selection, for failover.
+///
+/// Index 0 is the **primary**. [`advance`](Self::advance) rotates to the next
+/// endpoint after a failed connect (so a dead pool is left behind);
+/// [`maybe_failback`](Self::maybe_failback) returns to the primary after a quiet
+/// interval on a backup. All decisions are pure (a `now_ms` is injected), so the
+/// rotation/failback policy is unit-tested without sockets or real time.
+pub struct EndpointList {
+    all: Vec<String>,
+    current: usize,
+    last_failback_ms: u64,
+}
+
+impl EndpointList {
+    /// Build from a non-empty, ordered endpoint list (index 0 = primary).
+    pub fn new(all: Vec<String>) -> Self {
+        debug_assert!(!all.is_empty(), "EndpointList needs >= 1 endpoint");
+        EndpointList {
+            all,
+            current: 0,
+            last_failback_ms: 0,
+        }
+    }
+
+    /// The currently-selected endpoint.
+    pub fn current(&self) -> &str {
+        &self.all[self.current]
+    }
+
+    /// True if the current selection is the primary (index 0).
+    pub fn is_primary(&self) -> bool {
+        self.current == 0
+    }
+
+    /// Rotate to the next endpoint (wrapping), returning it. No-op for a single
+    /// endpoint. Called after a failed handshake to try the next pool.
+    pub fn advance(&mut self) -> &str {
+        if self.all.len() > 1 {
+            self.current = (self.current + 1) % self.all.len();
+        }
+        &self.all[self.current]
+    }
+
+    /// If currently on a backup and `interval_ms` has elapsed since the last
+    /// failback (or since we were last on the primary), jump back to the primary
+    /// so the next connect prefers it. Returns whether it failed back. While on
+    /// the primary it just keeps the failback clock fresh and returns `false`.
+    pub fn maybe_failback(&mut self, now_ms: u64, interval_ms: u64) -> bool {
+        if self.current == 0 {
+            self.last_failback_ms = now_ms;
+            return false;
+        }
+        if now_ms.saturating_sub(self.last_failback_ms) >= interval_ms {
+            self.current = 0;
+            self.last_failback_ms = now_ms;
+            return true;
+        }
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,5 +227,54 @@ mod tests {
         assert!(is_valid_host_port("1.2.3.4:8080"));
         assert!(is_valid_host_port("[::1]:3333")); // bracketed IPv6
         assert!(!is_valid_host_port("nope"));
+    }
+
+    #[test]
+    fn endpoint_list_starts_on_primary() {
+        let el = EndpointList::new(vec!["a:1".into(), "b:2".into()]);
+        assert_eq!(el.current(), "a:1");
+        assert!(el.is_primary());
+    }
+
+    #[test]
+    fn endpoint_list_advance_rotates_and_wraps() {
+        let mut el = EndpointList::new(vec!["a:1".into(), "b:2".into(), "c:3".into()]);
+        assert_eq!(el.advance(), "b:2");
+        assert!(!el.is_primary());
+        assert_eq!(el.advance(), "c:3");
+        assert_eq!(el.advance(), "a:1"); // wraps back to primary
+        assert!(el.is_primary());
+    }
+
+    #[test]
+    fn endpoint_list_single_endpoint_advance_is_noop() {
+        let mut el = EndpointList::new(vec!["only:1".into()]);
+        assert_eq!(el.advance(), "only:1");
+        assert_eq!(el.advance(), "only:1");
+        assert!(el.is_primary());
+    }
+
+    #[test]
+    fn endpoint_list_fails_back_to_primary_after_interval() {
+        let mut el = EndpointList::new(vec!["a:1".into(), "b:2".into()]);
+        // Establish the failback clock while on the primary at t=1000.
+        assert!(!el.maybe_failback(1000, 5000));
+        // Move to a backup.
+        el.advance();
+        assert!(!el.is_primary());
+        // Before the interval elapses (t=3000, 2000ms < 5000): no failback.
+        assert!(!el.maybe_failback(3000, 5000));
+        assert!(!el.is_primary());
+        // After the interval (t=6001, 5001ms >= 5000): fail back to primary.
+        assert!(el.maybe_failback(6001, 5000));
+        assert!(el.is_primary());
+        assert_eq!(el.current(), "a:1");
+    }
+
+    #[test]
+    fn endpoint_list_no_failback_while_on_primary() {
+        let mut el = EndpointList::new(vec!["a:1".into(), "b:2".into()]);
+        assert!(!el.maybe_failback(999_999, 5000)); // already primary → never fails back
+        assert!(el.is_primary());
     }
 }
