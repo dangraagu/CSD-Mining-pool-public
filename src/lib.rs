@@ -23,6 +23,7 @@ pub mod consensus_types;
 pub mod endpoint;
 pub mod logging;
 pub mod mining_config;
+pub mod notify;
 pub mod selftest;
 pub mod sha256d_cpu;
 pub mod stats;
