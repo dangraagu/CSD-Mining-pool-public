@@ -382,57 +382,27 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
             last_heartbeat = Instant::now();
         }
 
-        // --- work intake: poll the pool's latest pushed job ---
-        let job = match client.latest_job() {
-            Some(j) => j,
-            None => {
-                // No notify yet (just connected, or mid-reconnect). This is the
-                // Stratum analogue of WorkOutcome::Hold — but there is no
-                // last-good template to mine through on, so we idle briefly.
+        // --- work intake: poll the work source (pool notify, or solo node) ---
+        let work = match client.next_work() {
+            WorkIntake::Job(w) => w,
+            WorkIntake::Idle => {
                 if last_wait_log.elapsed() >= Duration::from_secs(10) {
-                    tracing::info!("stratum: waiting for first mining.notify from pool…");
+                    tracing::info!("stratum: waiting for first job…");
                     last_wait_log = Instant::now();
                 }
                 std::thread::sleep(Duration::from_millis(250));
                 continue;
             }
         };
-
-        // Share target from the current pool difficulty.
-        let difficulty = client.current_difficulty();
-        let share_target = target_from_difficulty(difficulty);
-
-        // Map notify → WorkTemplate (+ job_id + xn1_low). A malformed notify
-        // (bad hex, wrong extranonce1 width, etc.) is logged and we retry —
-        // never panic the loop on pool-side garbage.
-        let xn1_bytes = match hex::decode(&job.extranonce1_hex) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(
-                    "stratum: extranonce1 {:?} is not valid hex ({e}); waiting for next job",
-                    job.extranonce1_hex
-                );
-                std::thread::sleep(Duration::from_millis(250));
-                continue;
-            }
-        };
-        let mapped = match notify_to_template(&job.notify, &xn1_bytes, share_target) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!("stratum: cannot map job {}: {e}; waiting for next job", job.notify.job_id);
-                std::thread::sleep(Duration::from_millis(250));
-                continue;
-            }
-        };
-        let template = &mapped.template;
+        let template = &work.template;
         let branch: Vec<[u8; 32]> = template.merkle_branch.iter().map(|b| b.0).collect();
 
         tracing::info!(
             "stratum got_job id={} height(n/a) prev=0x{} diff={:.4} share_target=0x{}…",
-            mapped.job_id,
+            work.job_id,
             hex::encode(template.prev),
-            difficulty,
-            &hex::encode(share_target)[..16],
+            client.current_difficulty(),
+            &hex::encode(template.target)[..16],
         );
 
         let last_refresh = Instant::now();
@@ -449,13 +419,13 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
             // If the pool pushed a new job, abandon this one immediately so we
             // never mine stale work past a clean_jobs boundary.
             if let Some(j) = client.latest_job() {
-                if j.notify.job_id != mapped.job_id {
+                if j.notify.job_id != work.job_id {
                     break;
                 }
             }
 
             // Compose the full 8-byte extranonce: low = pool xn1, high = our xn2.
-            let extranonce = compose_extranonce(mapped.xn1_low, xn2);
+            let extranonce = compose_extranonce(work.xn1_low, xn2);
 
             // Coinbase txid + merkle root for this extranonce, then the header
             // skeleton (nonce overwritten by the backend per attempt).
@@ -607,7 +577,7 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
                     if cpu_hash != claimed_hash {
                         tracing::error!(
                             "stratum device={device} HASH MISMATCH job={} xn2={xn2} nonce={nonce}: claimed=0x{} cpu=0x{} - skipping",
-                            mapped.job_id,
+                            work.job_id,
                             hex::encode(claimed_hash),
                             hex::encode(cpu_hash),
                         );
@@ -615,12 +585,12 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
                         xn2 = xn2.wrapping_add(1);
                         continue;
                     }
-                    if !hash_leq_target(&cpu_hash, &share_target) {
+                    if !hash_leq_target(&cpu_hash, &template.target) {
                         tracing::error!(
                             "stratum device={device} hash ABOVE share target job={} nonce={nonce}: hash=0x{} target=0x{} - skipping",
-                            mapped.job_id,
+                            work.job_id,
                             hex::encode(cpu_hash),
-                            hex::encode(share_target),
+                            hex::encode(template.target),
                         );
                         xn2 = xn2.wrapping_add(1);
                         continue;
@@ -629,37 +599,29 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
                     match thread_label {
                         Some(t) => tracing::info!(
                             "stratum SHARE device={device} thread={t} job={} xn2={xn2} nonce={nonce} hash=0x{}",
-                            mapped.job_id, hex::encode(cpu_hash),
+                            work.job_id, hex::encode(cpu_hash),
                         ),
                         None => tracing::info!(
                             "stratum SHARE device={device} job={} xn2={xn2} nonce={nonce} hash=0x{}",
-                            mapped.job_id, hex::encode(cpu_hash),
+                            work.job_id, hex::encode(cpu_hash),
                         ),
                     }
 
-                    // Build the submit field trio and send it. xn2 is the high
-                    // half we rolled; time/nonce produced the winning hash.
-                    let fields = build_submit(xn2, template.time, nonce);
+                    let sol = Solution {
+                        template_id: template.id,
+                        job_id: work.job_id.clone(),
+                        xn2,
+                        extranonce,
+                        time: template.time,
+                        nonce,
+                    };
                     let submit_start = Instant::now();
-                    match client.send_submit(
-                        client.worker_addr(),
-                        &mapped.job_id,
-                        &fields.extranonce2_hex,
-                        &fields.ntime_hex,
-                        &fields.nonce_hex,
-                    ) {
+                    match client.submit_solution(&sol) {
                         Ok(()) => tracing::info!(
-                            "stratum submit OK job={} xn2_hex={} ntime={} nonce={} latency_ms={}",
-                            mapped.job_id,
-                            fields.extranonce2_hex,
-                            fields.ntime_hex,
-                            fields.nonce_hex,
-                            submit_start.elapsed().as_millis(),
+                            "stratum submit OK job={} xn2={} ntime={} nonce={} latency_ms={}",
+                            work.job_id, xn2, template.time, nonce, submit_start.elapsed().as_millis(),
                         ),
-                        Err(e) => tracing::warn!(
-                            "stratum submit FAILED job={} xn2_hex={}: {e}",
-                            mapped.job_id, fields.extranonce2_hex,
-                        ),
+                        Err(e) => tracing::warn!("stratum submit FAILED job={}: {e}", work.job_id),
                     }
 
                     // Roll xn2 for the next launch and re-derive work (next job
@@ -679,7 +641,7 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
                         client.record_hashrate(combined_ghs);
                         tracing::info!(
                             "stratum hashrate gpu={:.2} GH/s cpu={:.2} MH/s combined={:.2} GH/s (job={}, diff={:.2})",
-                            ghs_gpu, mhs_cpu, combined_ghs, mapped.job_id, difficulty,
+                            ghs_gpu, mhs_cpu, combined_ghs, work.job_id, client.current_difficulty(),
                         );
                         last_hashrate_log = Instant::now();
                         gpu_nonces_since_log = 0;
