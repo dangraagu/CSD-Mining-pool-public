@@ -22,7 +22,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 
@@ -189,7 +189,7 @@ impl WorkSource for StratumClient {
 
 /// Format the one-line INFO heartbeat from a [`HealthSnapshot`] + the current
 /// difficulty. Pure → unit-tested.
-fn format_health_line(h: &HealthSnapshot, difficulty: f64) -> String {
+fn format_health_line(h: &HealthSnapshot, difficulty: f64, hw_err: u64) -> String {
     let job_age = match h.job_age_s {
         Some(s) => format!("{s}s"),
         None => "n/a".to_string(),
@@ -201,9 +201,33 @@ fn format_health_line(h: &HealthSnapshot, difficulty: f64) -> String {
     };
     format!(
         "health pool={pool} job_age={job_age} diff={difficulty:.2} \
-         submitted={} acc={} rej={} stale={}",
+         submitted={} acc={} rej={} stale={} hw_err={hw_err}",
         h.submitted, h.accepted, h.rejected, h.stale,
     )
+}
+
+/// Pure FNV-1a mix of a process id + an entropy word into a starting `xn2`, so
+/// two rigs mining the SAME address (one process per GPU, or across machines)
+/// begin at different coinbase regions instead of both sweeping `xn2=0..` and
+/// duplicating work. Deterministic for a given `(pid, entropy)`.
+fn mix_xn2_seed(pid: u32, entropy: u32) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in pid.to_le_bytes().iter().chain(entropy.to_le_bytes().iter()) {
+        h ^= u32::from(*b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
+/// Seed `xn2` from this process's id + sub-second startup entropy. Wire-safe:
+/// the bridge accepts any 4-byte xn2 (see [`crate::stratum::mapping::build_submit`]).
+fn seed_xn2() -> u32 {
+    let pid = std::process::id();
+    let entropy = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    mix_xn2_seed(pid, entropy)
 }
 
 /// Run the pooled Stratum mining loop until `stop` is set.
@@ -225,6 +249,10 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
     // Hashrate tracking (mirrors the node loop's 10s cadence).
     let mut last_hashrate_log = Instant::now();
     let mut last_heartbeat = Instant::now();
+    // Backend hash-mismatch count (a kernel/driver/overclock fault caught by the
+    // pre-submit gate) — surfaced in the heartbeat so operators can spot an
+    // unstable overclock (B3 bad-OC signal).
+    let mut hash_mismatches: u64 = 0;
     let mut gpu_nonces_since_log: u128 = 0;
     let mut cpu_nonces_since_log: u128 = 0;
 
@@ -236,7 +264,9 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
 
     // The miner-rolled high half of the coinbase extranonce. Bumped once per
     // exhausted launch. The low half (xn1) is pool-fixed and NEVER rolled here.
-    let mut xn2: u32 = 0;
+    // Seeded per-process so co-fleet rigs (same address, one process per GPU)
+    // sweep DIFFERENT coinbase regions instead of duplicating xn2=0.. work.
+    let mut xn2: u32 = seed_xn2();
 
     if cfg.cpu_threads > 0 && cfg.cpu_share > 0.0 {
         tracing::info!(
@@ -265,7 +295,11 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
         if last_heartbeat.elapsed() >= Duration::from_secs(30) {
             tracing::info!(
                 "{}",
-                format_health_line(&client.health(), client.current_difficulty())
+                format_health_line(
+                    &client.health(),
+                    client.current_difficulty(),
+                    hash_mismatches
+                )
             );
             last_heartbeat = Instant::now();
         }
@@ -377,7 +411,6 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
             let found_for_template_id = Arc::new(AtomicU64::new(0));
             let template_id = template.id;
             let cpu_swept = Arc::new(AtomicU64::new(0));
-            let gpu_stop = Arc::new(AtomicBool::new(stop.load(Ordering::Relaxed)));
 
             let gpu_result: Mutex<Option<MiningResult>> = Mutex::new(None);
             let gpu_result_ref = &gpu_result;
@@ -406,9 +439,15 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
                         let mut local_swept: u64 = 0;
                         for (i, n) in (cstart..cend).enumerate() {
                             if i & 0xff == 0 {
-                                if stop_.load(Ordering::Relaxed)
-                                    || iter_stop_.load(Ordering::Relaxed)
-                                {
+                                if stop_.load(Ordering::Relaxed) {
+                                    // Propagate the global stop into iter_stop so
+                                    // the GPU backend (which watches iter_stop in
+                                    // dual-mining mode) wakes promptly — this
+                                    // replaces the old 5ms poller thread.
+                                    iter_stop_.store(true, Ordering::Release);
+                                    break;
+                                }
+                                if iter_stop_.load(Ordering::Relaxed) {
                                     break;
                                 }
                                 if found_for_template_id_.load(Ordering::Acquire) == template_id {
@@ -436,24 +475,20 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
                     });
                 }
 
-                // Bridge poller: forwards stop || iter_stop into gpu_stop so the
-                // GPU backend wakes up on a CPU win.
-                let stop_b = stop.clone();
-                let iter_stop_b = iter_stop.clone();
-                let gpu_stop_b = gpu_stop.clone();
-                scope.spawn(move || loop {
-                    let s = stop_b.load(Ordering::Relaxed) || iter_stop_b.load(Ordering::Relaxed);
-                    gpu_stop_b.store(s, Ordering::Relaxed);
-                    if s {
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(5));
-                });
+                // The GPU backend watches a SINGLE cancel flag (no polling
+                // thread). With CPU workers it watches `iter_stop` (set on a CPU
+                // win, or by a worker propagating the global stop); GPU-only it
+                // watches `stop` directly so it cancels mid-launch on shutdown.
+                let backend_stop: &AtomicBool = if cpu_ranges.is_empty() {
+                    &stop
+                } else {
+                    &iter_stop
+                };
 
                 // GPU sweep on its assigned sub-range (main scope thread).
                 let (gstart, gend) = gpu_range;
                 let res = if gend > gstart {
-                    backend.hash_range(hdr, target, gstart, gend, &gpu_stop)
+                    backend.hash_range(hdr, target, gstart, gend, backend_stop)
                 } else {
                     None
                 };
@@ -498,6 +533,7 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
                             hex::encode(claimed_hash),
                             hex::encode(cpu_hash),
                         );
+                        hash_mismatches += 1; // bad-OC / kernel-fault signal (B3)
                         xn2 = xn2.wrapping_add(1);
                         continue;
                     }
@@ -934,9 +970,9 @@ mod tests {
                 return Some(found);
             }
             // No scripted find: emulate a real backend hashing until told to
-            // stop. NOTE: relies on run_stratum driving the outer `stop` into
-            // the GPU backend's stop flag (via the bridge-poller thread); a
-            // future refactor that stopped doing so would hang this.
+            // stop. NOTE: these tests run cpu_threads=0, so run_stratum passes
+            // the outer `stop` to the backend directly (C1 removed the poller);
+            // a real backend instead sweeps a finite range and returns.
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -1009,7 +1045,7 @@ mod tests {
             job_age_s: Some(42),
             endpoint: "pool.test:3333".to_string(),
         };
-        let line = format_health_line(&h, 1024.0);
+        let line = format_health_line(&h, 1024.0, 7);
         for needle in [
             "pool=pool.test:3333",
             "job_age=42s",
@@ -1018,6 +1054,7 @@ mod tests {
             "acc=5",
             "rej=1",
             "stale=2",
+            "hw_err=7",
         ] {
             assert!(line.contains(needle), "missing {needle:?} in {line:?}");
         }
@@ -1027,9 +1064,21 @@ mod tests {
             endpoint: String::new(),
             ..h
         };
-        let line2 = format_health_line(&h2, 1.0);
+        let line2 = format_health_line(&h2, 1.0, 0);
         assert!(line2.contains("job_age=n/a"));
         assert!(line2.contains("pool=?"));
+        assert!(line2.contains("hw_err=0"));
+    }
+
+    #[test]
+    fn xn2_seed_diverges_by_pid_and_entropy() {
+        // Deterministic for fixed inputs.
+        assert_eq!(mix_xn2_seed(1234, 5678), mix_xn2_seed(1234, 5678));
+        // A different pid OR different entropy → a different seed.
+        assert_ne!(mix_xn2_seed(1234, 5678), mix_xn2_seed(1235, 5678));
+        assert_ne!(mix_xn2_seed(1234, 5678), mix_xn2_seed(1234, 5679));
+        // Two distinct co-fleet rigs (distinct pids) get distinct seeds.
+        assert_ne!(mix_xn2_seed(1000, 42), mix_xn2_seed(2000, 42));
     }
 
     /// Drive the REAL `run_stratum` with a mock work source + a never-finds
@@ -1069,6 +1118,46 @@ mod tests {
         assert!(
             work.submits.lock().unwrap().is_empty(),
             "no share should be submitted when the backend never finds"
+        );
+    }
+
+    /// C1 dual-mining path: with cpu_threads > 0 the GPU backend watches
+    /// `iter_stop`, and a CPU worker propagates the global stop into it (no 5ms
+    /// poller). The backend never finds and the CPU pool can't clear diff-1024
+    /// in the window; setting stop must shut everything down cleanly.
+    #[test]
+    fn run_stratum_dual_mining_shuts_down_clean() {
+        let work = Arc::new(MockWorkSource::new(mock_job(), 1024.0));
+        let backend = Arc::new(MockBackend::new(vec![])); // never finds; blocks until iter_stop
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let work_for_loop = Arc::clone(&work);
+        let backend_for_loop = Arc::clone(&backend);
+        let stop_for_loop = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let cfg = MiningConfig {
+                cpu_threads: 2,
+                cpu_share: 0.5,
+            };
+            run_stratum(
+                backend_for_loop.as_ref(),
+                work_for_loop.as_ref(),
+                stop_for_loop,
+                cfg,
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(120));
+        stop.store(true, Ordering::Relaxed);
+        let result = handle.join().expect("loop thread did not panic");
+        assert!(result.is_ok(), "run_stratum returns Ok on clean shutdown");
+        assert!(
+            backend.calls.load(Ordering::Relaxed) > 0,
+            "the GPU backend must have been dispatched alongside the CPU pool"
+        );
+        assert!(
+            work.submits.lock().unwrap().is_empty(),
+            "no share at diff 1024 in the brief window"
         );
     }
 
