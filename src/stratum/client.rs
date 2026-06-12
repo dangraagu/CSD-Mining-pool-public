@@ -768,11 +768,12 @@ fn reconnect(
                     // Best-effort close of the dead socket before swap.
                     let _ = w.shutdown(std::net::Shutdown::Both);
                     *w = hs.write_stream;
+                    // Reset the un-acked streak under the SAME writer lock the
+                    // watchdog must hold to shut the socket, so a stale streak
+                    // can't tear down the brand-new connection (review M1).
+                    shared.stats.consecutive_unacked.store(0, Ordering::Relaxed);
                 }
                 *backoff = BACKOFF_MIN;
-                // Fresh connection: clear the un-acked streak so the submit-ack
-                // watchdog doesn't immediately force another reconnect.
-                shared.stats.consecutive_unacked.store(0, Ordering::Relaxed);
                 tracing::info!("stratum: reconnected to {endpoint}");
                 return true;
             }
