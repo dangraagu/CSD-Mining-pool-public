@@ -6,7 +6,10 @@
 //! it (and the reconnect it requests) lives in `client`/`loop_stratum`; this
 //! module only decides *whether* to act.
 
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Tunables for the reliability watchdogs. Defaults are conservative,
 /// battle-tested values; nothing here is required of the operator.
@@ -100,6 +103,40 @@ pub fn watchdog_tick(view: &dyn WatchdogView, cfg: WatchdogCfg, now_ms: u64) -> 
         }
         None => false,
     }
+}
+
+/// Spawn the reliability-watchdog thread: every `cfg.poll`, evaluate `view` and
+/// act, until `stop` is set. Sleeps in small slices so it honors `stop`
+/// promptly (within ~200 ms). The caller may detach the handle — the thread
+/// owns its `Arc`s and exits as soon as `stop` flips.
+pub fn spawn_watchdog(
+    view: Arc<dyn WatchdogView>,
+    cfg: WatchdogCfg,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("stratum-watchdog".to_string())
+        .spawn(move || {
+            let slice = Duration::from_millis(200).min(cfg.poll);
+            let mut waited = Duration::ZERO;
+            while !stop.load(Ordering::Relaxed) {
+                if waited >= cfg.poll {
+                    waited = Duration::ZERO;
+                    watchdog_tick(view.as_ref(), cfg, now_unix_ms());
+                }
+                std::thread::sleep(slice);
+                waited += slice;
+            }
+        })
+        .expect("spawning stratum watchdog thread")
+}
+
+/// Wall-clock ms since the Unix epoch (0 if the clock predates it — never panics).
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -207,5 +244,26 @@ mod tests {
         });
         assert!(!watchdog_tick(&ok, WatchdogCfg::default(), 1_100));
         assert_eq!(ok.reconnect_calls(), 0);
+    }
+
+    #[test]
+    fn spawned_watchdog_ticks_and_stops() {
+        let view = Arc::new(MockView::new(WatchdogSnapshot {
+            consecutive_unacked: 10, // always triggers ForceReconnect
+            last_new_job_ms: 1,
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let cfg = WatchdogCfg {
+            poll: Duration::from_millis(5),
+            ..WatchdogCfg::default()
+        };
+        let h = spawn_watchdog(view.clone(), cfg, Arc::clone(&stop));
+        std::thread::sleep(Duration::from_millis(60));
+        stop.store(true, Ordering::Relaxed);
+        h.join().unwrap();
+        assert!(
+            view.reconnect_calls() >= 1,
+            "the watchdog thread must tick + act before stop"
+        );
     }
 }
