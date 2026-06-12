@@ -30,7 +30,7 @@ use crate::backend::{MiningBackend, MiningResult};
 use crate::coinbase::{coinbase_txid, header_84, merkle_root_from_branch};
 use crate::mining_config::{partition_nonce_range, MiningConfig};
 use crate::sha256d_cpu::{finish_sha256d_from_midstate_fast, midstate_of_first_chunk_fast};
-use crate::stratum::client::{StratumClient, StratumJob};
+use crate::stratum::client::{HealthSnapshot, StratumClient, StratumJob};
 use crate::stratum::mapping::{build_submit, compose_extranonce, notify_to_template};
 use crate::stratum::watchdog::{spawn_watchdog, WatchdogCfg, WatchdogView};
 
@@ -150,6 +150,13 @@ pub trait WorkSource {
     fn watchdog_view(&self) -> Option<Arc<dyn WatchdogView>> {
         None
     }
+
+    /// A snapshot of liveness/share stats for the INFO heartbeat. Default is
+    /// empty (mock / future solo source); `StratumClient` fills it from its live
+    /// session counters.
+    fn health(&self) -> HealthSnapshot {
+        HealthSnapshot::default()
+    }
 }
 
 impl WorkSource for StratumClient {
@@ -175,6 +182,28 @@ impl WorkSource for StratumClient {
     fn watchdog_view(&self) -> Option<Arc<dyn WatchdogView>> {
         Some(self.watchdog_handle())
     }
+    fn health(&self) -> HealthSnapshot {
+        self.health_snapshot()
+    }
+}
+
+/// Format the one-line INFO heartbeat from a [`HealthSnapshot`] + the current
+/// difficulty. Pure → unit-tested.
+fn format_health_line(h: &HealthSnapshot, difficulty: f64) -> String {
+    let job_age = match h.job_age_s {
+        Some(s) => format!("{s}s"),
+        None => "n/a".to_string(),
+    };
+    let pool = if h.endpoint.is_empty() {
+        "?"
+    } else {
+        h.endpoint.as_str()
+    };
+    format!(
+        "health pool={pool} job_age={job_age} diff={difficulty:.2} \
+         submitted={} acc={} rej={} stale={}",
+        h.submitted, h.accepted, h.rejected, h.stale,
+    )
 }
 
 /// Run the pooled Stratum mining loop until `stop` is set.
@@ -195,6 +224,7 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
 
     // Hashrate tracking (mirrors the node loop's 10s cadence).
     let mut last_hashrate_log = Instant::now();
+    let mut last_heartbeat = Instant::now();
     let mut gpu_nonces_since_log: u128 = 0;
     let mut cpu_nonces_since_log: u128 = 0;
 
@@ -230,6 +260,16 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
         .map(|view| spawn_watchdog(view, WatchdogCfg::default(), Arc::clone(&stop)));
 
     while !stop.load(Ordering::Relaxed) {
+        // Emit a health heartbeat at a fixed cadence — even while idle/waiting
+        // for the first job — so "connected but 0 h/s / stale" is never silent.
+        if last_heartbeat.elapsed() >= Duration::from_secs(30) {
+            tracing::info!(
+                "{}",
+                format_health_line(&client.health(), client.current_difficulty())
+            );
+            last_heartbeat = Instant::now();
+        }
+
         // --- work intake: poll the pool's latest pushed job ---
         let job = match client.latest_job() {
             Some(j) => j,
@@ -957,6 +997,39 @@ mod tests {
             notify: fixture_notify(),
             extranonce1_hex: "aabbccdd".to_string(),
         }
+    }
+
+    #[test]
+    fn health_line_contains_key_fields() {
+        let h = HealthSnapshot {
+            accepted: 5,
+            rejected: 1,
+            stale: 2,
+            submitted: 9,
+            job_age_s: Some(42),
+            endpoint: "pool.test:3333".to_string(),
+        };
+        let line = format_health_line(&h, 1024.0);
+        for needle in [
+            "pool=pool.test:3333",
+            "job_age=42s",
+            "diff=1024.00",
+            "submitted=9",
+            "acc=5",
+            "rej=1",
+            "stale=2",
+        ] {
+            assert!(line.contains(needle), "missing {needle:?} in {line:?}");
+        }
+        // No job yet → n/a; empty endpoint → '?'.
+        let h2 = HealthSnapshot {
+            job_age_s: None,
+            endpoint: String::new(),
+            ..h
+        };
+        let line2 = format_health_line(&h2, 1.0);
+        assert!(line2.contains("job_age=n/a"));
+        assert!(line2.contains("pool=?"));
     }
 
     /// Drive the REAL `run_stratum` with a mock work source + a never-finds

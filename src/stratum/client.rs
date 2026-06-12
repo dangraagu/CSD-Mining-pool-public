@@ -205,6 +205,22 @@ fn record_ack(line: &str, stats: &SessionStats) -> bool {
     true
 }
 
+/// A point-in-time view of the miner's liveness + share accounting, for the INFO
+/// heartbeat. Empty default for sources without a live connection (the mock / a
+/// future solo source).
+#[derive(Debug, Clone, Default)]
+pub struct HealthSnapshot {
+    pub accepted: u64,
+    pub rejected: u64,
+    pub stale: u64,
+    pub submitted: u64,
+    /// Seconds since the last *new* job (`None` = no job received yet).
+    pub job_age_s: Option<u64>,
+    /// The pool endpoint (the configured primary; v0.1.8 doesn't reflect a
+    /// failover here — the heartbeat's value is the share counts + job age).
+    pub endpoint: String,
+}
+
 /// A job pushed by the pool via `mining.notify`, paired with the session
 /// `extranonce1` captured at subscribe time. The notify→header mapping is
 /// Task 3; this is the raw material that mapping will consume.
@@ -596,6 +612,21 @@ impl StratumClient {
             shared: Arc::clone(&self.shared),
             writer: Arc::clone(&self.writer),
         })
+    }
+
+    /// Snapshot the session's share counters + job age for the heartbeat.
+    pub fn health_snapshot(&self) -> HealthSnapshot {
+        let s = &self.shared.stats;
+        let last_job = s.last_new_job_ms.load(Ordering::Relaxed);
+        let job_age_s = (last_job != 0).then(|| now_unix_ms().saturating_sub(last_job) / 1000);
+        HealthSnapshot {
+            accepted: s.accepted.load(Ordering::Relaxed),
+            rejected: s.rejected.load(Ordering::Relaxed),
+            stale: s.stale.load(Ordering::Relaxed),
+            submitted: s.submitted.load(Ordering::Relaxed),
+            job_age_s,
+            endpoint: self.endpoint.clone(),
+        }
     }
 
     /// Send a `mining.submit` line for a found share. Serializes writes through
