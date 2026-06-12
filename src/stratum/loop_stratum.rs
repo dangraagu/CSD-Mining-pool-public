@@ -1107,7 +1107,14 @@ mod tests {
             )
         });
 
-        std::thread::sleep(Duration::from_millis(120));
+        // Wait (up to ~3s) for the backend to actually be dispatched — robust
+        // under CPU load, where a fixed short sleep can race the loop's startup.
+        for _ in 0..300 {
+            if backend.calls.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         stop.store(true, Ordering::Relaxed);
         let result = handle.join().expect("loop thread did not panic");
         assert!(result.is_ok(), "run_stratum returns Ok on clean shutdown");
@@ -1147,7 +1154,14 @@ mod tests {
             )
         });
 
-        std::thread::sleep(Duration::from_millis(120));
+        // Wait (up to ~3s) for the backend to actually be dispatched — robust
+        // under CPU load, where a fixed short sleep can race the loop's startup.
+        for _ in 0..300 {
+            if backend.calls.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         stop.store(true, Ordering::Relaxed);
         let result = handle.join().expect("loop thread did not panic");
         assert!(result.is_ok(), "run_stratum returns Ok on clean shutdown");
@@ -1192,7 +1206,14 @@ mod tests {
             )
         });
 
-        std::thread::sleep(Duration::from_millis(120));
+        // Wait (up to ~3s) for the backend to actually be dispatched — robust
+        // under CPU load, where a fixed short sleep can race the loop's startup.
+        for _ in 0..300 {
+            if backend.calls.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         stop.store(true, Ordering::Relaxed);
         handle
             .join()
