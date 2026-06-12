@@ -620,4 +620,52 @@ mod tests {
         assert_eq!(got.submitted, 14);
         assert_eq!(got.endpoint, "pool.x:3333");
     }
+
+    /// End-to-end D2: wire the server exactly as `main` does — the health closure
+    /// reads from the SAME handle the loop pushes into (`move || handle.health()`)
+    /// — then assert a recorded hashrate sample and a pushed health snapshot both
+    /// show through `/1/summary`.
+    #[test]
+    fn summary_reflects_recorded_hashrate_and_pushed_health() {
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let handle = Arc::new(StatsHandle::new());
+        handle.record(3.0); // 3 GH/s, in the 10s window
+        handle.set_health(HealthSnapshot {
+            accepted: 42,
+            rejected: 0,
+            stale: 0,
+            submitted: 42,
+            job_age_s: Some(1),
+            endpoint: "pool.live:3333".to_string(),
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let health_src = handle.clone();
+        let join = spawn(
+            addr,
+            handle.clone(),
+            Box::new(move || health_src.health()),
+            "csd1live".to_string(),
+            None,
+            stop.clone(),
+        )
+        .expect("spawn");
+
+        let resp = http_get_raw(addr, "GET /1/summary HTTP/1.1\r\n\r\n");
+        let (status, body) = split_response(&resp);
+        assert!(status.starts_with("HTTP/1.1 200"), "status: {status}");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        // Health pushed via set_health shows through.
+        assert_eq!(v["results"]["shares_good"], 42);
+        assert_eq!(v["connection"]["pool"], "pool.live:3333");
+        assert_eq!(v["worker_id"], "csd1live");
+        // 3 GH/s recorded → 3e9 H/s in the 10s window (xmrig reports H/s).
+        let total = v["hashrate"]["total"].as_array().unwrap();
+        let s10 = total[0].as_f64().unwrap();
+        assert!((s10 - 3.0e9).abs() < 1.0, "10s hashrate {s10} != 3e9");
+
+        stop_and_join(stop, join);
+    }
 }

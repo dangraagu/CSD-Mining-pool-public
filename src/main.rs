@@ -16,6 +16,7 @@ use csd_gpu_miner::backends::cpu::CpuBackend;
 use csd_gpu_miner::endpoint;
 use csd_gpu_miner::logging;
 use csd_gpu_miner::mining_config::MiningConfig;
+use csd_gpu_miner::stats_server::{self, StatsHandle};
 use csd_gpu_miner::stratum::{run_stratum, StratumClient};
 
 #[cfg(feature = "opencl")]
@@ -52,6 +53,22 @@ struct Cli {
     /// omitted, the compiled-in default pool is used.
     #[arg(long = "pool", visible_alias = "url", value_delimiter = ',')]
     pool: Vec<String>,
+
+    /// Telemetry: serve an xmrig-compatible `/1/summary` JSON endpoint on this
+    /// port (plus `/healthz`) for dashboards/monitoring. Omitted ⇒ no server.
+    #[arg(long)]
+    stats_port: Option<u16>,
+
+    /// Telemetry: bind IP for `--stats-port`. Default 127.0.0.1 (localhost only);
+    /// set 0.0.0.0 to expose on the LAN (an info-leak — pair with
+    /// `--stats-password`). Must be an IP, not a hostname.
+    #[arg(long, default_value = "127.0.0.1")]
+    stats_bind: String,
+
+    /// Telemetry: require this token on `/1/summary` (via `Authorization: Bearer`
+    /// or `?token=`). `/healthz` stays open. Omitted ⇒ no auth.
+    #[arg(long)]
+    stats_password: Option<String>,
 
     /// Backend to use.
     #[arg(long, default_value = "auto")]
@@ -358,7 +375,7 @@ fn main() -> Result<()> {
     // Hand the full ordered list to the client so the reader's reconnect path can
     // fail over to a backup pool (and fail back to the primary). With one
     // endpoint this is the same single-pool, no-failover behavior as before.
-    let client = StratumClient::connect_failover(&endpoints, &address)
+    let mut client = StratumClient::connect_failover(&endpoints, &address)
         .map_err(|e| anyhow::anyhow!("failed to connect to pool {endpoint}: {e}"))?;
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -369,6 +386,37 @@ fn main() -> Result<()> {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
         });
     }
+
+    // D2: optional xmrig-compatible /1/summary telemetry server. Off unless the
+    // operator passes --stats-port. It reads live hashrate + health from the
+    // shared StatsHandle (the mining loop pushes into it via record_hashrate);
+    // it never touches the share/submit/header path.
+    let _stats_server = if let Some(port) = cli.stats_port {
+        let bind: std::net::SocketAddr = format!("{}:{}", cli.stats_bind, port)
+            .parse()
+            .map_err(|e| {
+                anyhow::anyhow!("invalid --stats-bind/--stats-port {}:{port}: {e}", cli.stats_bind)
+            })?;
+        let handle = Arc::new(StatsHandle::new());
+        client.attach_stats(handle.clone());
+        let health_src = handle.clone();
+        let server = stats_server::spawn(
+            bind,
+            handle,
+            Box::new(move || health_src.health()),
+            address.clone(),
+            cli.stats_password.clone(),
+            stop.clone(),
+        )
+        .map_err(|e| anyhow::anyhow!("failed to bind stats port {bind}: {e}"))?;
+        tracing::info!(
+            "stats: xmrig /1/summary on http://{bind} (auth={})",
+            cli.stats_password.is_some()
+        );
+        Some(server)
+    } else {
+        None
+    };
 
     match cli.backend {
         BackendChoice::Cpu => {
