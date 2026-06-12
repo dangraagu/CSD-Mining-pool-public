@@ -403,7 +403,6 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
             let found_for_template_id = Arc::new(AtomicU64::new(0));
             let template_id = template.id;
             let cpu_swept = Arc::new(AtomicU64::new(0));
-            let gpu_stop = Arc::new(AtomicBool::new(stop.load(Ordering::Relaxed)));
 
             let gpu_result: Mutex<Option<MiningResult>> = Mutex::new(None);
             let gpu_result_ref = &gpu_result;
@@ -432,9 +431,15 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
                         let mut local_swept: u64 = 0;
                         for (i, n) in (cstart..cend).enumerate() {
                             if i & 0xff == 0 {
-                                if stop_.load(Ordering::Relaxed)
-                                    || iter_stop_.load(Ordering::Relaxed)
-                                {
+                                if stop_.load(Ordering::Relaxed) {
+                                    // Propagate the global stop into iter_stop so
+                                    // the GPU backend (which watches iter_stop in
+                                    // dual-mining mode) wakes promptly — this
+                                    // replaces the old 5ms poller thread.
+                                    iter_stop_.store(true, Ordering::Release);
+                                    break;
+                                }
+                                if iter_stop_.load(Ordering::Relaxed) {
                                     break;
                                 }
                                 if found_for_template_id_.load(Ordering::Acquire) == template_id {
@@ -462,24 +467,20 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
                     });
                 }
 
-                // Bridge poller: forwards stop || iter_stop into gpu_stop so the
-                // GPU backend wakes up on a CPU win.
-                let stop_b = stop.clone();
-                let iter_stop_b = iter_stop.clone();
-                let gpu_stop_b = gpu_stop.clone();
-                scope.spawn(move || loop {
-                    let s = stop_b.load(Ordering::Relaxed) || iter_stop_b.load(Ordering::Relaxed);
-                    gpu_stop_b.store(s, Ordering::Relaxed);
-                    if s {
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(5));
-                });
+                // The GPU backend watches a SINGLE cancel flag (no polling
+                // thread). With CPU workers it watches `iter_stop` (set on a CPU
+                // win, or by a worker propagating the global stop); GPU-only it
+                // watches `stop` directly so it cancels mid-launch on shutdown.
+                let backend_stop: &AtomicBool = if cpu_ranges.is_empty() {
+                    &stop
+                } else {
+                    &iter_stop
+                };
 
                 // GPU sweep on its assigned sub-range (main scope thread).
                 let (gstart, gend) = gpu_range;
                 let res = if gend > gstart {
-                    backend.hash_range(hdr, target, gstart, gend, &gpu_stop)
+                    backend.hash_range(hdr, target, gstart, gend, backend_stop)
                 } else {
                     None
                 };
@@ -960,9 +961,9 @@ mod tests {
                 return Some(found);
             }
             // No scripted find: emulate a real backend hashing until told to
-            // stop. NOTE: relies on run_stratum driving the outer `stop` into
-            // the GPU backend's stop flag (via the bridge-poller thread); a
-            // future refactor that stopped doing so would hang this.
+            // stop. NOTE: these tests run cpu_threads=0, so run_stratum passes
+            // the outer `stop` to the backend directly (C1 removed the poller);
+            // a real backend instead sweeps a finite range and returns.
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -1106,6 +1107,46 @@ mod tests {
         assert!(
             work.submits.lock().unwrap().is_empty(),
             "no share should be submitted when the backend never finds"
+        );
+    }
+
+    /// C1 dual-mining path: with cpu_threads > 0 the GPU backend watches
+    /// `iter_stop`, and a CPU worker propagates the global stop into it (no 5ms
+    /// poller). The backend never finds and the CPU pool can't clear diff-1024
+    /// in the window; setting stop must shut everything down cleanly.
+    #[test]
+    fn run_stratum_dual_mining_shuts_down_clean() {
+        let work = Arc::new(MockWorkSource::new(mock_job(), 1024.0));
+        let backend = Arc::new(MockBackend::new(vec![])); // never finds; blocks until iter_stop
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let work_for_loop = Arc::clone(&work);
+        let backend_for_loop = Arc::clone(&backend);
+        let stop_for_loop = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let cfg = MiningConfig {
+                cpu_threads: 2,
+                cpu_share: 0.5,
+            };
+            run_stratum(
+                backend_for_loop.as_ref(),
+                work_for_loop.as_ref(),
+                stop_for_loop,
+                cfg,
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(120));
+        stop.store(true, Ordering::Relaxed);
+        let result = handle.join().expect("loop thread did not panic");
+        assert!(result.is_ok(), "run_stratum returns Ok on clean shutdown");
+        assert!(
+            backend.calls.load(Ordering::Relaxed) > 0,
+            "the GPU backend must have been dispatched alongside the CPU pool"
+        );
+        assert!(
+            work.submits.lock().unwrap().is_empty(),
+            "no share at diff 1024 in the brief window"
         );
     }
 
