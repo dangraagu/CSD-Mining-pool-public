@@ -30,7 +30,7 @@ use crate::backend::{MiningBackend, MiningResult};
 use crate::coinbase::{coinbase_txid, header_84, merkle_root_from_branch};
 use crate::mining_config::{partition_nonce_range, MiningConfig};
 use crate::sha256d_cpu::{finish_sha256d_from_midstate_fast, midstate_of_first_chunk_fast};
-use crate::stratum::client::StratumClient;
+use crate::stratum::client::{StratumClient, StratumJob};
 use crate::stratum::mapping::{build_submit, compose_extranonce, notify_to_template};
 
 /// Pool-difficulty-1 target as 32 big-endian bytes:
@@ -119,15 +119,62 @@ struct CpuFind {
     hash: [u8; 32],
 }
 
+/// Source of pooled mining work + sink for found shares.
+///
+/// Abstracts the loop's dependency on a concrete [`StratumClient`] so
+/// `run_stratum` can be driven headless in tests (and, later, by a solo
+/// csd-node source — P3). The four methods are exactly what the loop calls
+/// today; `StratumClient` implements them by delegating to its inherent
+/// methods, so introducing this trait is a pure zero-behaviour-change refactor.
+pub trait WorkSource {
+    /// Latest job pushed by the pool, or `None` if none has arrived yet.
+    fn latest_job(&self) -> Option<StratumJob>;
+    /// Current share difficulty (defaults to 1.0 until the pool sends one).
+    fn current_difficulty(&self) -> f64;
+    /// The worker (csd1) address shares are submitted under.
+    fn worker_addr(&self) -> &str;
+    /// Send a `mining.submit` line for a found share.
+    fn send_submit(
+        &self,
+        worker: &str,
+        job_id: &str,
+        xn2_hex: &str,
+        ntime_hex: &str,
+        nonce_hex: &str,
+    ) -> Result<()>;
+}
+
+impl WorkSource for StratumClient {
+    fn latest_job(&self) -> Option<StratumJob> {
+        StratumClient::latest_job(self)
+    }
+    fn current_difficulty(&self) -> f64 {
+        StratumClient::current_difficulty(self)
+    }
+    fn worker_addr(&self) -> &str {
+        StratumClient::worker_addr(self)
+    }
+    fn send_submit(
+        &self,
+        worker: &str,
+        job_id: &str,
+        xn2_hex: &str,
+        ntime_hex: &str,
+        nonce_hex: &str,
+    ) -> Result<()> {
+        StratumClient::send_submit(self, worker, job_id, xn2_hex, ntime_hex, nonce_hex)
+    }
+}
+
 /// Run the pooled Stratum mining loop until `stop` is set.
 ///
 /// `client` must already be connected (handshake done, reader thread running).
 /// Work is pulled from its background-updated `latest_job()` / difficulty; found
 /// shares are submitted via `client.send_submit`. The CPU+GPU split honours the
 /// `MiningConfig` knobs `cpu_threads` and `cpu_share`.
-pub fn run_stratum<B: MiningBackend>(
+pub fn run_stratum<B: MiningBackend, W: WorkSource>(
     backend: &B,
-    client: &StratumClient,
+    client: &W,
     stop: Arc<AtomicBool>,
     cfg: MiningConfig,
 ) -> Result<()> {
