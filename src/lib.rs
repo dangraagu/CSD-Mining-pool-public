@@ -26,6 +26,7 @@ pub mod mining_config;
 pub mod notify;
 pub mod selftest;
 pub mod sha256d_cpu;
+pub mod solo;
 pub mod stats;
 pub mod stats_server;
 pub mod stratum;
