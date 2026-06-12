@@ -64,6 +64,38 @@ pub fn pool_endpoint() -> String {
     String::from_utf8(decoded).expect("pool endpoint decodes to valid UTF-8")
 }
 
+/// Resolve the ordered list of pool endpoints to try, from the operator's
+/// `--pool`/`--url` overrides and the compiled-in default.
+///
+/// An empty override list yields `[builtin]` — the baked-in endpoint is the
+/// DEFAULT element and is never removed. A non-empty list is used verbatim, in
+/// order (each validated as `host:port`); the builtin is NOT appended (an
+/// operator who names pools chooses their own failover order). A malformed entry
+/// is a hard error so the miner fails loud instead of silently mining nowhere.
+pub fn resolve_endpoints(cli_pools: &[String], builtin: &str) -> Result<Vec<String>, String> {
+    if cli_pools.is_empty() {
+        return Ok(vec![builtin.to_string()]);
+    }
+    let mut out = Vec::with_capacity(cli_pools.len());
+    for p in cli_pools {
+        let p = p.trim();
+        if !is_valid_host_port(p) {
+            return Err(format!("invalid pool endpoint {p:?} (expected host:port)"));
+        }
+        out.push(p.to_string());
+    }
+    Ok(out)
+}
+
+/// Lightweight syntactic `host:port` check (DNS is resolved later, at connect
+/// time): a non-empty host, a final `:` separator, and a numeric port 1..=65535.
+fn is_valid_host_port(s: &str) -> bool {
+    match s.rsplit_once(':') {
+        Some((host, port)) => !host.is_empty() && matches!(port.parse::<u16>(), Ok(p) if p > 0),
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,5 +131,40 @@ mod tests {
         assert_ne!(&scrambled[..], &sample[..]);
         let back: Vec<u8> = scrambled.iter().map(|&b| b ^ XOR_KEY).collect();
         assert_eq!(&back[..], &sample[..]);
+    }
+
+    #[test]
+    fn resolve_endpoints_defaults_to_builtin_when_empty() {
+        assert_eq!(
+            resolve_endpoints(&[], "pool.example.com:3333").unwrap(),
+            vec!["pool.example.com:3333".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_endpoints_uses_cli_list_in_order_without_builtin() {
+        let pools = vec!["a.com:1".to_string(), "b.com:2".to_string()];
+        assert_eq!(
+            resolve_endpoints(&pools, "builtin.example:3333").unwrap(),
+            vec!["a.com:1".to_string(), "b.com:2".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_endpoints_rejects_bad_hostport() {
+        for bad in ["noport", "host:", ":3333", "host:0", "host:99999", "host:abc"] {
+            assert!(
+                resolve_endpoints(&[bad.to_string()], "b:3333").is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn is_valid_host_port_accepts_real_endpoints() {
+        assert!(is_valid_host_port("pool.yamaduo.no:3333"));
+        assert!(is_valid_host_port("1.2.3.4:8080"));
+        assert!(is_valid_host_port("[::1]:3333")); // bracketed IPv6
+        assert!(!is_valid_host_port("nope"));
     }
 }
