@@ -28,6 +28,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 
 use crate::endpoint::EndpointList;
+use crate::stats_server::StatsHandle;
 use super::protocol::{
     authorize_request, serialize_line, subscribe_request, submit_request, NotifyParams,
     Notification, Response, SubscribeResult,
@@ -272,6 +273,10 @@ pub struct StratumClient {
     /// Reader-thread handle. `Option` so `Drop` can `join()` after signalling
     /// shutdown.
     reader: Option<JoinHandle<()>>,
+    /// Optional stats sink (D2): when the operator runs `--stats-port`, the
+    /// loop's hashrate samples + live health are pushed here for the telemetry
+    /// server. `None` ⇒ no stats endpoint and zero overhead.
+    stats: Option<Arc<StatsHandle>>,
 }
 
 /// Result of one handshake attempt.
@@ -363,6 +368,7 @@ impl StratumClient {
             writer,
             next_id: AtomicU64::new(100),
             reader: Some(reader),
+            stats: None,
         })
     }
 
@@ -626,6 +632,22 @@ impl StratumClient {
             submitted: s.submitted.load(Ordering::Relaxed),
             job_age_s,
             endpoint: self.endpoint.clone(),
+        }
+    }
+
+    /// Attach a stats sink (D2). Called once at startup when `--stats-port` is
+    /// set, before the mining loop borrows the client (`&mut self`); `None`
+    /// until then, so the unconfigured build carries no stats overhead.
+    pub fn attach_stats(&mut self, handle: Arc<StatsHandle>) {
+        self.stats = Some(handle);
+    }
+
+    /// Push a combined-hashrate sample (GH/s) plus the current health snapshot
+    /// to the attached stats sink, if any. No-op when `--stats-port` is off.
+    pub fn record_hashrate_sample(&self, ghs: f64) {
+        if let Some(s) = &self.stats {
+            s.record(ghs);
+            s.set_health(self.health_snapshot());
         }
     }
 

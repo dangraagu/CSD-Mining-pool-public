@@ -157,6 +157,11 @@ pub trait WorkSource {
     fn health(&self) -> HealthSnapshot {
         HealthSnapshot::default()
     }
+
+    /// Record a combined-hashrate sample (GH/s) for the optional stats endpoint
+    /// (D2). Default no-op (mock / a solo source without stats); `StratumClient`
+    /// routes it to its attached `StatsHandle`.
+    fn record_hashrate(&self, _ghs: f64) {}
 }
 
 impl WorkSource for StratumClient {
@@ -184,6 +189,9 @@ impl WorkSource for StratumClient {
     }
     fn health(&self) -> HealthSnapshot {
         self.health_snapshot()
+    }
+    fn record_hashrate(&self, ghs: f64) {
+        StratumClient::record_hashrate_sample(self, ghs)
     }
 }
 
@@ -596,6 +604,9 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
                         let ghs_gpu = (gpu_nonces_since_log as f64) / 1e9 / elapsed;
                         let mhs_cpu = (cpu_nonces_since_log as f64) / 1e6 / elapsed;
                         let combined_ghs = ghs_gpu + (mhs_cpu / 1000.0);
+                        // D2: feed the optional stats endpoint (no-op unless the
+                        // operator ran --stats-port). Never touches the share path.
+                        client.record_hashrate(combined_ghs);
                         tracing::info!(
                             "stratum hashrate gpu={:.2} GH/s cpu={:.2} MH/s combined={:.2} GH/s (job={}, diff={:.2})",
                             ghs_gpu, mhs_cpu, combined_ghs, mapped.job_id, difficulty,
