@@ -873,7 +873,10 @@ mod tests {
             if let Some(found) = self.script.lock().unwrap().pop_front().flatten() {
                 return Some(found);
             }
-            // No scripted find: emulate a backend hashing until told to stop.
+            // No scripted find: emulate a real backend hashing until told to
+            // stop. NOTE: relies on run_stratum driving the outer `stop` into
+            // the GPU backend's stop flag (via the bridge-poller thread); a
+            // future refactor that stopped doing so would hang this.
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -943,23 +946,33 @@ mod tests {
     #[test]
     fn run_stratum_via_mock_worksource_shuts_down_clean() {
         let work = Arc::new(MockWorkSource::new(mock_job(), 1024.0));
-        let backend = MockBackend::new(vec![]); // never finds
+        let backend = Arc::new(MockBackend::new(vec![])); // never finds
         let stop = Arc::new(AtomicBool::new(false));
 
         let work_for_loop = Arc::clone(&work);
+        let backend_for_loop = Arc::clone(&backend);
         let stop_for_loop = Arc::clone(&stop);
         let handle = std::thread::spawn(move || {
             let cfg = MiningConfig {
                 cpu_threads: 0,
                 cpu_share: 0.0,
             };
-            run_stratum(&backend, work_for_loop.as_ref(), stop_for_loop, cfg)
+            run_stratum(
+                backend_for_loop.as_ref(),
+                work_for_loop.as_ref(),
+                stop_for_loop,
+                cfg,
+            )
         });
 
         std::thread::sleep(Duration::from_millis(120));
         stop.store(true, Ordering::Relaxed);
         let result = handle.join().expect("loop thread did not panic");
         assert!(result.is_ok(), "run_stratum returns Ok on clean shutdown");
+        assert!(
+            backend.calls.load(Ordering::Relaxed) > 0,
+            "the loop must have actually dispatched the backend, not idled"
+        );
         assert!(
             work.submits.lock().unwrap().is_empty(),
             "no share should be submitted when the backend never finds"
@@ -978,17 +991,23 @@ mod tests {
             nonce: 12345,
             hash: [0u8; 32],
         };
-        let backend = MockBackend::new(vec![Some(bogus)]);
+        let backend = Arc::new(MockBackend::new(vec![Some(bogus)]));
         let stop = Arc::new(AtomicBool::new(false));
 
         let work_for_loop = Arc::clone(&work);
+        let backend_for_loop = Arc::clone(&backend);
         let stop_for_loop = Arc::clone(&stop);
         let handle = std::thread::spawn(move || {
             let cfg = MiningConfig {
                 cpu_threads: 0,
                 cpu_share: 0.0,
             };
-            run_stratum(&backend, work_for_loop.as_ref(), stop_for_loop, cfg)
+            run_stratum(
+                backend_for_loop.as_ref(),
+                work_for_loop.as_ref(),
+                stop_for_loop,
+                cfg,
+            )
         });
 
         std::thread::sleep(Duration::from_millis(120));
@@ -997,6 +1016,13 @@ mod tests {
             .join()
             .expect("loop thread did not panic")
             .expect("run_stratum Ok");
+        // The backend WAS dispatched and returned the bogus find (calls > 0)...
+        assert!(
+            backend.calls.load(Ordering::Relaxed) > 0,
+            "the loop must have dispatched the backend and processed the find"
+        );
+        // ...yet nothing was submitted — so the pre-submit gate is provably
+        // what rejected it (only the gate sits between FOUND and submit).
         assert!(
             work.submits.lock().unwrap().is_empty(),
             "the correctness gate must reject a backend find whose hash is wrong"
