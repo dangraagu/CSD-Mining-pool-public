@@ -33,6 +33,8 @@ use crate::sha256d_cpu::{finish_sha256d_from_midstate_fast, midstate_of_first_ch
 use crate::stratum::client::{HealthSnapshot, StratumClient, StratumJob};
 use crate::stratum::mapping::{build_submit, compose_extranonce, notify_to_template};
 use crate::stratum::watchdog::{spawn_watchdog, WatchdogCfg, WatchdogView};
+use crate::consensus_types::WorkTemplate;
+use crate::solo::Solution;
 
 /// Pool-difficulty-1 target as 32 big-endian bytes:
 /// `0x00000000FFFF0000000000000000000000000000000000000000000000000000`.
@@ -127,6 +129,25 @@ struct CpuFind {
 /// csd-node source — P3). The four methods are exactly what the loop calls
 /// today; `StratumClient` implements them by delegating to its inherent
 /// methods, so introducing this trait is a pure zero-behaviour-change refactor.
+/// One unit of work the loop mines, abstracted over pool vs solo sources.
+pub struct LoopWork {
+    /// The work template; `template.target` is the gate target (pool share
+    /// target, or solo network target).
+    pub template: WorkTemplate,
+    /// Job id for logging + staleness (pool: the notify id; solo: `node-<id>`).
+    pub job_id: String,
+    /// Pool extranonce1 low half (solo: 0 — the miner owns the full extranonce).
+    pub xn1_low: u32,
+}
+
+/// Result of polling a [`WorkSource`] for the next job.
+pub enum WorkIntake {
+    /// A job to mine.
+    Job(LoopWork),
+    /// No work yet (just connected / mid-reconnect / node 503) — idle + retry.
+    Idle,
+}
+
 pub trait WorkSource {
     /// Latest job pushed by the pool, or `None` if none has arrived yet.
     fn latest_job(&self) -> Option<StratumJob>;
@@ -162,6 +183,55 @@ pub trait WorkSource {
     /// (D2). Default no-op (mock / a solo source without stats); `StratumClient`
     /// routes it to its attached `StatsHandle`.
     fn record_hashrate(&self, _ghs: f64) {}
+
+    /// Poll the next unit of work. **Default = the pool/Stratum path**
+    /// (`latest_job` → `notify_to_template`); a solo `NodeWorkSource` overrides
+    /// this to poll csd-node directly. Decode/mapping failures ⇒ `Idle`.
+    fn next_work(&self) -> WorkIntake {
+        let job = match self.latest_job() {
+            Some(j) => j,
+            None => return WorkIntake::Idle,
+        };
+        let share_target = target_from_difficulty(self.current_difficulty());
+        let xn1 = match hex::decode(&job.extranonce1_hex) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    "stratum: extranonce1 {:?} not valid hex ({e}); waiting for next job",
+                    job.extranonce1_hex
+                );
+                return WorkIntake::Idle;
+            }
+        };
+        match notify_to_template(&job.notify, &xn1, share_target) {
+            Ok(mapped) => WorkIntake::Job(LoopWork {
+                template: mapped.template,
+                job_id: mapped.job_id,
+                xn1_low: mapped.xn1_low,
+            }),
+            Err(e) => {
+                tracing::warn!(
+                    "stratum: cannot map job {}: {e}; waiting for next job",
+                    job.notify.job_id
+                );
+                WorkIntake::Idle
+            }
+        }
+    }
+
+    /// Submit a solved unit. **Default = the pool/Stratum path** (`build_submit`
+    /// + `send_submit`, byte-identical to the pre-seam submit); a solo
+    /// `NodeWorkSource` overrides this to POST `/work/submit`.
+    fn submit_solution(&self, sol: &Solution) -> Result<()> {
+        let fields = build_submit(sol.xn2, sol.time, sol.nonce);
+        self.send_submit(
+            self.worker_addr(),
+            &sol.job_id,
+            &fields.extranonce2_hex,
+            &fields.ntime_hex,
+            &fields.nonce_hex,
+        )
+    }
 }
 
 impl WorkSource for StratumClient {
@@ -1044,6 +1114,40 @@ mod tests {
             notify: fixture_notify(),
             extranonce1_hex: "aabbccdd".to_string(),
         }
+    }
+
+    #[test]
+    fn next_work_default_maps_pool_job() {
+        // The default next_work IS the pool path: latest_job → notify_to_template,
+        // with the share target baked into template.target.
+        let src = MockWorkSource::new(mock_job(), 1024.0);
+        match src.next_work() {
+            WorkIntake::Job(w) => {
+                assert_eq!(w.template.target, target_from_difficulty(1024.0));
+                assert!(!w.job_id.is_empty());
+            }
+            WorkIntake::Idle => panic!("a mappable job must yield Job, not Idle"),
+        }
+    }
+
+    #[test]
+    fn submit_solution_default_routes_through_send_submit() {
+        // The default submit_solution IS the pool path: build_submit + send_submit.
+        let src = MockWorkSource::new(mock_job(), 1.0);
+        let sol = crate::solo::Solution {
+            template_id: 0,
+            job_id: "job-xyz".to_string(),
+            xn2: 0x1122_3344,
+            extranonce: 0,
+            time: 0x6543_2100,
+            nonce: 0xABCD,
+        };
+        src.submit_solution(&sol).unwrap();
+        let recorded = src.submits.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "one submit recorded");
+        let (worker, job_id, _xn2_hex, _ntime, _nonce_hex) = &recorded[0];
+        assert_eq!(worker, "csd1mockworker");
+        assert_eq!(job_id, "job-xyz");
     }
 
     #[test]

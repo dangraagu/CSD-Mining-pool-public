@@ -52,15 +52,21 @@ pub fn parse_node_template(body: &str) -> Result<WorkTemplate, String> {
     }
 }
 
-/// A solved work unit, ready to submit to the node. `job_id` is for local
-/// logging/staleness only and is NOT sent on the wire.
+/// A solved work unit. Carries BOTH pool and solo submit fields so neither path
+/// does a lossy round-trip: the pool default uses `{job_id, xn2, time, nonce}`,
+/// the solo override uses `{template_id, extranonce, time, nonce}`.
 #[derive(Clone, Debug)]
 pub struct Solution {
+    /// Node template id (solo submit → `WorkSubmission.id`).
     pub template_id: u64,
-    pub nonce: u32,
+    /// Stratum job id (pool submit) + local logging/staleness.
+    pub job_id: String,
+    /// Rolled xn2 high-half (pool submit via `build_submit`).
+    pub xn2: u32,
+    /// Full 8-byte extranonce (solo submit).
     pub extranonce: u64,
     pub time: u64,
-    pub job_id: String,
+    pub nonce: u32,
 }
 
 /// Map a [`Solution`] to the node's [`WorkSubmission`] — the exact
@@ -230,10 +236,11 @@ mod tests {
     fn solution_to_submission_has_node_worksubmission_shape() {
         let sol = Solution {
             template_id: 42,
-            nonce: 0xDEAD_BEEF,
+            job_id: "job-1".to_string(),
+            xn2: 7,
             extranonce: 0x0102_0304_0506_0708,
             time: 1_700_000_000,
-            job_id: "job-1".to_string(),
+            nonce: 0xDEAD_BEEF,
         };
         let sub = solution_to_submission(&sol);
         let v = serde_json::to_value(&sub).unwrap();
