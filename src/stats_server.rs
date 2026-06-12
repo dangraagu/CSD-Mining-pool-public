@@ -44,6 +44,10 @@ const MAX_REQUEST_BYTES: usize = 8 * 1024;
 /// [`crate::stats`] with injected times, so the server only needs a real now.
 pub struct StatsHandle {
     hashrate: Mutex<HashrateWindows>,
+    /// Latest health snapshot, pushed by the mining loop and served verbatim.
+    /// Keeping it here (rather than calling the live work source per request)
+    /// means the server needs only the handle, not a reference to the client.
+    health: Mutex<HealthSnapshot>,
     /// Process/server start, in UNIX-epoch milliseconds.
     started_ms: u64,
 }
@@ -53,6 +57,7 @@ impl StatsHandle {
     pub fn new() -> Self {
         StatsHandle {
             hashrate: Mutex::new(HashrateWindows::new()),
+            health: Mutex::new(HealthSnapshot::default()),
             started_ms: now_ms(),
         }
     }
@@ -78,6 +83,20 @@ impl StatsHandle {
     /// clock ever goes backwards).
     pub fn uptime_s(&self) -> u64 {
         now_ms().saturating_sub(self.started_ms) / 1000
+    }
+
+    /// Push the latest health snapshot — the mining loop calls this; the server
+    /// serves whatever was last pushed. A poisoned lock is silently skipped
+    /// (telemetry must never take the loop down).
+    pub fn set_health(&self, h: HealthSnapshot) {
+        if let Ok(mut slot) = self.health.lock() {
+            *slot = h;
+        }
+    }
+
+    /// The last-pushed health snapshot (default/empty until the loop pushes one).
+    pub fn health(&self) -> HealthSnapshot {
+        self.health.lock().map(|h| h.clone()).unwrap_or_default()
     }
 }
 
@@ -580,5 +599,25 @@ mod tests {
         );
         assert_eq!(query_token("/1/summary"), None);
         assert_eq!(query_token("/1/summary?notoken=1"), None);
+    }
+
+    #[test]
+    fn stats_handle_health_round_trips() {
+        let h = StatsHandle::new();
+        // Empty until the loop pushes a snapshot.
+        assert_eq!(h.health().accepted, 0);
+        assert_eq!(h.health().endpoint, "");
+        h.set_health(HealthSnapshot {
+            accepted: 11,
+            rejected: 2,
+            stale: 1,
+            submitted: 14,
+            job_age_s: Some(9),
+            endpoint: "pool.x:3333".to_string(),
+        });
+        let got = h.health();
+        assert_eq!(got.accepted, 11);
+        assert_eq!(got.submitted, 14);
+        assert_eq!(got.endpoint, "pool.x:3333");
     }
 }
