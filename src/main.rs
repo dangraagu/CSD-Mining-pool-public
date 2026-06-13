@@ -17,8 +17,9 @@ use csd_gpu_miner::endpoint;
 use csd_gpu_miner::logging;
 use csd_gpu_miner::mining_config::MiningConfig;
 use csd_gpu_miner::notify::{self, DiscordNotifier};
-use csd_gpu_miner::solo::NodeWorkSource;
+use csd_gpu_miner::solo::{self, NodeWorkSource};
 use csd_gpu_miner::stats_server::{self, StatsHandle};
+use csd_gpu_miner::{hiveos, selfupdate};
 use csd_gpu_miner::stratum::{run_stratum, StratumClient};
 
 #[cfg(feature = "opencl")]
@@ -210,6 +211,43 @@ enum Cmd {
         #[arg(long, default_value_t = 0xC0FFEE)]
         seed: u64,
     },
+
+    /// Self-update helper (P4): semver-compare two versions. Prints
+    /// `update-available` + exits 0 if `latest` is newer than `current`, else
+    /// prints `up-to-date` + exits 1. Lets the launcher scripts gate an update on
+    /// ONE tested semver compare (`0.1.10 > 0.1.9`) instead of a fragile string
+    /// `!=`. Exits immediately; does not mine.
+    CheckUpdate {
+        /// The currently-installed version (e.g. the running binary's version).
+        #[arg(long)]
+        current: String,
+        /// The candidate version (e.g. the latest release tag).
+        #[arg(long)]
+        latest: String,
+    },
+
+    /// Self-update helper (P4): verify a downloaded file's SHA-256 before it is
+    /// swapped in + executed. Reads `file`, compares its digest to `sha256`
+    /// (case-insensitive hex). Prints `ok` + exits 0 on match, `MISMATCH` + exits
+    /// 1 on mismatch, or the read error + exits 2 if the file can't be read.
+    /// Exits immediately; does not mine.
+    VerifyFile {
+        /// Path to the downloaded file to verify.
+        file: PathBuf,
+        /// Expected SHA-256 hex digest (from the release `SHA256SUMS`).
+        sha256: String,
+    },
+
+    /// HiveOS integration (P4): scrape this miner's own `/1/summary` stats
+    /// endpoint and print the HiveOS h-stats JSON on stdout, for `h-stats.sh` to
+    /// relay. On ANY failure (server down, non-200, parse error) prints a valid
+    /// zero h-stats object so HiveOS reads the rig as alive-but-zero rather than
+    /// broken. Never panics, never hangs. Exits immediately; does not mine.
+    HiveosStats {
+        /// Port the local `--stats-port` server is listening on (default 3380).
+        #[arg(long, default_value_t = 3380)]
+        stats_port: u16,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -352,6 +390,53 @@ fn main() -> Result<()> {
 
     if matches!(cli.cmd, Some(Cmd::Devices)) {
         return print_devices();
+    }
+
+    // P4 self-update + HiveOS helpers. Each runs a pure check and exits with a
+    // shell-meaningful code (so the launcher scripts can `if csd-gpu-miner
+    // check-update …; then …`), rather than continuing into the mining path.
+    if let Some(Cmd::CheckUpdate { current, latest }) = &cli.cmd {
+        if selfupdate::should_update(current, latest) {
+            println!("update-available");
+            std::process::exit(0);
+        } else {
+            println!("up-to-date");
+            std::process::exit(1);
+        }
+    }
+
+    if let Some(Cmd::VerifyFile { file, sha256 }) = &cli.cmd {
+        match std::fs::read(file) {
+            Ok(bytes) => {
+                if selfupdate::verify_sha256(&bytes, sha256) {
+                    println!("ok");
+                    std::process::exit(0);
+                } else {
+                    println!("MISMATCH");
+                    std::process::exit(1);
+                }
+            }
+            Err(e) => {
+                println!("error reading {}: {e}", file.display());
+                std::process::exit(2);
+            }
+        }
+    }
+
+    if let Some(Cmd::HiveosStats { stats_port }) = &cli.cmd {
+        // Scrape our own /1/summary and emit the HiveOS h-stats JSON. On ANY
+        // failure (server down, non-200, unparseable body) emit a zero-but-valid
+        // object from an empty summary so HiveOS still gets well-formed JSON.
+        let url = format!("http://127.0.0.1:{stats_port}/1/summary");
+        let stats = match solo::http_get(&url) {
+            Ok((200, body)) => match serde_json::from_str::<serde_json::Value>(&body) {
+                Ok(v) => hiveos::hiveos_stats_from_summary(&v),
+                Err(_) => hiveos::hiveos_stats_from_summary(&serde_json::json!({})),
+            },
+            _ => hiveos::hiveos_stats_from_summary(&serde_json::json!({})),
+        };
+        println!("{stats}");
+        std::process::exit(0);
     }
 
     if let Some(Cmd::Selftest {

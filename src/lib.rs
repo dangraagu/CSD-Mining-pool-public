@@ -21,6 +21,7 @@ pub mod backends;
 pub mod coinbase;
 pub mod consensus_types;
 pub mod endpoint;
+pub mod hiveos;
 pub mod logging;
 pub mod mining_config;
 pub mod notify;
