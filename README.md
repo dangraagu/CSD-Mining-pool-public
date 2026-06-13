@@ -1,4 +1,4 @@
-# csd-pool-miner
+# csd-pool-miner™
 
 A standalone miner for the **Compute Substrate (CSD)** network. Point it at your
 payout address and it mines to the CSD pool — auto-detecting your GPU (NVIDIA or
@@ -155,30 +155,22 @@ binary current: they check the latest release with a proper semver compare,
 it in** (atomic, and they keep the running binary if verification fails), and
 restart the miner if it ever exits.
 
-## Reliability (failover + watchdog)
+## Reliability (watchdog + auto-reconnect)
 
-For 24/7 rigs the miner keeps itself connected and earning without babysitting:
+For 24/7 rigs the miner keeps itself connected to the official CSD pool and
+earning without babysitting:
 
-- **Multiple pools / failover** — give a comma-separated list and it tries them in
-  order, rotating to the next on a dead connection and failing back to the first
-  once it recovers:
-
-  ```sh
-  csd-pool-miner --address <ADDR> --pool pool.example:3333,backup.example:3333
-  ```
-
-  (`--url` is an alias.) With no `--pool`, it uses the built-in CSD pool.
 - **Connection watchdog** — if the link goes half-open (still gets work but
   silently drops your shares) or the pool stops sending new jobs, the miner forces
   a clean reconnect instead of mining into the void.
-- **Won't-credit failover** — if a pool keeps acking and pushing fresh work but
-  stops *crediting* your shares for ~30 minutes (a forked or misconfigured pool),
-  the miner rotates to the next endpoint on its own — at most once per window, so
-  one bad pool can't cause a reconnect storm.
+- **Won't-credit reconnect** — if the link keeps acking and pushing fresh work but
+  stops *crediting* your shares for ~30 minutes, the miner forces a fresh
+  reconnect on its own — at most once per window, so a transient hiccup can't
+  cause a reconnect storm.
 
 The 30-second health heartbeat in the log ends with
 `conn=<reconnects>/<failovers>` so connection churn is visible at a glance, and
-`selftest` TCP-probes each pool endpoint (PASS/FAIL) so you can confirm
+`selftest` TCP-probes the pool endpoint (PASS/FAIL) so you can confirm
 reachability before a long run.
 
 Invalid mining parameters (e.g. `--blocks 0`, `--cpu-share 5`) now **fail loudly**
@@ -254,4 +246,19 @@ it in `src/endpoint.rs` — see the module docs there.)
 
 ## License
 
-MIT OR Apache-2.0.
+**Future versions (v0.1.7 onward)** are licensed under the **PolyForm Perimeter
+License 1.0.0** (see [`LICENSE`](LICENSE)). The source stays public so you can
+read and audit it, but the license does **not** permit using it to build or
+operate a competing product or pool, nor redistributing or reselling it.
+
+This relicensing is **forward-only**. Already-published releases — **v0.1.6 and
+earlier** — remain under **MIT OR Apache-2.0** (see [`LICENSE-MIT`](LICENSE-MIT)
+and [`LICENSE-APACHE`](LICENSE-APACHE)); those grants are irrevocable and cannot
+be clawed back. Only versions tagged v0.1.7 and later carry the new terms.
+
+## Trademark
+
+"CSD Pool Miner" and "Compute Substrate", and the associated names and logos, are
+trademarks of the operator. The source license grants **no** rights to these
+marks — see [`TRADEMARK.md`](TRADEMARK.md) for the policy (forks must rename and
+remove the marks; nominative/referential use is fine).

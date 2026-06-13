@@ -2,9 +2,18 @@
 
 ## 0.1.7
 
-**Reliability, observability, and packaging.** Everything is automatic or opt-in;
-a plain `--address <addr>` run mines to the CSD pool exactly as before, and the
-pool share/submit path is byte-for-byte compatible with earlier builds.
+**Official-pool-only, build hardening, and relicensing.** This release:
+
+- **Hardcodes the official CSD pool endpoint** — the miner connects only to the
+  official pool; there is no endpoint/server flag to configure.
+- **Build hardening** — build-host paths are scrubbed from the release binaries.
+- **Relicensed to the PolyForm Perimeter License 1.0.0** (see `LICENSE`). The
+  relicensing is **forward-only**: v0.1.6 and earlier stay under MIT OR Apache-2.0
+  and cannot be clawed back; only v0.1.7+ carry the new terms.
+
+Everything else is automatic or opt-in; a plain `--address <addr>` run mines to
+the CSD pool exactly as before, and the pool share/submit path is byte-for-byte
+compatible with earlier builds.
 
 ### Added
 - **Stats endpoint** — `--stats-port <port>` serves an xmrig
@@ -19,14 +28,12 @@ pool share/submit path is byte-for-byte compatible with earlier builds.
 - **HiveOS package** — a Custom-miner package (`hiveos/`, shipped as a release
   tarball) that reports hashrate + accepted/rejected to the HiveOS dashboard by
   scraping the miner's own stats endpoint.
-- **Pool failover + watchdog** — `--pool a:3333,b:3333` (alias `--url`) tries
-  endpoints in order, rotating to a backup on a dead connection and failing back
-  to the primary; a connection watchdog forces a clean reconnect on a half-open
-  link or a stalled job feed; and an accepted-share dead-man rotates off a pool
-  that takes shares but stops crediting them for ~30 min (at most once per
-  window). The 30-second health heartbeat ends with `conn=<reconnects>/<failovers>`
-  so connection churn is visible at a glance.
-- **Pool-reachability probe** — `selftest` also resolves + TCP-probes each pool
+- **Connection watchdog** — forces a clean reconnect to the official pool on a
+  half-open link or a stalled job feed; and an accepted-share dead-man forces a
+  fresh reconnect if the pool takes shares but stops crediting them for ~30 min
+  (at most once per window). The 30-second health heartbeat ends with
+  `conn=<reconnects>/<failovers>` so connection churn is visible at a glance.
+- **Pool-reachability probe** — `selftest` also resolves + TCP-probes the pool
   endpoint (PASS/FAIL, non-fatal).
 - **Device UX** — `--list-devices` (flag form of the `devices` subcommand) and
   `--gpu-id <list>` (e.g. `0,2,3`).
