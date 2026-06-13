@@ -464,7 +464,7 @@ fn main() -> Result<()> {
         seed,
     }) = cli.cmd
     {
-        return csd_gpu_miner::selftest::run(csd_gpu_miner::selftest::SelftestOpts {
+        let result = csd_gpu_miner::selftest::run(csd_gpu_miner::selftest::SelftestOpts {
             trials,
             nonce_range,
             target_zero_bytes,
@@ -473,6 +473,12 @@ fn main() -> Result<()> {
             threads_per_block: cli.threads_per_block,
             nonces_per_thread: cli.nonces_per_thread,
         });
+        // v0.1.9 #4: also probe pool reachability (non-fatal, diagnostic only) so
+        // one `selftest` answers both "backends OK?" and "can I reach the pool?".
+        let endpoints = endpoint::resolve_endpoints(&cli.pool, &endpoint::pool_endpoint())
+            .unwrap_or_else(|_| vec![endpoint::pool_endpoint()]);
+        csd_gpu_miner::selftest::print_reachability(&endpoints);
+        return result;
     }
 
     print_build_features();

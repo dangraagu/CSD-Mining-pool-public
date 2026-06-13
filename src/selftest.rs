@@ -16,8 +16,9 @@
 //! Reports PASS / FAIL per backend and a final summary. Exit code is
 //! non-zero on any FAIL.
 
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::AtomicBool;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use rand::{Rng, SeedableRng};
@@ -323,4 +324,55 @@ fn exhaustive_cpu_scan(header: &[u8; 84], target: &[u8; 32], range: u32) -> Opti
         }
     }
     None
+}
+
+/// Probe whether a `host:port` pool endpoint is reachable: resolve it and open a
+/// TCP connection with a short timeout (then drop it immediately — this is
+/// non-destructive, it never subscribes). `Ok(())` = reachable; `Err(msg)` =
+/// unresolvable or unreachable. (v0.1.9 #4)
+pub fn probe_reachable(endpoint: &str, timeout: Duration) -> Result<(), String> {
+    let addr = endpoint
+        .to_socket_addrs()
+        .map_err(|e| format!("resolve failed: {e}"))?
+        .next()
+        .ok_or_else(|| "no address resolved".to_string())?;
+    TcpStream::connect_timeout(&addr, timeout)
+        .map(|_| ())
+        .map_err(|e| format!("connect failed: {e}"))
+}
+
+/// Print a pool-reachability report (PASS/FAIL per endpoint). DIAGNOSTIC ONLY +
+/// NON-FATAL — it never changes the selftest exit code (which stays
+/// backend-correctness-only) — so one `selftest` answers both "are the backends
+/// correct?" and "can I actually reach the pool?".
+pub fn print_reachability(endpoints: &[String]) {
+    println!();
+    println!("=== pool reachability ===");
+    for ep in endpoints {
+        match probe_reachable(ep, Duration::from_secs(5)) {
+            Ok(()) => println!("  {ep:<28} PASS - tcp connect ok"),
+            Err(e) => println!("  {ep:<28} FAIL - {e}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn probe_reachable_connects_to_a_live_listener() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        assert!(probe_reachable(&format!("127.0.0.1:{port}"), Duration::from_secs(2)).is_ok());
+    }
+
+    #[test]
+    fn probe_reachable_fails_on_refused_and_unresolvable() {
+        // Nothing listening on loopback port 1 → connection refused.
+        assert!(probe_reachable("127.0.0.1:1", Duration::from_millis(500)).is_err());
+        // `.invalid` is a reserved never-resolvable TLD → resolve failure.
+        assert!(probe_reachable("nonexistent.invalid:3333", Duration::from_millis(500)).is_err());
+    }
 }
