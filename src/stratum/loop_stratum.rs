@@ -294,8 +294,8 @@ fn format_health_line(h: &HealthSnapshot, difficulty: f64, hw_err: u64) -> Strin
     };
     format!(
         "health pool={pool} job_age={job_age} diff={difficulty:.2} \
-         submitted={} acc={} rej={} stale={} hw_err={hw_err}",
-        h.submitted, h.accepted, h.rejected, h.stale,
+         submitted={} acc={} rej={} stale={} hw_err={hw_err} conn={}/{}",
+        h.submitted, h.accepted, h.rejected, h.stale, h.reconnects, h.failovers,
     )
 }
 
@@ -1141,6 +1141,8 @@ mod tests {
             submitted: 9,
             job_age_s: Some(42),
             endpoint: "pool.test:3333".to_string(),
+            reconnects: 3,
+            failovers: 1,
         };
         let line = format_health_line(&h, 1024.0, 7);
         for needle in [
@@ -1152,6 +1154,7 @@ mod tests {
             "rej=1",
             "stale=2",
             "hw_err=7",
+            "conn=3/1", // reconnects/failovers
         ] {
             assert!(line.contains(needle), "missing {needle:?} in {line:?}");
         }

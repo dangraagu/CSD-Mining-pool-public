@@ -379,6 +379,7 @@ mod tests {
             submitted: 10,
             job_age_s: Some(5),
             endpoint: "pool.example:3333".to_string(),
+            ..Default::default()
         }
     }
 
@@ -618,6 +619,7 @@ mod tests {
             submitted: 14,
             job_age_s: Some(9),
             endpoint: "pool.x:3333".to_string(),
+            ..Default::default()
         });
         let got = h.health();
         assert_eq!(got.accepted, 11);
@@ -644,6 +646,7 @@ mod tests {
             submitted: 42,
             job_age_s: Some(1),
             endpoint: "pool.live:3333".to_string(),
+            ..Default::default()
         });
         let stop = Arc::new(AtomicBool::new(false));
         let health_src = handle.clone();

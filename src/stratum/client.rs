@@ -123,6 +123,13 @@ struct SessionStats {
     /// the accepted-share dead-man (v0.1.9 #2): every reconnect restarts its clock
     /// so a never-crediting endpoint fails over at most once per `accept_stale`.
     last_reconnect_ms: AtomicU64,
+    /// Lifetime count of successful reconnects (after the initial connect) — a
+    /// connection-churn signal surfaced in telemetry so an operator can see an
+    /// unstable link.
+    reconnects: AtomicU64,
+    /// Lifetime count of endpoint failovers (accepted-share dead-man rotations) —
+    /// surfaced in telemetry so an operator can see a flaky/non-crediting primary.
+    failovers: AtomicU64,
 }
 
 /// Current wall-clock time as milliseconds since the Unix epoch (0 if the clock
@@ -245,9 +252,14 @@ pub struct HealthSnapshot {
     pub submitted: u64,
     /// Seconds since the last *new* job (`None` = no job received yet).
     pub job_age_s: Option<u64>,
-    /// The pool endpoint (the configured primary; v0.1.8 doesn't reflect a
-    /// failover here — the heartbeat's value is the share counts + job age).
+    /// The pool endpoint currently connected to (tracks failover, as of v0.1.9 #1).
     pub endpoint: String,
+    /// Lifetime successful reconnects — a connection-churn signal for dashboards.
+    /// 0 for sources without a live pool (the mock / solo).
+    pub reconnects: u64,
+    /// Lifetime endpoint failovers (accepted-share dead-man rotations). 0 for
+    /// sources without a live pool.
+    pub failovers: u64,
 }
 
 /// A job pushed by the pool via `mining.notify`, paired with the session
@@ -618,6 +630,8 @@ impl StratumClient {
                             // maybe_failback after FAILBACK_MS.
                             if shared.force_failover.swap(false, Ordering::Relaxed) {
                                 endpoints.advance();
+                                // Telemetry: count this failover (flaky-primary signal).
+                                shared.stats.failovers.fetch_add(1, Ordering::Relaxed);
                                 tracing::warn!(
                                     "stratum: failover armed — rotating to {}",
                                     endpoints.current()
@@ -708,6 +722,8 @@ impl StratumClient {
                 .lock()
                 .map(|e| e.clone())
                 .unwrap_or_else(|_| self.endpoint.clone()),
+            reconnects: s.reconnects.load(Ordering::Relaxed),
+            failovers: s.failovers.load(Ordering::Relaxed),
         }
     }
 
@@ -994,6 +1010,8 @@ fn reconnect(
                     .stats
                     .last_reconnect_ms
                     .store(now_unix_ms(), Ordering::Relaxed);
+                // Telemetry: count this successful reconnect (connection-churn signal).
+                shared.stats.reconnects.fetch_add(1, Ordering::Relaxed);
                 return true;
             }
             Err(e) => {
@@ -1489,6 +1507,13 @@ mod tests {
             client.health_snapshot().endpoint
         );
 
+        // Telemetry: A died and we reconnected our way to B via the reconnect
+        // path's OWN advance-on-handshake-failure — that is NOT a watchdog
+        // failover, so the failover counter stays 0 while reconnects is non-zero.
+        let hs = client.health_snapshot();
+        assert_eq!(hs.failovers, 0, "primary death is a reconnect, not a failover");
+        assert!(hs.reconnects >= 1, "reconnected at least once reaching B");
+
         drop(client);
         let _ = server_a.join();
         let _ = server_b.join();
@@ -1610,6 +1635,12 @@ mod tests {
             "health_snapshot().endpoint must track the failover to B; got {:?}",
             client.health_snapshot().endpoint
         );
+
+        // Telemetry: the rotation counts as exactly ONE failover, and at least one
+        // successful reconnect (the dial to B).
+        let hs = client.health_snapshot();
+        assert_eq!(hs.failovers, 1, "exactly one endpoint failover");
+        assert!(hs.reconnects >= 1, "at least one successful reconnect (to B)");
 
         drop(client);
         let _ = server_a.join();

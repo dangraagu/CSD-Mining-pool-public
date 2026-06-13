@@ -499,6 +499,8 @@ impl WorkSource for NodeWorkSource {
             submitted: self.stats.submitted.load(Ordering::Relaxed),
             job_age_s,
             endpoint: self.base_url.clone(),
+            // Solo polls its own node — no pool reconnect/failover churn to report.
+            ..Default::default()
         }
     }
 

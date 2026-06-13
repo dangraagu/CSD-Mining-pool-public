@@ -39,6 +39,10 @@ pub fn summary_json(
         "connection": {
             "pool": health.endpoint,
             "uptime": uptime_s,
+            // csd extensions (xmrig consumers ignore unknown fields): connection
+            // churn so an operator sees an unstable link / flaky primary pool.
+            "reconnects": health.reconnects,
+            "failovers": health.failovers,
         },
     })
 }
@@ -155,6 +159,8 @@ mod tests {
             submitted: 9,
             job_age_s: Some(3),
             endpoint: "pool.test:3333".to_string(),
+            reconnects: 4,
+            failovers: 2,
         };
         let v = summary_json("csd1abc", &h, [1.0, 1.2, 1.1], 3600);
         assert_eq!(v["worker_id"], "csd1abc");
@@ -163,6 +169,8 @@ mod tests {
         assert_eq!(v["results"]["shares_total"], 9);
         assert_eq!(v["results"]["shares_rejected"], 1);
         assert_eq!(v["connection"]["pool"], "pool.test:3333");
+        assert_eq!(v["connection"]["reconnects"], 4);
+        assert_eq!(v["connection"]["failovers"], 2);
         let total = v["hashrate"]["total"].as_array().unwrap();
         assert_eq!(total.len(), 3);
         assert_eq!(total[0], 1.0e9); // 1 GH/s → 1e9 H/s
