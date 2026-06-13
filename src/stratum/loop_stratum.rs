@@ -34,7 +34,20 @@ use crate::stratum::client::{HealthSnapshot, StratumClient, StratumJob};
 use crate::stratum::mapping::{build_submit, compose_extranonce, notify_to_template};
 use crate::stratum::watchdog::{spawn_watchdog, WatchdogCfg, WatchdogView};
 use crate::consensus_types::WorkTemplate;
-use crate::solo::Solution;
+
+/// A solved share, handed from the mining loop to [`WorkSource::submit_solution`].
+/// The pool submit (`build_submit`) consumes `{job_id, xn2, time, nonce}`.
+#[derive(Clone, Debug)]
+pub struct Solution {
+    /// Stratum job id (pool submit) + local logging / staleness.
+    pub job_id: String,
+    /// Rolled xn2 high-half (pool submit via `build_submit`).
+    pub xn2: u32,
+    /// ntime used for this share.
+    pub time: u64,
+    /// Winning nonce.
+    pub nonce: u32,
+}
 
 /// Pool-difficulty-1 target as 32 big-endian bytes:
 /// `0x00000000FFFF0000000000000000000000000000000000000000000000000000`.
@@ -628,10 +641,8 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
                     }
 
                     let sol = Solution {
-                        template_id: template.id,
                         job_id: work.job_id.clone(),
                         xn2,
-                        extranonce,
                         time: template.time,
                         nonce,
                     };
@@ -1116,11 +1127,9 @@ mod tests {
     fn submit_solution_default_routes_through_send_submit() {
         // The default submit_solution IS the pool path: build_submit + send_submit.
         let src = MockWorkSource::new(mock_job(), 1.0);
-        let sol = crate::solo::Solution {
-            template_id: 0,
+        let sol = Solution {
             job_id: "job-xyz".to_string(),
             xn2: 0x1122_3344,
-            extranonce: 0,
             time: 0x6543_2100,
             nonce: 0xABCD,
         };

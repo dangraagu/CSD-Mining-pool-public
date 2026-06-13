@@ -17,7 +17,7 @@ use csd_gpu_miner::endpoint;
 use csd_gpu_miner::logging;
 use csd_gpu_miner::mining_config::MiningConfig;
 use csd_gpu_miner::notify::{self, DiscordNotifier};
-use csd_gpu_miner::solo::{self, NodeWorkSource};
+use csd_gpu_miner::http;
 use csd_gpu_miner::stats_server::{self, StatsHandle};
 use csd_gpu_miner::{hiveos, selfupdate};
 use csd_gpu_miner::stratum::{run_stratum, StratumClient};
@@ -56,20 +56,6 @@ struct Cli {
     /// omitted, the compiled-in default pool is used.
     #[arg(long = "pool", visible_alias = "url", value_delimiter = ',')]
     pool: Vec<String>,
-
-    /// SOLO mining: mine directly to your own csd-node instead of the pool.
-    /// Requires `--node`. Mutually exclusive with `--pool`/`--url` (you are
-    /// either pooling or soloing). In solo mode every block you find is yours
-    /// (no pool fee, no PPLNS) — but you also earn nothing until you find one.
-    #[arg(long, conflicts_with = "pool")]
-    solo: bool,
-
-    /// SOLO mining: your csd-node's HTTP endpoint as `http://host:port` (plain
-    /// HTTP only — no TLS). Passing `--node` turns on solo mode on its own (it
-    /// implies `--solo`). Mutually exclusive with `--pool`/`--url`. The miner
-    /// pulls work from `<node>/work/get` and submits blocks to `<node>/work/submit`.
-    #[arg(long, conflicts_with = "pool")]
-    node: Option<String>,
 
     /// Telemetry: serve an xmrig-compatible `/1/summary` JSON endpoint on this
     /// port (plus `/healthz`) for dashboards/monitoring. Omitted ⇒ no server.
@@ -446,7 +432,7 @@ fn main() -> Result<()> {
         // failure (server down, non-200, unparseable body) emit a zero-but-valid
         // object from an empty summary so HiveOS still gets well-formed JSON.
         let url = format!("http://127.0.0.1:{stats_port}/1/summary");
-        let stats = match solo::http_get(&url) {
+        let stats = match http::http_get(&url) {
             Ok((200, body)) => match serde_json::from_str::<serde_json::Value>(&body) {
                 Ok(v) => hiveos::hiveos_stats_from_summary(&v),
                 Err(_) => hiveos::hiveos_stats_from_summary(&serde_json::json!({})),
@@ -529,24 +515,6 @@ fn main() -> Result<()> {
         }
     }
 
-    // SOLO/POOL mode validation. clap already rejects `--solo`/`--node` together
-    // with `--pool`/`--url` (conflicts_with = "pool"); here we cover the two
-    // remaining shapes:
-    //   * `--solo` without `--node`  → error (solo needs a node to mine to).
-    //   * `--node` without `--solo`  → IMPLY solo (a node url means "mine solo").
-    // After this block, `cli.solo` is the single source of truth for the branch.
-    if cli.solo && cli.node.is_none() {
-        bail!(
-            "--solo requires --node <url>: tell the miner which csd-node to mine to, \
-             e.g. --solo --node http://127.0.0.1:8799"
-        );
-    }
-    if cli.node.is_some() && !cli.solo {
-        // `--node` on its own means the operator wants solo mining; flip it on
-        // rather than erroring, so `--node http://…` is enough.
-        cli.solo = true;
-    }
-
     // G6: optional Discord notifier. Built once here (fail-fast on a bad webhook,
     // before any socket opens) and shared into whichever arm runs. `None` ⇒ the
     // notifier is OFF: no fire points post, and behaviour is byte-identical to a
@@ -577,39 +545,6 @@ fn main() -> Result<()> {
         });
     }
 
-    // Branch on the work source. Both arms: build the source, optionally wire the
-    // D2 stats sink into it (when --stats-port is set) BEFORE spawning the stats
-    // server, then hand the source to `drive` which selects the backend and runs
-    // the same `run_stratum` loop. The pool arm is byte-identical in behaviour to
-    // the pre-solo build; the solo arm swaps the StratumClient for a NodeWorkSource.
-    if cli.solo {
-        let node_url = cli.node.clone().expect("validated: --solo implies --node");
-        let mut work = NodeWorkSource::connect(&node_url, &address)
-            .map_err(|e| anyhow::anyhow!("failed to connect to node {node_url}: {e}"))?;
-
-        // G6: wire the Discord notifier into the solo source (fires a block-found
-        // post on each accepted submit). No-op when --discord-webhook is unset.
-        if let Some(n) = &notifier {
-            work.attach_notifier(n.clone());
-        }
-
-        // D2: optional xmrig-compatible /1/summary telemetry. Off unless
-        // --stats-port. Attach the sink to the source BEFORE spawning the server
-        // so record_hashrate has somewhere to route from the first sample.
-        let _stats_server = if cli.stats_port.is_some() {
-            let handle = Arc::new(StatsHandle::new());
-            work.attach_stats(handle.clone());
-            Some(spawn_stats(handle, &address, &cli, &stop)?)
-        } else {
-            None
-        };
-
-        tracing::info!("solo: mining to {node_url} as {address}");
-        return drive(&work, &cli, stop);
-    }
-
-    // POOL mode (default): the existing flow, unchanged.
-    //
     // Resolve the pool endpoint(s): the operator's --url/--pool override(s) if
     // given (validated host:port), else the compiled-in default. The first is
     // the primary we connect to now; the full list will back failover (P1 §3).
