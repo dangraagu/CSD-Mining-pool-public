@@ -82,6 +82,43 @@ pub fn watchdog_decision(
     None
 }
 
+/// Accepted-share dead-man (v0.1.9 #2): true when the pool is STILL sending fresh
+/// work but has not ACCEPTED a share within `accept_threshold` — it takes our
+/// submits but never credits us (a forked / misconfigured / hostile pool). This
+/// is distinct from the submit-ack streak (a pool that stops ACKing at all) and
+/// job-staleness (a dead push channel); it catches a pool that acks + pushes but
+/// never accepts, and maps to a FAILOVER (rotate endpoints), not a same-endpoint
+/// reconnect.
+///
+/// Guards against false-tripping a healthy-but-quiet miner:
+///   - `last_accept_ms == 0` (never accepted yet) ⇒ never trips — a brand-new or
+///     very-low-hashrate miner that simply hasn't found a share is not a victim.
+///   - jobs must be FRESH (`last_new_job_ms` within `job_fresh_within`); if the
+///     push channel is also quiet/dead, that's job-staleness's job, not this.
+///
+/// Use a LONG `accept_threshold` (e.g. 30 min) so a miner that accepts even
+/// occasionally never trips. (For a single-endpoint miner a failover just
+/// re-dials the same pool, so even a rare false-trip is merely a brief reconnect.)
+pub fn accept_deadman(
+    last_accept_ms: u64,
+    last_new_job_ms: u64,
+    now_ms: u64,
+    accept_threshold: Duration,
+    job_fresh_within: Duration,
+) -> bool {
+    if last_accept_ms == 0 {
+        return false; // never been credited a share ⇒ not a dropped-shares victim
+    }
+    // The pool must still be pushing FRESH work, else this is a dead push channel
+    // (job-staleness handles that) — and a genuinely quiet pool isn't dropping us.
+    if last_new_job_ms == 0
+        || now_ms.saturating_sub(last_new_job_ms) > job_fresh_within.as_millis() as u64
+    {
+        return false;
+    }
+    now_ms.saturating_sub(last_accept_ms) >= accept_threshold.as_millis() as u64
+}
+
 /// A `'static` view the watchdog thread uses to observe the session and request
 /// a reconnect — without holding the mining loop's borrows. Implemented by the
 /// live client (real socket) and a mock (tests).
@@ -201,6 +238,26 @@ mod tests {
             last_new_job_ms: 0,
         };
         assert_eq!(watchdog_decision(snap, cfg(), 9_999_999), None);
+    }
+
+    #[test]
+    fn accept_deadman_trips_only_when_jobs_fresh_and_accepts_stale() {
+        let accept_thr = Duration::from_secs(1800); // 30 min
+        let job_fresh = Duration::from_secs(300); // 5 min
+        let now = 10_000_000u64;
+        let m = 60_000u64; // ms per minute
+
+        // Jobs fresh (1 min ago), last accept 31 min ago ⇒ TRIP (pool not crediting).
+        assert!(accept_deadman(now - 31 * m, now - m, now, accept_thr, job_fresh));
+        // Last accept only 29 min ago ⇒ under threshold, no trip.
+        assert!(!accept_deadman(now - 29 * m, now - m, now, accept_thr, job_fresh));
+        // Never accepted (0) ⇒ never trips (new / very-low-hashrate miner).
+        assert!(!accept_deadman(0, now - m, now, accept_thr, job_fresh));
+        // Accepts stale BUT jobs also stale (10 min ago > 5 min window) ⇒ no trip
+        // (that's the job-staleness watchdog's case, not dropped shares).
+        assert!(!accept_deadman(now - 31 * m, now - 10 * m, now, accept_thr, job_fresh));
+        // Jobs fresh but no job has ever arrived (0) ⇒ no trip.
+        assert!(!accept_deadman(now - 31 * m, 0, now, accept_thr, job_fresh));
     }
 
     struct MockView {
