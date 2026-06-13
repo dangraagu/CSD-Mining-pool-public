@@ -1,0 +1,18 @@
+# Cargo build configuration for csd-pool-miner.
+#
+# Scrub the build-host absolute path out of the shipped binary. With
+# `panic = "unwind"` and `#[track_caller]`, rustc bakes source file paths into
+# the binary's panic metadata. On this build host those paths begin with the
+# developer's home directory, so the username would otherwise leak ~hundreds of
+# times in a `strings <binary>` dump of a release build.
+#
+# `--remap-path-prefix=FROM=TO` rewrites any compiled-in path beginning with
+# FROM so it begins with TO instead. Each mapping MUST be a single argv token
+# (the `FROM=TO` pair contains an `=`), so each is one array element here — do
+# NOT split it across two. We cover both the native Windows path and the
+# Unix-style (MSYS/Git-Bash) spelling of the same home directory.
+[build]
+rustflags = [
+    "--remap-path-prefix=C:\\Users\\bahs_admin=/build",
+    "--remap-path-prefix=/c/Users/bahs_admin=/build",
+]
