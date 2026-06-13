@@ -65,7 +65,18 @@ impl DiscordNotifier {
                     .build();
                 match agent.post(&webhook).send_json(discord_payload(&content)) {
                     Ok(_) => {}
-                    Err(e) => tracing::warn!("discord webhook post failed (ignored): {e}"),
+                    // Log ONLY the status code / error kind — never the bare error.
+                    // ureq's Error Display embeds the request URL, and a Discord
+                    // webhook URL carries its secret token in the path, so logging
+                    // `{e}` would leak the token into the operator's log file on a
+                    // 429/4xx/transport error. (P3 review finding.)
+                    Err(ureq::Error::Status(code, _)) => {
+                        tracing::warn!("discord webhook post failed (ignored): HTTP {code}")
+                    }
+                    Err(e) => tracing::warn!(
+                        "discord webhook post failed (ignored): {:?}",
+                        e.kind()
+                    ),
                 }
             });
     }

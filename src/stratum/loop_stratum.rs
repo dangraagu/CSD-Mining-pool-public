@@ -134,6 +134,10 @@ pub struct LoopWork {
 }
 
 /// Result of polling a [`WorkSource`] for the next job.
+// `Job` carries a full `WorkTemplate` while `Idle` is empty — clippy flags the
+// size gap, but boxing would add a heap allocation per job on the hot intake
+// path for no benefit (the enum is moved once per job, never stored in bulk).
+#[allow(clippy::large_enum_variant)]
 pub enum WorkIntake {
     /// A job to mine.
     Job(LoopWork),
