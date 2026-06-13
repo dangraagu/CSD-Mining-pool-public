@@ -21,8 +21,10 @@ name: release
 # against — without SHA256SUMS the updater has nothing to verify a download
 # against, so this job is load-bearing, not cosmetic.
 #
-# NOTE for the operator: before tagging a REAL release, set the pool endpoint in
-# src/endpoint.rs (it ships as a placeholder).
+# NOTE for the operator: before tagging, confirm src/endpoint.rs points at the
+# intended live pool. It is ALREADY set to the production endpoint (verified by the
+# pool_endpoint_decodes_to_expected test) — the binary does NOT ship a placeholder;
+# only edit it if you want to ship a different pool.
 #
 # FIRST-RUN ITERATION POINTS (these run on GitHub, not locally — watch the logs):
 #   * The CPU build is the safe one and should always succeed.
