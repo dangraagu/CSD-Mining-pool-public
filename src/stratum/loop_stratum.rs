@@ -135,14 +135,14 @@ struct CpuFind {
     hash: [u8; 32],
 }
 
-/// One unit of work the loop mines, abstracted over pool vs solo sources.
+/// One unit of work the loop mines, supplied by the pool client (or the test mock).
 pub struct LoopWork {
-    /// The work template; `template.target` is the gate target (pool share
-    /// target, or solo network target).
+    /// The work template; `template.target` is the gate target (the pool share
+    /// target).
     pub template: WorkTemplate,
-    /// Job id for logging + staleness (pool: the notify id; solo: `node-<id>`).
+    /// Job id for logging + staleness (the pool notify id).
     pub job_id: String,
-    /// Pool extranonce1 low half (solo: 0 — the miner owns the full extranonce).
+    /// Pool extranonce1 low half.
     pub xn1_low: u32,
 }
 
@@ -161,11 +161,11 @@ pub enum WorkIntake {
 /// Source of mining work + sink for found shares.
 ///
 /// Abstracts the loop's dependency on a concrete [`StratumClient`] so
-/// `run_stratum` can be driven by the pool client, the test mock, or a solo
-/// `NodeWorkSource` (P3). The pool/Stratum behaviour lives in the DEFAULT
-/// methods (`next_work` = latest_job → notify_to_template; `submit_solution` =
-/// build_submit → send_submit); `StratumClient` + the mock inherit them, and a
-/// solo source overrides just those two.
+/// `run_stratum` can be driven by the pool client or the test mock. The
+/// pool/Stratum behaviour lives in the DEFAULT methods (`next_work` =
+/// latest_job → notify_to_template; `submit_solution` = build_submit →
+/// send_submit); `StratumClient` + the mock inherit them, and the test mock may
+/// override those two.
 pub trait WorkSource {
     /// Latest job pushed by the pool, or `None` if none has arrived yet.
     fn latest_job(&self) -> Option<StratumJob>;
@@ -184,34 +184,33 @@ pub trait WorkSource {
     ) -> Result<()>;
 
     /// A `'static` watchdog handle, if this source backs the reliability
-    /// watchdog. Default `None` (e.g. a future solo csd-node source or the test
-    /// mock); `StratumClient` returns a handle over its live connection.
+    /// watchdog. Default `None` (e.g. the test mock); `StratumClient` returns a
+    /// handle over its live connection.
     fn watchdog_view(&self) -> Option<Arc<dyn WatchdogView>> {
         None
     }
 
     /// A snapshot of liveness/share stats for the INFO heartbeat. Default is
-    /// empty (mock / future solo source); `StratumClient` fills it from its live
-    /// session counters.
+    /// empty (the test mock); `StratumClient` fills it from its live session
+    /// counters.
     fn health(&self) -> HealthSnapshot {
         HealthSnapshot::default()
     }
 
     /// Record a combined-hashrate sample (GH/s) for the optional stats endpoint
-    /// (D2). Default no-op (mock / a solo source without stats); `StratumClient`
-    /// routes it to its attached `StatsHandle`.
+    /// (D2). Default no-op (the test mock); `StratumClient` routes it to its
+    /// attached `StatsHandle`.
     fn record_hashrate(&self, _ghs: f64) {}
 
     /// Heartbeat hook for the optional G6 Discord accepted-share milestone.
     /// Called from the loop's 30s heartbeat (NOT the share path). Default no-op:
-    /// the mock and the solo `NodeWorkSource` inherit it (solo fires its
-    /// block-found post in `submit_solution`, not here). `StratumClient`
-    /// overrides it to post the running accepted total when it has grown.
+    /// the test mock inherits it. `StratumClient` overrides it to post the
+    /// running accepted total when it has grown.
     fn notify_heartbeat(&self) {}
 
     /// Poll the next unit of work. **Default = the pool/Stratum path**
-    /// (`latest_job` → `notify_to_template`); a solo `NodeWorkSource` overrides
-    /// this to poll csd-node directly. Decode/mapping failures ⇒ `Idle`.
+    /// (`latest_job` → `notify_to_template`); the test mock may override this.
+    /// Decode/mapping failures ⇒ `Idle`.
     fn next_work(&self) -> WorkIntake {
         let job = match self.latest_job() {
             Some(j) => j,
@@ -245,8 +244,8 @@ pub trait WorkSource {
     }
 
     /// Submit a solved unit. **Default = the pool/Stratum path** (`build_submit`
-    /// + `send_submit`, byte-identical to the pre-seam submit); a solo
-    /// `NodeWorkSource` overrides this to POST `/work/submit`.
+    /// + `send_submit`, byte-identical to the pre-seam submit); the test mock
+    /// may override this.
     fn submit_solution(&self, sol: &Solution) -> Result<()> {
         let fields = build_submit(sol.xn2, sol.time, sol.nonce);
         self.send_submit(
@@ -390,7 +389,7 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
     // half-open socket (submits going un-acked) or a dead push channel (no new
     // jobs). Detached — it owns Arc clones and exits when `stop` is set, so the
     // loop never has to join it. Sources without a live connection (the test
-    // mock, a future solo source) return `None` and run without it.
+    // mock) return `None` and run without it.
     let _watchdog = client
         .watchdog_view()
         .map(|view| spawn_watchdog(view, WatchdogCfg::default(), Arc::clone(&stop)));
@@ -415,7 +414,7 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
             last_heartbeat = Instant::now();
         }
 
-        // --- work intake: poll the work source (pool notify, or solo node) ---
+        // --- work intake: poll the work source (the pool notify) ---
         let work = match client.next_work() {
             WorkIntake::Job(w) => w,
             WorkIntake::Idle => {

@@ -39,7 +39,8 @@ impl DiscordNotifier {
         }
     }
 
-    /// Whether this notifier fires only on solved blocks (not share milestones).
+    /// Whether share-milestone pings are suppressed (vestigial in pool-only mode,
+    /// where a miner never observes a solved block).
     pub fn solutions_only(&self) -> bool {
         self.solutions_only
     }

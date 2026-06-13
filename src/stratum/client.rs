@@ -242,8 +242,8 @@ fn record_ack(line: &str, stats: &SessionStats) -> bool {
 }
 
 /// A point-in-time view of the miner's liveness + share accounting, for the INFO
-/// heartbeat. Empty default for sources without a live connection (the mock / a
-/// future solo source).
+/// heartbeat. Empty default for sources without a live connection (the test
+/// mock).
 #[derive(Debug, Clone, Default)]
 pub struct HealthSnapshot {
     pub accepted: u64,
@@ -255,7 +255,7 @@ pub struct HealthSnapshot {
     /// The pool endpoint currently connected to (tracks failover, as of v0.1.9 #1).
     pub endpoint: String,
     /// Lifetime successful reconnects — a connection-churn signal for dashboards.
-    /// 0 for sources without a live pool (the mock / solo).
+    /// 0 for sources without a live pool (the test mock).
     pub reconnects: u64,
     /// Lifetime endpoint failovers (accepted-share dead-man rotations). 0 for
     /// sources without a live pool.

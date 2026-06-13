@@ -82,10 +82,10 @@ mod tests {
 
     #[test]
     fn parse_http_url_extracts_host_port_path() {
-        let u = parse_http_url("http://127.0.0.1:8799/work/get").unwrap();
+        let u = parse_http_url("http://127.0.0.1:8799/1/summary").unwrap();
         assert_eq!(u.host, "127.0.0.1");
         assert_eq!(u.port, 8799);
-        assert_eq!(u.path, "/work/get");
+        assert_eq!(u.path, "/1/summary");
         let u2 = parse_http_url("http://node.local/summary").unwrap();
         assert_eq!(u2.port, 80);
         assert_eq!(u2.path, "/summary");

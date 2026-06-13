@@ -1,7 +1,7 @@
 //! Compiled-in pool endpoint, lightly obfuscated.
 //!
 //! The public build connects to ONE pool by default and exposes no
-//! `--node`/`--pool` override flag. To keep the literal host:port from showing
+//! `--pool`/`--url` override flag. To keep the literal host:port from showing
 //! up in a plain `strings <binary>` dump (and to make a casual hex-edit of the
 //! binary slightly more annoying), the endpoint is stored **XOR-scrambled** as a
 //! byte array and reconstructed at runtime by [`pool_endpoint`].

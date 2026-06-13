@@ -575,8 +575,7 @@ fn main() -> Result<()> {
     // D2: optional xmrig-compatible /1/summary telemetry server. Off unless the
     // operator passes --stats-port. It reads live hashrate + health from the
     // shared StatsHandle (the mining loop pushes into it via record_hashrate);
-    // it never touches the share/submit/header path. Shares `spawn_stats` with
-    // the solo arm.
+    // it never touches the share/submit/header path.
     let _stats_server = if cli.stats_port.is_some() {
         let handle = Arc::new(StatsHandle::new());
         client.attach_stats(handle.clone());
@@ -590,9 +589,8 @@ fn main() -> Result<()> {
 
 /// Select the backend (cuda → opencl → cpu, honoring `--backend`) and run the
 /// shared `run_stratum` loop against `work`. Generic over the [`WorkSource`] so
-/// the SAME selection logic drives both the pool `StratumClient` and the solo
-/// `NodeWorkSource` — the backend arms are unchanged; only the work-source
-/// argument differs from the pre-solo inline version.
+/// the same selection logic drives the pool `StratumClient` (and the test mock);
+/// the backend arms are independent of the work-source argument.
 fn drive<W: csd_gpu_miner::stratum::loop_stratum::WorkSource>(
     work: &W,
     cli: &Cli,
@@ -757,9 +755,9 @@ fn drive<W: csd_gpu_miner::stratum::loop_stratum::WorkSource>(
 }
 
 /// Spawn the D2 xmrig-compatible `/1/summary` stats server bound to
-/// `cli.stats_bind:cli.stats_port`, serving until `stop` is set. Shared by the
-/// pool and solo arms so the bind-parse + spawn happens in exactly one place;
-/// the caller builds the [`StatsHandle`], attaches it to its work source
+/// `cli.stats_bind:cli.stats_port`, serving until `stop` is set. Factored out so
+/// the bind-parse + spawn happens in exactly one place; the caller builds the
+/// [`StatsHandle`], attaches it to its work source
 /// (`work.attach_stats(handle.clone())`), then passes the same handle here. The
 /// server reads health via a closure over the handle's last-pushed snapshot.
 fn spawn_stats(
