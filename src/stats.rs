@@ -41,6 +41,9 @@ pub fn summary_json(
             "uptime": uptime_s,
             // csd extensions (xmrig consumers ignore unknown fields): connection
             // churn so an operator sees an unstable link / flaky primary pool.
+            // NB: "failovers" = endpoint ROTATIONS (accept-deadman dead-man),
+            // distinct from xmrig's own connection-`failures` notion; every
+            // failover is also a reconnect, so reconnects >= failovers.
             "reconnects": health.reconnects,
             "failovers": health.failovers,
         },
