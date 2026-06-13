@@ -119,6 +119,10 @@ struct SessionStats {
     /// Unix-ms a *new* job_id last arrived (0 = none yet); job-staleness wd. Only
     /// advanced on a changed id, so a same-id resend can't mask a stalled pool.
     last_new_job_ms: AtomicU64,
+    /// Unix-ms of the last successful (re)connect (0 = none yet). Storm-guard for
+    /// the accepted-share dead-man (v0.1.9 #2): every reconnect restarts its clock
+    /// so a never-crediting endpoint fails over at most once per `accept_stale`.
+    last_reconnect_ms: AtomicU64,
 }
 
 /// Current wall-clock time as milliseconds since the Unix epoch (0 if the clock
@@ -271,6 +275,11 @@ struct Shared {
     extranonce2_size: AtomicU64,
     /// Set on shutdown so the reader loop exits instead of reconnecting.
     shutdown: AtomicBool,
+    /// Set by the watchdog's `request_failover` (accepted-share dead-man). The
+    /// reader consumes it (swap-to-false) on its next reconnect to
+    /// `endpoints.advance()` BEFORE re-dialing, so the same af8c236 reconnect
+    /// lands on the NEXT endpoint. One-shot; never forks `reconnect()`.
+    force_failover: AtomicBool,
     /// Accept/reject/stale share counters, written by the reader on each ack.
     stats: SessionStats,
     /// The endpoint we are CURRENTLY connected to — updated by the reader on each
@@ -365,6 +374,7 @@ impl StratumClient {
             extranonce1_hex: Mutex::new(hs.subscribe.extranonce1_hex.clone()),
             extranonce2_size: AtomicU64::new(hs.subscribe.extranonce2_size as u64),
             shutdown: AtomicBool::new(false),
+            force_failover: AtomicBool::new(false),
             stats: SessionStats::default(),
             current_endpoint: Mutex::new(endpoint.to_string()),
         });
@@ -595,6 +605,19 @@ impl StratumClient {
                                     "stratum: connection closed by {current}, reconnecting"
                                 );
                             }
+                            // v0.1.9 #2: if the watchdog armed a failover, rotate
+                            // to the next endpoint BEFORE reconnecting so the same
+                            // af8c236 reconnect re-dials a DIFFERENT pool (the
+                            // current one acks + pushes work but won't credit us).
+                            // One-shot (swap-to-false): a later plain reconnect
+                            // stays on the current endpoint.
+                            if shared.force_failover.swap(false, Ordering::Relaxed) {
+                                endpoints.advance();
+                                tracing::warn!(
+                                    "stratum: failover armed — rotating to {}",
+                                    endpoints.current()
+                                );
+                            }
                             line.clear();
                             if !reconnect(
                                 &mut endpoints,
@@ -783,6 +806,8 @@ impl WatchdogView for ClientWatchdog {
         WatchdogSnapshot {
             consecutive_unacked: self.shared.stats.consecutive_unacked.load(Ordering::Relaxed),
             last_new_job_ms: self.shared.stats.last_new_job_ms.load(Ordering::Relaxed),
+            last_accept_ms: self.shared.stats.last_accept_ms.load(Ordering::Relaxed),
+            last_reconnect_ms: self.shared.stats.last_reconnect_ms.load(Ordering::Relaxed),
         }
     }
     fn request_reconnect(&self) {
@@ -793,6 +818,18 @@ impl WatchdogView for ClientWatchdog {
             let _ = w.shutdown(std::net::Shutdown::Both);
         }
         tracing::warn!("stratum: watchdog requested reconnect (shutting socket)");
+    }
+    fn request_failover(&self) {
+        // Arm the one-shot failover flag, THEN shut the socket. The reader's
+        // existing reconnect arm consumes the flag and `endpoints.advance()`s
+        // before re-dialing, so the SAME af8c236 reconnect lands on the next
+        // endpoint — reconnect() is never forked. Set the flag BEFORE the
+        // shutdown so it's always visible by the time the reader wakes.
+        self.shared.force_failover.store(true, Ordering::Relaxed);
+        if let Ok(w) = self.writer.lock() {
+            let _ = w.shutdown(std::net::Shutdown::Both);
+        }
+        tracing::warn!("stratum: watchdog requested FAILOVER (rotate endpoint + reconnect)");
     }
 }
 
@@ -944,6 +981,14 @@ fn reconnect(
                 if let Ok(mut cur) = shared.current_endpoint.lock() {
                     *cur = ep.to_string();
                 }
+                // v0.1.9 #2: stamp the reconnect so the accepted-share dead-man's
+                // clock restarts here — a fresh connection is as good as an accept
+                // for "is this endpoint crediting us?", and this bounds a never-
+                // crediting endpoint to one failover per `accept_stale` (no storm).
+                shared
+                    .stats
+                    .last_reconnect_ms
+                    .store(now_unix_ms(), Ordering::Relaxed);
                 return true;
             }
             Err(e) => {
@@ -972,6 +1017,7 @@ mod tests {
             extranonce1_hex: Mutex::new(xn1.to_string()),
             extranonce2_size: AtomicU64::new(xn2_size),
             shutdown: AtomicBool::new(false),
+            force_failover: AtomicBool::new(false),
             stats: SessionStats::default(),
             current_endpoint: Mutex::new("test-pool:3333".to_string()),
         })
@@ -1434,6 +1480,119 @@ mod tests {
         }
         assert!(
             endpoint_followed,
+            "health_snapshot().endpoint must track the failover to B; got {:?}",
+            client.health_snapshot().endpoint
+        );
+
+        drop(client);
+        let _ = server_a.join();
+        let _ = server_b.join();
+    }
+
+    /// Unit: `request_failover` arms the one-shot `force_failover` flag (so the
+    /// reader rotates) AND shuts the socket; a plain `request_reconnect` shuts the
+    /// socket WITHOUT arming failover (stays on the current endpoint).
+    #[test]
+    fn request_failover_arms_flag_but_reconnect_does_not() {
+        let shared = fresh_shared("aabbccdd", 4);
+        // A throwaway connected socket stands in for the writer half.
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let wd = ClientWatchdog {
+            shared: Arc::clone(&shared),
+            writer: Arc::new(Mutex::new(stream)),
+        };
+        // A plain reconnect must NOT arm failover.
+        wd.request_reconnect();
+        assert!(
+            !shared.force_failover.load(Ordering::Relaxed),
+            "request_reconnect must not arm failover"
+        );
+        // A failover arms the one-shot flag for the reader to consume.
+        wd.request_failover();
+        assert!(
+            shared.force_failover.load(Ordering::Relaxed),
+            "request_failover must arm force_failover"
+        );
+    }
+
+    /// Integration (v0.1.9 #2): `request_failover` rotates a HEALTHY primary A to
+    /// the backup B. Unlike `reconnect_rotates_to_backup_on_primary_failure` (A
+    /// dies), here A stays up and re-handshakes every dial — so the ONLY way the
+    /// reader can reach B is the `force_failover` advance. If the flag weren't
+    /// consumed, a reconnect would re-dial healthy A and never reach B.
+    #[test]
+    fn watchdog_failover_rotates_healthy_primary_to_backup() {
+        let listener_a = TcpListener::bind("127.0.0.1:0").expect("bind A");
+        let listener_b = TcpListener::bind("127.0.0.1:0").expect("bind B");
+        let addr_a = listener_a.local_addr().unwrap().to_string();
+        let addr_b = listener_b.local_addr().unwrap().to_string();
+        let done = Arc::new(AtomicBool::new(false));
+
+        // Server A (HEALTHY primary): handshake EVERY connection and hold it open.
+        // A never dies, so the reader only leaves A via the failover advance.
+        let done_a = Arc::clone(&done);
+        let server_a = std::thread::spawn(move || {
+            listener_a.set_nonblocking(true).expect("A set_nonblocking");
+            let mut held: Vec<TcpStream> = Vec::new();
+            while !done_a.load(Ordering::Relaxed) {
+                match listener_a.accept() {
+                    Ok((mut sock, _)) => {
+                        sock.set_nonblocking(false).ok();
+                        serve_handshake(&mut sock);
+                        held.push(sock); // keep the session(s) open — A stays healthy
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Server B (backup): accept + handshake, signal the reader rotated here.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let done_b = Arc::clone(&done);
+        let server_b = std::thread::spawn(move || {
+            let (mut sock, _) = listener_b.accept().expect("B accept");
+            serve_handshake(&mut sock);
+            let _ = tx.send(());
+            while !done_b.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let client = StratumClient::connect_failover(
+            &[addr_a.clone(), addr_b.clone()],
+            "csd1testworker",
+        )
+        .expect("connect to primary A ok");
+
+        // The healthy session is on A. Fire a FAILOVER via the watchdog handle.
+        client.watchdog_handle().request_failover();
+
+        // The reader must rotate A→B and handshake there. On Windows a cross-handle
+        // shutdown may not interrupt the in-flight recv, so the reader can take up
+        // to READ_TIMEOUT(5s) to notice the shut socket, then backoff(1s) + dial B.
+        // The channel returns the instant B is hit; a 15s ceiling is generous slack.
+        let reached_b = rx.recv_timeout(Duration::from_secs(15)).is_ok();
+        done.store(true, Ordering::Relaxed);
+        assert!(
+            reached_b,
+            "request_failover must rotate from HEALTHY primary A to backup B"
+        );
+
+        // The live endpoint must follow the failover to B.
+        let mut followed = false;
+        for _ in 0..150 {
+            if client.health_snapshot().endpoint == addr_b {
+                followed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            followed,
             "health_snapshot().endpoint must track the failover to B; got {:?}",
             client.health_snapshot().endpoint
         );

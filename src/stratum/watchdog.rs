@@ -23,6 +23,12 @@ pub struct WatchdogCfg {
     /// Conservative (5 min) so a merely-quiet chain doesn't trigger needless
     /// reconnects (respecting the af8c236 "quiet link is not a dead link" rule).
     pub job_stale: Duration,
+    /// Accepted-share dead-man threshold (v0.1.9 #2): the current endpoint acks +
+    /// pushes FRESH work but has not ACCEPTED a share for this long ⇒ it takes our
+    /// shares without crediting them ⇒ FAILOVER (rotate endpoints). Long (30 min)
+    /// so an only-occasionally-accepting miner never trips; "fresh" reuses
+    /// `job_stale` (a fresh job is exactly one that is not job-stale).
+    pub accept_stale: Duration,
     /// How often the watchdog thread evaluates the snapshot.
     pub poll: Duration,
 }
@@ -32,28 +38,42 @@ impl Default for WatchdogCfg {
         WatchdogCfg {
             max_unacked: 10,
             job_stale: Duration::from_secs(300),
+            accept_stale: Duration::from_secs(1800),
             poll: Duration::from_secs(15),
         }
     }
 }
 
 /// A point-in-time view of the session counters the watchdog reasons over.
-/// (Grows with §3/§4: last-accept timestamp for the accepted-share dead-man.)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WatchdogSnapshot {
     /// Submits with no ack of any kind since the last ack.
     pub consecutive_unacked: u64,
     /// Unix-ms a *new* job last arrived (0 = none yet).
     pub last_new_job_ms: u64,
+    /// Unix-ms a share was last ACCEPTED by the pool (0 = none yet). Drives the
+    /// accepted-share dead-man (v0.1.9 #2).
+    pub last_accept_ms: u64,
+    /// Unix-ms of the last successful (re)connect (0 = none since start). Used
+    /// purely as a storm-guard for the accepted-share dead-man: every reconnect
+    /// restarts its clock, so a never-crediting endpoint triggers at most one
+    /// failover per `accept_stale` window instead of one per poll.
+    pub last_reconnect_ms: u64,
 }
 
-/// What the watchdog wants done. (Grows: `Failover` with §3, a guarded `Exit`
-/// process-dead-man later.)
+/// What the watchdog wants done. (May grow a guarded `Exit` process-dead-man
+/// later.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WatchdogAction {
     /// Drop and re-establish the connection (re-handshake), reusing the
     /// af8c236-blessed reconnect path.
     ForceReconnect,
+    /// Rotate to the NEXT configured endpoint, then re-handshake. Raised when the
+    /// current endpoint acks + pushes fresh work but never CREDITS a share
+    /// (accepted-share dead-man, v0.1.9 #2). Consumed by advancing the endpoint
+    /// list before that same af8c236 reconnect — `reconnect()` itself is not
+    /// forked. A no-op rotation (single endpoint) degrades to a plain reconnect.
+    Failover,
 }
 
 /// True if no *new* job has arrived within `threshold`, given at least one job
@@ -78,6 +98,27 @@ pub fn watchdog_decision(
     // Job-staleness: pool stopped pushing work ⇒ push channel likely dead.
     if job_is_stale(snap.last_new_job_ms, now_ms, cfg.job_stale) {
         return Some(WatchdogAction::ForceReconnect);
+    }
+    // Accepted-share dead-man (v0.1.9 #2): acks + FRESH jobs but no accepted share
+    // for `accept_stale` ⇒ this endpoint won't credit us ⇒ rotate away. Checked
+    // LAST so the cheaper same-endpoint reconnect triggers win when they also
+    // apply. Storm-guard: a reconnect restarts the clock as effectively as an
+    // accept would, so measure staleness from the LATER of (last accept, last
+    // reconnect) — but only once a share has ever been accepted (the `== 0` guard
+    // inside `accept_deadman`, which must see the REAL last-accept, not the max).
+    let accept_baseline = if snap.last_accept_ms == 0 {
+        0
+    } else {
+        snap.last_accept_ms.max(snap.last_reconnect_ms)
+    };
+    if accept_deadman(
+        accept_baseline,
+        snap.last_new_job_ms,
+        now_ms,
+        cfg.accept_stale,
+        cfg.job_stale,
+    ) {
+        return Some(WatchdogAction::Failover);
     }
     None
 }
@@ -127,6 +168,13 @@ pub trait WatchdogView: Send + Sync {
     fn snapshot(&self) -> WatchdogSnapshot;
     /// Force the connection to drop + re-handshake (reusing the af8c236 path).
     fn request_reconnect(&self);
+    /// Rotate to the next endpoint, then drop + re-handshake. Defaults to a plain
+    /// reconnect so a view that can't (or needn't) rotate degrades safely; the
+    /// live client overrides it to advance the endpoint list before the same
+    /// af8c236 reconnect fires.
+    fn request_failover(&self) {
+        self.request_reconnect();
+    }
 }
 
 /// One watchdog evaluation: read the view's snapshot, decide, and act. Returns
@@ -136,6 +184,10 @@ pub fn watchdog_tick(view: &dyn WatchdogView, cfg: WatchdogCfg, now_ms: u64) -> 
     match watchdog_decision(view.snapshot(), cfg, now_ms) {
         Some(WatchdogAction::ForceReconnect) => {
             view.request_reconnect();
+            true
+        }
+        Some(WatchdogAction::Failover) => {
+            view.request_failover();
             true
         }
         None => false,
@@ -189,6 +241,8 @@ mod tests {
         let snap = WatchdogSnapshot {
             consecutive_unacked: 3,
             last_new_job_ms: 1_000_000,
+            last_accept_ms: 0,
+            last_reconnect_ms: 0,
         };
         // 100 s since the last job (< 300 s) and only 3 unacked ⇒ all fine.
         assert_eq!(watchdog_decision(snap, cfg(), 1_000_000 + 100_000), None);
@@ -200,6 +254,8 @@ mod tests {
         let snap = WatchdogSnapshot {
             consecutive_unacked: 10,
             last_new_job_ms: 1_000_000,
+            last_accept_ms: 0,
+            last_reconnect_ms: 0,
         };
         assert_eq!(
             watchdog_decision(snap, cfg(), at),
@@ -209,6 +265,8 @@ mod tests {
         let snap9 = WatchdogSnapshot {
             consecutive_unacked: 9,
             last_new_job_ms: 1_000_000,
+            last_accept_ms: 0,
+            last_reconnect_ms: 0,
         };
         assert_eq!(watchdog_decision(snap9, cfg(), at), None);
     }
@@ -219,6 +277,8 @@ mod tests {
         let snap = WatchdogSnapshot {
             consecutive_unacked: 0,
             last_new_job_ms: last,
+            last_accept_ms: 0,
+            last_reconnect_ms: 0,
         };
         // 301 s later ⇒ stale.
         assert_eq!(
@@ -236,6 +296,8 @@ mod tests {
         let snap = WatchdogSnapshot {
             consecutive_unacked: 0,
             last_new_job_ms: 0,
+            last_accept_ms: 0,
+            last_reconnect_ms: 0,
         };
         assert_eq!(watchdog_decision(snap, cfg(), 9_999_999), None);
     }
@@ -260,19 +322,88 @@ mod tests {
         assert!(!accept_deadman(now - 31 * m, 0, now, accept_thr, job_fresh));
     }
 
+    #[test]
+    fn accept_deadman_maps_to_failover_in_decision() {
+        // Acks fine (0 unacked), jobs FRESH (1 min ago < job_stale 5 min), but no
+        // accepted share for 31 min (> accept_stale 30 min) and no recent reconnect
+        // ⇒ the decision is FAILOVER (rotate endpoints), not a same-endpoint
+        // reconnect.
+        let now = 10_000_000u64;
+        let m = 60_000u64;
+        let snap = WatchdogSnapshot {
+            consecutive_unacked: 0,
+            last_new_job_ms: now - m,
+            last_accept_ms: now - 31 * m,
+            last_reconnect_ms: 0,
+        };
+        assert_eq!(
+            watchdog_decision(snap, cfg(), now),
+            Some(WatchdogAction::Failover)
+        );
+        // A reconnect trigger still WINS over failover (cheaper + more specific):
+        // same stale-accept but ALSO a submit-ack streak ⇒ ForceReconnect, not
+        // Failover.
+        let snap2 = WatchdogSnapshot {
+            consecutive_unacked: 10,
+            ..snap
+        };
+        assert_eq!(
+            watchdog_decision(snap2, cfg(), now),
+            Some(WatchdogAction::ForceReconnect)
+        );
+        // And jobs going stale flips it back to a reconnect (job-staleness owns
+        // the dead-push-channel case), never a failover.
+        let snap3 = WatchdogSnapshot {
+            last_new_job_ms: now - 6 * m, // > job_stale (5 min)
+            ..snap
+        };
+        assert_eq!(
+            watchdog_decision(snap3, cfg(), now),
+            Some(WatchdogAction::ForceReconnect)
+        );
+        // STORM-PREVENTION: a RECENT reconnect (2 min ago) restarts the accept
+        // clock even though the last *accept* is 31 min old ⇒ NO failover this
+        // poll. (Without this a never-crediting pool would rotate every poll.)
+        let snap4 = WatchdogSnapshot {
+            last_reconnect_ms: now - 2 * m,
+            ..snap
+        };
+        assert_eq!(watchdog_decision(snap4, cfg(), now), None);
+    }
+
+    #[test]
+    fn tick_failover_calls_request_failover_not_reconnect() {
+        let now = 10_000_000u64;
+        let m = 60_000u64;
+        let v = MockView::new(WatchdogSnapshot {
+            consecutive_unacked: 0,
+            last_new_job_ms: now - m,
+            last_accept_ms: now - 31 * m,
+            last_reconnect_ms: 0,
+        });
+        assert!(watchdog_tick(&v, WatchdogCfg::default(), now));
+        assert_eq!(v.failover_calls(), 1, "Failover ⇒ request_failover");
+        assert_eq!(v.reconnect_calls(), 0, "Failover must NOT reconnect");
+    }
+
     struct MockView {
         snap: WatchdogSnapshot,
         reconnects: std::sync::atomic::AtomicU64,
+        failovers: std::sync::atomic::AtomicU64,
     }
     impl MockView {
         fn new(snap: WatchdogSnapshot) -> Self {
             MockView {
                 snap,
                 reconnects: std::sync::atomic::AtomicU64::new(0),
+                failovers: std::sync::atomic::AtomicU64::new(0),
             }
         }
         fn reconnect_calls(&self) -> u64 {
             self.reconnects.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        fn failover_calls(&self) -> u64 {
+            self.failovers.load(std::sync::atomic::Ordering::Relaxed)
         }
     }
     impl WatchdogView for MockView {
@@ -283,6 +414,10 @@ mod tests {
             self.reconnects
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        fn request_failover(&self) {
+            self.failovers
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     #[test]
@@ -291,6 +426,8 @@ mod tests {
         let trig = MockView::new(WatchdogSnapshot {
             consecutive_unacked: 10,
             last_new_job_ms: 1,
+            last_accept_ms: 0,
+            last_reconnect_ms: 0,
         });
         assert!(watchdog_tick(&trig, WatchdogCfg::default(), 1_000));
         assert_eq!(trig.reconnect_calls(), 1);
@@ -298,6 +435,8 @@ mod tests {
         let ok = MockView::new(WatchdogSnapshot {
             consecutive_unacked: 1,
             last_new_job_ms: 1_000,
+            last_accept_ms: 0,
+            last_reconnect_ms: 0,
         });
         assert!(!watchdog_tick(&ok, WatchdogCfg::default(), 1_100));
         assert_eq!(ok.reconnect_calls(), 0);
@@ -308,6 +447,8 @@ mod tests {
         let view = Arc::new(MockView::new(WatchdogSnapshot {
             consecutive_unacked: 10, // always triggers ForceReconnect
             last_new_job_ms: 1,
+            last_accept_ms: 0,
+            last_reconnect_ms: 0,
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let cfg = WatchdogCfg {
