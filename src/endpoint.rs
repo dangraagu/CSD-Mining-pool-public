@@ -165,6 +165,22 @@ mod tests {
         assert_eq!(SCRAMBLED_ENDPOINT.len(), plain.len());
     }
 
+    /// Pin the decoded endpoint to a known SHA-256 digest. The digest is
+    /// preimage-resistant, so no plaintext host literal lives in source — yet
+    /// this catches ANY corruption of `SCRAMBLED_ENDPOINT`, including a
+    /// valid-but-wrong byte that the descramble round-trip cannot see, before a
+    /// wrong-host binary could ship with a green suite.
+    #[test]
+    fn decoded_endpoint_matches_pinned_digest() {
+        use sha2::{Digest, Sha256};
+        let got = hex::encode(Sha256::digest(pool_endpoint().as_bytes()));
+        assert_eq!(
+            got, "3e8a0f477e5dfbb50e5c8092dc01f55ccd62a2d372b65ac7e715937fbe86dd6d",
+            "decoded endpoint changed: if you intentionally repointed the pool, \
+             recompute this digest; otherwise SCRAMBLED_ENDPOINT is corrupted"
+        );
+    }
+
     #[test]
     fn round_trips_for_an_arbitrary_endpoint() {
         // Document the scramble recipe a release-cutter uses: scramble then

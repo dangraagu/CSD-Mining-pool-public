@@ -15,3 +15,10 @@ csd-wallet.txt
 # a stray `git add -A` can't leak them. (Tracked docs live at the repo root:
 # README.md, CHANGELOG.md, config.example.toml.)
 /docs/superpowers/
+
+# Agent/session scaffolding + local release helpers — never part of the public
+# repo. RELEASE-*.bat embeds the production pool host; *-matrix.md planning docs
+# name it too. Ignored so a stray `git add -A` can't leak them.
+.claude/
+RELEASE-*.bat
+/docs/*-matrix.md
