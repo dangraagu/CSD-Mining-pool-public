@@ -108,9 +108,65 @@ csd-pool-miner --address <YOUR_ADDR20> --backend cpu      # CPU only
 ### Useful extras
 
 ```sh
-csd-pool-miner devices     # list detected GPUs (handy if auto keeps picking CPU)
-csd-pool-miner selftest    # cross-check every backend against the reference CPU hasher
+csd-pool-miner devices         # list detected GPUs (handy if auto keeps picking CPU)
+csd-pool-miner --list-devices  # same list, as a flag
+csd-pool-miner selftest        # cross-check every backend against the reference CPU hasher
 ```
+
+## Monitoring (stats endpoint + Discord)
+
+Expose an **xmrig-`/1/summary`-compatible** JSON endpoint for dashboards
+(Awesome Miner, Home Assistant, custom scrapers) — off unless you ask for it:
+
+```sh
+csd-pool-miner --address <ADDR> --stats-port 3380
+# then GET  http://127.0.0.1:3380/1/summary   (and /healthz)
+```
+
+It binds **localhost only** by default. To expose it on your LAN, add
+`--stats-bind 0.0.0.0` and protect it with `--stats-password <token>` (sent as
+`Authorization: Bearer <token>` or `?token=<token>`); `/healthz` stays open.
+
+Get a **Discord** ping when you find a block (solo) or pass a share milestone
+(pool):
+
+```sh
+csd-pool-miner --address <ADDR> --discord-webhook https://discord.com/api/webhooks/...
+# add --discord-solutions-only to ping ONLY on solved blocks
+```
+
+Notifications are best-effort and non-blocking — a slow or dead webhook never
+affects mining.
+
+## Solo mining — mine to your own node
+
+By default you mine to the pool. To mine **directly to your own csd-node**
+instead — no pool, no fee, no PPLNS; every block you find is yours:
+
+```sh
+csd-pool-miner --address <ADDR> --solo --node http://127.0.0.1:8799
+```
+
+The miner pulls work from `<node>/work/get` and submits solved blocks to
+`<node>/work/submit`. It's mutually exclusive with the pool — you earn nothing
+until you find a block, but keep the whole block when you do. `--stats-port` and
+`--discord-webhook` work in solo too (Discord fires on a found block).
+
+## HiveOS
+
+A HiveOS **Custom-miner package** ships with each release
+(`csd-pool-miner-hiveos-<version>.tar.gz`, also in the [`hiveos/`](hiveos/) dir).
+Add it as a Custom miner with your addr20 as the wallet; it reports hashrate and
+accepted/rejected shares to the HiveOS dashboard (by scraping the miner's own
+stats endpoint, so the kH/s is always correct).
+
+## Auto-update (24/7 rigs)
+
+`mine-auto.sh` (Linux) / `mine-auto.bat` (Windows) run every card and keep the
+binary current: they check the latest release with a proper semver compare,
+**verify the download's SHA-256 against the release `SHA256SUMS` before swapping
+it in** (atomic, and they keep the running binary if verification fails), and
+restart the miner if it ever exits.
 
 ## Config file (optional)
 
