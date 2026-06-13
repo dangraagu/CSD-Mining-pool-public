@@ -110,7 +110,7 @@ csd-pool-miner --address <YOUR_ADDR20> --backend cpu      # CPU only
 ```sh
 csd-pool-miner devices         # list detected GPUs (handy if auto keeps picking CPU)
 csd-pool-miner --list-devices  # same list, as a flag
-csd-pool-miner selftest        # cross-check every backend against the reference CPU hasher
+csd-pool-miner selftest        # cross-check every backend vs the reference CPU hasher + probe pool reachability
 ```
 
 ## Monitoring (stats endpoint + Discord)
@@ -126,6 +126,9 @@ csd-pool-miner --address <ADDR> --stats-port 3380
 It binds **localhost only** by default. To expose it on your LAN, add
 `--stats-bind 0.0.0.0` and protect it with `--stats-password <token>` (sent as
 `Authorization: Bearer <token>` or `?token=<token>`); `/healthz` stays open.
+
+The `connection` object also reports `reconnects` and `failovers` (lifetime
+counts), so a dashboard can flag an unstable link or a flaky pool at a glance.
 
 Get a **Discord** ping when you find a block (solo) or pass a share milestone
 (pool):
@@ -167,6 +170,36 @@ binary current: they check the latest release with a proper semver compare,
 **verify the download's SHA-256 against the release `SHA256SUMS` before swapping
 it in** (atomic, and they keep the running binary if verification fails), and
 restart the miner if it ever exits.
+
+## Reliability (failover + watchdog)
+
+For 24/7 rigs the miner keeps itself connected and earning without babysitting:
+
+- **Multiple pools / failover** — give a comma-separated list and it tries them in
+  order, rotating to the next on a dead connection and failing back to the first
+  once it recovers:
+
+  ```sh
+  csd-pool-miner --address <ADDR> --pool pool.example:3333,backup.example:3333
+  ```
+
+  (`--url` is an alias.) With no `--pool`, it uses the built-in CSD pool.
+- **Connection watchdog** — if the link goes half-open (still gets work but
+  silently drops your shares) or the pool stops sending new jobs, the miner forces
+  a clean reconnect instead of mining into the void.
+- **Won't-credit failover** — if a pool keeps acking and pushing fresh work but
+  stops *crediting* your shares for ~30 minutes (a forked or misconfigured pool),
+  the miner rotates to the next endpoint on its own — at most once per window, so
+  one bad pool can't cause a reconnect storm.
+
+The 30-second health heartbeat in the log ends with
+`conn=<reconnects>/<failovers>` so connection churn is visible at a glance, and
+`selftest` TCP-probes each pool endpoint (PASS/FAIL) so you can confirm
+reachability before a long run.
+
+Invalid mining parameters (e.g. `--blocks 0`, `--cpu-share 5`) now **fail loudly**
+with a clear message at startup instead of being silently clamped, so a typo can't
+quietly leave you mining at a fraction of your hardware.
 
 ## Config file (optional)
 
