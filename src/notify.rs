@@ -61,20 +61,30 @@ impl DiscordNotifier {
                     .build();
                 match agent.post(&webhook).send_json(discord_payload(&content)) {
                     Ok(_) => {}
-                    // Log ONLY the status code / error kind — never the bare error.
-                    // ureq's Error Display embeds the request URL, and a Discord
-                    // webhook URL carries its secret token in the path, so logging
-                    // `{e}` would leak the token into the operator's log file on a
-                    // 429/4xx/transport error. (P3 review finding.)
-                    Err(ureq::Error::Status(code, _)) => {
-                        tracing::warn!("discord webhook post failed (ignored): HTTP {code}")
-                    }
+                    // Log ONLY the redacted error — never the bare error. ureq's
+                    // Error Display embeds the request URL, and a Discord webhook
+                    // URL carries its secret token in the path, so logging `{e}`
+                    // would leak the token into the operator's log file on a
+                    // 429/4xx/transport error. (P3 review finding; regression-tested
+                    // via `redact_ureq_error`.)
                     Err(e) => tracing::warn!(
-                        "discord webhook post failed (ignored): {:?}",
-                        e.kind()
+                        "discord webhook post failed (ignored): {}",
+                        redact_ureq_error(&e)
                     ),
                 }
             });
+    }
+}
+
+/// Map a `ureq::Error` to a log-safe one-line string. NEVER includes the request
+/// URL: a Discord webhook URL carries its secret token in the path, and ureq's
+/// `Error` Display embeds that url — so logging the bare error would leak the
+/// token into the operator's log. `Status` → just the numeric code; anything else
+/// → the `ErrorKind` (URL-free). Regression-tested in this module.
+fn redact_ureq_error(e: &ureq::Error) -> String {
+    match e {
+        ureq::Error::Status(code, _) => format!("HTTP {code}"),
+        other => format!("{:?}", other.kind()),
     }
 }
 
@@ -169,5 +179,36 @@ mod tests {
     fn discord_notifier_solutions_only_getter() {
         assert!(DiscordNotifier::new("https://discord.com/x".to_string(), true).solutions_only());
         assert!(!DiscordNotifier::new("https://discord.com/x".to_string(), false).solutions_only());
+    }
+
+    /// Regression guard (P3 secret-leak finding): a webhook POST that fails with a
+    /// Status error (the common 401-revoked / 429-rate-limited case) must log ONLY
+    /// the numeric code — ureq's bare `Error` Display would print the response URL,
+    /// which carries the secret token in its path. `redact_ureq_error`'s Status arm
+    /// ignores the response entirely, so a token can never reach the log.
+    #[test]
+    fn redact_ureq_error_status_logs_only_the_code() {
+        let resp = ureq::Response::new(429, "Too Many Requests", "").unwrap();
+        let err = ureq::Error::Status(429, resp);
+        assert_eq!(redact_ureq_error(&err), "HTTP 429");
+    }
+
+    /// And a real transport failure (connect refused — instant, nothing listening
+    /// on loopback:1) whose bare ureq Display embeds the url+token must redact to
+    /// just the `ErrorKind`, leaking neither the token nor the host.
+    #[test]
+    fn redact_ureq_error_transport_never_leaks_url_or_token() {
+        let token = "S3cr3tWebhookT0ken";
+        let url = format!("http://127.0.0.1:1/api/webhooks/123456/{token}");
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(2))
+            .build();
+        let err = agent
+            .post(&url)
+            .send_json(discord_payload("x"))
+            .expect_err("connect refused on loopback:1");
+        let safe = redact_ureq_error(&err);
+        assert!(!safe.contains(token), "redacted log leaks the token: {safe}");
+        assert!(!safe.contains("127.0.0.1"), "redacted log leaks the url: {safe}");
     }
 }
