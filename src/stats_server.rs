@@ -429,8 +429,12 @@ mod tests {
         stream
             .set_read_timeout(Some(Duration::from_secs(3)))
             .ok();
-        stream.write_all(raw_request.as_bytes()).unwrap();
-        stream.flush().unwrap();
+        // Tolerate a write error: for the oversized-request case the server
+        // legitimately reads its cap, replies 400, and CLOSES while we're still
+        // writing — a broken-pipe here is expected, not a test failure. We still
+        // read whatever response landed before the close.
+        let _ = stream.write_all(raw_request.as_bytes());
+        let _ = stream.flush();
         let mut buf = Vec::new();
         let _ = stream.read_to_end(&mut buf);
         String::from_utf8_lossy(&buf).to_string()
