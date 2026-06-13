@@ -185,6 +185,13 @@ pub trait WorkSource {
     /// routes it to its attached `StatsHandle`.
     fn record_hashrate(&self, _ghs: f64) {}
 
+    /// Heartbeat hook for the optional G6 Discord accepted-share milestone.
+    /// Called from the loop's 30s heartbeat (NOT the share path). Default no-op:
+    /// the mock and the solo `NodeWorkSource` inherit it (solo fires its
+    /// block-found post in `submit_solution`, not here). `StratumClient`
+    /// overrides it to post the running accepted total when it has grown.
+    fn notify_heartbeat(&self) {}
+
     /// Poll the next unit of work. **Default = the pool/Stratum path**
     /// (`latest_job` → `notify_to_template`); a solo `NodeWorkSource` overrides
     /// this to poll csd-node directly. Decode/mapping failures ⇒ `Idle`.
@@ -263,6 +270,9 @@ impl WorkSource for StratumClient {
     }
     fn record_hashrate(&self, ghs: f64) {
         StratumClient::record_hashrate_sample(self, ghs)
+    }
+    fn notify_heartbeat(&self) {
+        StratumClient::notify_heartbeat_sample(self)
     }
 }
 
@@ -380,6 +390,11 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
                     hash_mismatches
                 )
             );
+            // G6: best-effort accepted-share milestone ping (no-op unless a
+            // Discord webhook is wired AND the total grew; pool stays silent
+            // under --discord-solutions-only). Heartbeat-only — never the share
+            // path — so it can't affect submit timing/correctness.
+            client.notify_heartbeat();
             last_heartbeat = Instant::now();
         }
 

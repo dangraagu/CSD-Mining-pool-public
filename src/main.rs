@@ -16,6 +16,7 @@ use csd_gpu_miner::backends::cpu::CpuBackend;
 use csd_gpu_miner::endpoint;
 use csd_gpu_miner::logging;
 use csd_gpu_miner::mining_config::MiningConfig;
+use csd_gpu_miner::notify::{self, DiscordNotifier};
 use csd_gpu_miner::solo::NodeWorkSource;
 use csd_gpu_miner::stats_server::{self, StatsHandle};
 use csd_gpu_miner::stratum::{run_stratum, StratumClient};
@@ -84,6 +85,15 @@ struct Cli {
     /// or `?token=`). `/healthz` stays open. Omitted ⇒ no auth.
     #[arg(long)]
     stats_password: Option<String>,
+
+    /// Discord webhook URL for block-found (solo) / accepted-share milestone
+    /// (pool) alerts. Must be an https Discord webhook.
+    #[arg(long)]
+    discord_webhook: Option<String>,
+
+    /// Only notify on solved blocks (solo); suppresses pool share-milestone pings.
+    #[arg(long)]
+    discord_solutions_only: bool,
 
     /// Backend to use.
     #[arg(long, default_value = "auto")]
@@ -392,6 +402,27 @@ fn main() -> Result<()> {
         cli.solo = true;
     }
 
+    // G6: optional Discord notifier. Built once here (fail-fast on a bad webhook,
+    // before any socket opens) and shared into whichever arm runs. `None` ⇒ the
+    // notifier is OFF: no fire points post, and behaviour is byte-identical to a
+    // build without this flag. The URL is validated to an https Discord endpoint
+    // here (the only place validation happens); `DiscordNotifier::new` does not
+    // re-validate.
+    let notifier: Option<Arc<DiscordNotifier>> = match cli.discord_webhook.as_deref() {
+        Some(url) => {
+            notify::validate_webhook_url(url).map_err(|e| anyhow::anyhow!(e))?;
+            tracing::info!(
+                "discord: notifications enabled (solutions_only={})",
+                cli.discord_solutions_only
+            );
+            Some(Arc::new(DiscordNotifier::new(
+                url.to_string(),
+                cli.discord_solutions_only,
+            )))
+        }
+        None => None,
+    };
+
     let stop = Arc::new(AtomicBool::new(false));
     {
         let stop = stop.clone();
@@ -410,6 +441,12 @@ fn main() -> Result<()> {
         let node_url = cli.node.clone().expect("validated: --solo implies --node");
         let mut work = NodeWorkSource::connect(&node_url, &address)
             .map_err(|e| anyhow::anyhow!("failed to connect to node {node_url}: {e}"))?;
+
+        // G6: wire the Discord notifier into the solo source (fires a block-found
+        // post on each accepted submit). No-op when --discord-webhook is unset.
+        if let Some(n) = &notifier {
+            work.attach_notifier(n.clone());
+        }
 
         // D2: optional xmrig-compatible /1/summary telemetry. Off unless
         // --stats-port. Attach the sink to the source BEFORE spawning the server
@@ -446,6 +483,13 @@ fn main() -> Result<()> {
     // endpoint this is the same single-pool, no-failover behavior as before.
     let mut client = StratumClient::connect_failover(&endpoints, &address)
         .map_err(|e| anyhow::anyhow!("failed to connect to pool {endpoint}: {e}"))?;
+
+    // G6: wire the Discord notifier into the pool client (the 30s heartbeat posts
+    // an accepted-share milestone when the total grows, unless
+    // --discord-solutions-only). No-op when --discord-webhook is unset.
+    if let Some(n) = &notifier {
+        client.attach_notifier(n.clone());
+    }
 
     // D2: optional xmrig-compatible /1/summary telemetry server. Off unless the
     // operator passes --stats-port. It reads live hashrate + health from the

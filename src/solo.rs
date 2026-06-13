@@ -233,6 +233,12 @@ pub struct NodeWorkSource {
     /// gets the same `/1/summary` telemetry as the pool path. When set,
     /// `record_hashrate` pushes the GH/s sample + the live health snapshot.
     stats_sink: Option<Arc<crate::stats_server::StatsHandle>>,
+    /// Optional G6 Discord notifier. `None` until `--discord-webhook` wires one
+    /// in via [`NodeWorkSource::attach_notifier`]; when set, an ACCEPTED block in
+    /// `submit_solution` fires a best-effort block-found post. A solo block is
+    /// always a solution, so it fires regardless of `solutions_only`. Off by
+    /// default ⇒ zero notify overhead on the unconfigured build.
+    notifier: Option<Arc<crate::notify::DiscordNotifier>>,
 }
 
 impl NodeWorkSource {
@@ -268,6 +274,7 @@ impl NodeWorkSource {
             shutdown,
             poller: Some(poller),
             stats_sink: None,
+            notifier: None,
         })
     }
 
@@ -277,6 +284,15 @@ impl NodeWorkSource {
     /// [`crate::stratum::StratumClient::attach_stats`].
     pub fn attach_stats(&mut self, handle: Arc<crate::stats_server::StatsHandle>) {
         self.stats_sink = Some(handle);
+    }
+
+    /// Attach a G6 Discord notifier. Called once at startup when
+    /// `--discord-webhook` is set, before the mining loop borrows the source
+    /// (`&mut self`); `None` until then, so the unconfigured solo build carries
+    /// no notify overhead. When set, an ACCEPTED block in `submit_solution` fires
+    /// a best-effort (detached, non-blocking) block-found post.
+    pub fn attach_notifier(&mut self, n: Arc<crate::notify::DiscordNotifier>) {
+        self.notifier = Some(n);
     }
 
     /// Test-only constructor: an idle source (no poller, `latest = None`) so
@@ -291,6 +307,7 @@ impl NodeWorkSource {
             shutdown: Arc::new(AtomicBool::new(true)),
             poller: None,
             stats_sink: None,
+            notifier: None,
         }
     }
 }
@@ -432,11 +449,23 @@ impl WorkSource for NodeWorkSource {
                 let v: serde_json::Value = serde_json::from_str(&resp).unwrap_or(serde_json::Value::Null);
                 if v.get("accepted").and_then(|a| a.as_bool()) == Some(true) {
                     self.stats.accepted.fetch_add(1, Ordering::Relaxed);
+                    // Extract height/hash defensively (never panic on a malformed
+                    // 200 body — default to 0 / "" so the post is still sent).
+                    let height = v.get("height").and_then(|h| h.as_u64()).unwrap_or(0);
+                    let block_hash = v.get("block_hash").and_then(|h| h.as_str()).unwrap_or("");
                     tracing::info!(
-                        "solo: BLOCK ACCEPTED height={} hash={}",
-                        v.get("height").unwrap_or(&serde_json::Value::Null),
-                        v.get("block_hash").unwrap_or(&serde_json::Value::Null),
+                        "solo: BLOCK ACCEPTED height={height} hash={block_hash}"
                     );
+                    // G6: a solo block IS a solution, so fire regardless of
+                    // `solutions_only`. Best-effort + detached — a webhook hiccup
+                    // can never affect this submit (which already landed).
+                    if let Some(n) = &self.notifier {
+                        n.post(crate::notify::block_found_message(
+                            height,
+                            block_hash,
+                            &self.addr_hex,
+                        ));
+                    }
                 } else {
                     self.stats.rejected.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
@@ -653,7 +682,15 @@ mod tests {
     }
 
     impl MockNode {
+        /// Default mock node: an accepted submit reports `height:1`.
         fn start(template: &WorkTemplate) -> MockNode {
+            Self::start_with_height(template, 1)
+        }
+
+        /// Like [`start`], but the accepted-submit response reports
+        /// `accepted_height` (so a test can assert the block-found notify carries
+        /// the height the node returned).
+        fn start_with_height(template: &WorkTemplate, accepted_height: u64) -> MockNode {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let base_url = format!("http://127.0.0.1:{}", addr.port());
@@ -730,7 +767,9 @@ mod tests {
                         }
                         let body_str = String::from_utf8_lossy(&body_bytes).to_string();
                         submits_t.lock().unwrap().push(body_str);
-                        let resp_body = b"{\"accepted\":true,\"height\":1,\"block_hash\":\"ab\"}";
+                        let resp_body =
+                            format!("{{\"accepted\":true,\"height\":{accepted_height},\"block_hash\":\"ab\"}}");
+                        let resp_body = resp_body.as_bytes();
                         let resp = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                             resp_body.len()
@@ -878,5 +917,179 @@ mod tests {
         // No sink attached ⇒ record_hashrate must not panic (unconfigured build).
         let src = NodeWorkSource::idle_for_test("http://127.0.0.1:1");
         WorkSource::record_hashrate(&src, 5.0); // no-op, no panic
+    }
+
+    // -----------------------------------------------------------------------
+    // G6 Discord block-found notify: an ACCEPTED solo submit fires a detached
+    // POST to the configured webhook. We stand up a localhost mock WEBHOOK (a
+    // TcpListener that records POST bodies + replies 200 {}) and assert the
+    // post lands with the height/hash text. The post is fire-and-forget, so we
+    // poll the recorder with a timeout and tolerate scheduling latency.
+    // -----------------------------------------------------------------------
+
+    /// A localhost mock Discord webhook: a `TcpListener` accept loop that reads
+    /// each incoming POST (draining the Content-Length body), records the body,
+    /// and replies `200 {}`. Handles many connections; stops on `shutdown`
+    /// (set on drop). Mirrors `MockNode`'s POST-draining discipline so the body
+    /// is captured whole even if it arrives in separate TCP segments.
+    struct WebhookRecorder {
+        port: u16,
+        posts: Arc<Mutex<Vec<String>>>,
+        shutdown: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl WebhookRecorder {
+        fn start() -> WebhookRecorder {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let posts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+
+            let posts_t = Arc::clone(&posts);
+            let shutdown_t = Arc::clone(&shutdown);
+            listener.set_nonblocking(true).expect("listener nonblocking");
+            let handle = std::thread::spawn(move || {
+                while !shutdown_t.load(Ordering::Relaxed) {
+                    let mut sock = match listener.accept() {
+                        Ok((s, _)) => s,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(_) => break,
+                    };
+                    sock.set_read_timeout(Some(Duration::from_millis(500))).ok();
+                    sock.set_write_timeout(Some(Duration::from_millis(500))).ok();
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 2048];
+                    let n = match sock.read(&mut tmp) {
+                        Ok(0) | Err(_) => continue,
+                        Ok(n) => n,
+                    };
+                    buf.extend_from_slice(&tmp[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    // Drain the full Content-Length body (header + body may split
+                    // across segments) so we record the JSON whole.
+                    let want: usize = text
+                        .split("\r\n")
+                        .find_map(|l| {
+                            let l = l.to_ascii_lowercase();
+                            l.strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    let header_end = text.find("\r\n\r\n").map(|i| i + 4);
+                    let mut body_bytes = match header_end {
+                        Some(he) => buf[he..].to_vec(),
+                        None => Vec::new(),
+                    };
+                    while body_bytes.len() < want {
+                        match sock.read(&mut tmp) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => body_bytes.extend_from_slice(&tmp[..n]),
+                        }
+                    }
+                    posts_t
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&body_bytes).to_string());
+                    // Minimal valid Discord-style 200 reply so ureq sees success.
+                    let _ = sock.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    );
+                }
+            });
+
+            WebhookRecorder {
+                port,
+                posts,
+                shutdown,
+                handle: Some(handle),
+            }
+        }
+    }
+
+    impl Drop for WebhookRecorder {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::Relaxed);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    #[test]
+    fn solo_accepted_submit_fires_block_found_webhook() {
+        use crate::notify::DiscordNotifier;
+
+        let tmpl = sample_template();
+        // Node accepts the submit and reports height 7 + block_hash "ab".
+        let node = MockNode::start_with_height(&tmpl, 7);
+        let webhook = WebhookRecorder::start();
+
+        let mut src =
+            NodeWorkSource::connect(&node.base_url, "1122334455667788990011223344556677889900")
+                .expect("connect");
+        // http:// is fine here — DiscordNotifier::new does NOT validate the URL
+        // (only the CLI enforces https). solutions_only=false; a solo block fires
+        // regardless either way.
+        src.attach_notifier(Arc::new(DiscordNotifier::new(
+            format!("http://127.0.0.1:{}", webhook.port),
+            false,
+        )));
+
+        let sol = Solution {
+            template_id: tmpl.id,
+            job_id: format!("node-{}", tmpl.id),
+            xn2: 0,
+            extranonce: 0x0102_0304_0506_0708,
+            time: 1_700_000_123,
+            nonce: 0x00C0_FFEE,
+        };
+        src.submit_solution(&sol).expect("submit Ok on HTTP 200 accepted");
+
+        // The post is detached — poll the recorder up to ~3s for the body.
+        let mut body = None;
+        for _ in 0..300 {
+            if let Some(b) = webhook.posts.lock().unwrap().first().cloned() {
+                body = Some(b);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let body = body.expect("block-found webhook POST should arrive within 3s");
+        // Discord payload shape + the height/hash text from block_found_message.
+        assert!(body.contains("content"), "payload has a content field: {body}");
+        assert!(body.contains('7'), "height 7 present in {body}");
+        assert!(body.contains("ab"), "block hash 'ab' present in {body}");
+        // And the payout addr (worker) is in the message too.
+        assert!(
+            body.contains("1122334455667788990011223344556677889900"),
+            "worker addr present in {body}"
+        );
+    }
+
+    #[test]
+    fn solo_accepted_submit_without_notifier_does_not_post() {
+        // No notifier attached ⇒ an accepted submit must NOT attempt any post
+        // (notifier None ⇒ the block-found branch is skipped). This is the
+        // default build's behaviour: zero notify side-effects.
+        let tmpl = sample_template();
+        let node = MockNode::start(&tmpl);
+        let src =
+            NodeWorkSource::connect(&node.base_url, "1122334455667788990011223344556677889900")
+                .expect("connect");
+        let sol = Solution {
+            template_id: tmpl.id,
+            job_id: format!("node-{}", tmpl.id),
+            xn2: 0,
+            extranonce: 0x0102_0304_0506_0708,
+            time: 1_700_000_123,
+            nonce: 0x00C0_FFEE,
+        };
+        // Must not panic and must return Ok with no notifier wired.
+        src.submit_solution(&sol).expect("submit Ok with no notifier");
+        assert_eq!(src.health().accepted, 1, "accepted still counted");
     }
 }
