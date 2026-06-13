@@ -83,6 +83,42 @@ pub fn partition_nonce_range(
     (gpu_range, cpu_ranges)
 }
 
+/// Validate the CLI mining parameters, returning a clear error for a nonsensical
+/// value instead of silently clamping it — a silent clamp can hide a typo
+/// (`--blocks 0` would otherwise launch zero nonces; `--cpu-share 5` would
+/// quietly become 1.0). Pure → unit-tested. Sensible-but-capped values (a huge
+/// `--cpu-threads` capped to the core count) are NOT errors; only meaningless
+/// values (can't mine) or an out-of-`0..=1` fraction are rejected.
+pub fn validate_mining_config(
+    cpu_share: f32,
+    threads: Option<usize>,
+    blocks: u32,
+    threads_per_block: u32,
+    nonces_per_thread: u32,
+) -> Result<(), String> {
+    if !cpu_share.is_finite() || !(0.0..=1.0).contains(&cpu_share) {
+        return Err(format!(
+            "--cpu-share must be a fraction in 0.0..=1.0 (got {cpu_share}); it is the share of the nonce range the CPU pool sweeps"
+        ));
+    }
+    if threads == Some(0) {
+        return Err(
+            "--threads must be >= 1 (to run NO CPU pool alongside a GPU, use --cpu-threads 0 instead)"
+                .to_string(),
+        );
+    }
+    if blocks == 0 {
+        return Err("--blocks must be >= 1 (a GPU launch needs at least one block)".to_string());
+    }
+    if threads_per_block == 0 {
+        return Err("--threads-per-block must be >= 1".to_string());
+    }
+    if nonces_per_thread == 0 {
+        return Err("--nonces-per-thread must be >= 1".to_string());
+    }
+    Ok(())
+}
+
 /// Cheap invariant check used by the partition tests.
 #[cfg(test)]
 fn partition_invariants_hold(
@@ -120,6 +156,26 @@ fn partition_invariants_hold(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- validate_mining_config (v0.1.9 fail-loud config) ---
+
+    #[test]
+    fn validate_mining_config_accepts_sane_values() {
+        assert!(validate_mining_config(0.4, None, 560, 256, 4096).is_ok());
+        assert!(validate_mining_config(0.0, Some(16), 1, 1, 1).is_ok()); // edges
+        assert!(validate_mining_config(1.0, Some(1), 100, 100, 100).is_ok());
+    }
+
+    #[test]
+    fn validate_mining_config_rejects_nonsense() {
+        assert!(validate_mining_config(1.5, None, 560, 256, 4096).is_err()); // share > 1
+        assert!(validate_mining_config(-0.1, None, 560, 256, 4096).is_err()); // share < 0
+        assert!(validate_mining_config(f32::NAN, None, 560, 256, 4096).is_err()); // NaN
+        assert!(validate_mining_config(0.4, Some(0), 560, 256, 4096).is_err()); // threads 0
+        assert!(validate_mining_config(0.4, None, 0, 256, 4096).is_err()); // blocks 0
+        assert!(validate_mining_config(0.4, None, 560, 0, 4096).is_err()); // tpb 0
+        assert!(validate_mining_config(0.4, None, 560, 256, 0).is_err()); // npt 0
+    }
 
     // --- partition truth-table tests ---
 

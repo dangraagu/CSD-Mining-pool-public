@@ -487,6 +487,17 @@ fn main() -> Result<()> {
         ),
     };
 
+    // Fail loud on a nonsensical mining parameter (e.g. a typo like `--blocks 0`
+    // or `--cpu-share 5`) instead of silently clamping it. v0.1.9 #3.
+    csd_gpu_miner::mining_config::validate_mining_config(
+        cli.cpu_share,
+        cli.threads,
+        cli.blocks,
+        cli.threads_per_block,
+        cli.nonces_per_thread,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
     // Validate `--gpu-id` up front (junk fails fast, before any socket opens).
     // v0.1.8 mines ONE device per process (`--device`); the include-list is a
     // launcher-level filter (mine-auto/mine-all-gpus read it to pick which cards
