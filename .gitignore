@@ -9,3 +9,9 @@ logs/
 csd-wallet.txt
 *wallet*.txt
 *.key
+
+# Internal planning/design scaffolding (superpowers implementation plans + specs).
+# Development process artifacts, never part of the public miner repo — ignored so
+# a stray `git add -A` can't leak them. (Tracked docs live at the repo root:
+# README.md, CHANGELOG.md, config.example.toml.)
+/docs/superpowers/
