@@ -130,30 +130,14 @@ It binds **localhost only** by default. To expose it on your LAN, add
 The `connection` object also reports `reconnects` and `failovers` (lifetime
 counts), so a dashboard can flag an unstable link or a flaky pool at a glance.
 
-Get a **Discord** ping when you find a block (solo) or pass a share milestone
-(pool):
+Get a **Discord** ping when you pass an accepted-share milestone:
 
 ```sh
 csd-pool-miner --address <ADDR> --discord-webhook https://discord.com/api/webhooks/...
-# add --discord-solutions-only to ping ONLY on solved blocks
 ```
 
 Notifications are best-effort and non-blocking — a slow or dead webhook never
 affects mining.
-
-## Solo mining — mine to your own node
-
-By default you mine to the pool. To mine **directly to your own csd-node**
-instead — no pool, no fee, no PPLNS; every block you find is yours:
-
-```sh
-csd-pool-miner --address <ADDR> --solo --node http://127.0.0.1:8799
-```
-
-The miner pulls work from `<node>/work/get` and submits solved blocks to
-`<node>/work/submit`. It's mutually exclusive with the pool — you earn nothing
-until you find a block, but keep the whole block when you do. `--stats-port` and
-`--discord-webhook` work in solo too (Discord fires on a found block).
 
 ## HiveOS
 
@@ -246,8 +230,8 @@ means losing access to any coins paid to the address.** The saved key imports in
 a full node with `csd wallet recover` when you want to spend.
 
 Already have a CSD node/wallet? Your existing address works too — it's the same
-one you'd receive coinbase on when solo mining. Anything that isn't 40 hex chars
-is rejected at startup with a clear error.
+one you'd receive payouts to. Anything that isn't 40 hex chars is rejected at
+startup with a clear error.
 
 ## Building
 

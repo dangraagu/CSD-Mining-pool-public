@@ -6,13 +6,6 @@
 //! is handed to a detached thread, so a slow / dead / rate-limited Discord can
 //! never stall or crash mining.
 
-/// A Discord `content` line announcing a solved block (the unambiguous "solution"
-/// signal, fired on a solo `/work/submit` accept). Contains the height, the block
-/// hash, and the worker so the channel is self-describing.
-pub fn block_found_message(height: u64, block_hash: &str, worker: &str) -> String {
-    format!("\u{1F389} CSD block found! height {height} \u{00B7} {block_hash} \u{00B7} worker {worker}")
-}
-
 /// A Discord `content` line for an accepted-share milestone (the pool-side
 /// "solution" proxy — a client pool miner never learns it found a block, so the
 /// closest signal is accepted shares). Contains the running total + the worker.
@@ -36,7 +29,9 @@ pub struct DiscordNotifier {
 
 impl DiscordNotifier {
     /// Build a notifier. `webhook` should already be [`validate_webhook_url`]-ed.
-    /// `solutions_only` = fire ONLY on solved blocks (skip share milestones).
+    /// `solutions_only` = stay silent: a pool miner never observes a solved block,
+    /// so this suppresses the accepted-share milestone pings (configure the webhook
+    /// but send nothing). Vestigial in pool-only mode; kept for compatibility.
     pub fn new(webhook: String, solutions_only: bool) -> Self {
         DiscordNotifier {
             webhook,
@@ -121,14 +116,6 @@ pub fn validate_webhook_url(url: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn block_found_message_contains_height_hash_worker() {
-        let m = block_found_message(12345, "00ab_c0ffee", "csd1rig");
-        assert!(m.contains("12345"), "{m}");
-        assert!(m.contains("00ab_c0ffee"), "{m}");
-        assert!(m.contains("csd1rig"), "{m}");
-    }
 
     #[test]
     fn share_accepted_message_contains_count_and_worker() {

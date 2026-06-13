@@ -73,12 +73,13 @@ struct Cli {
     #[arg(long)]
     stats_password: Option<String>,
 
-    /// Discord webhook URL for block-found (solo) / accepted-share milestone
-    /// (pool) alerts. Must be an https Discord webhook.
+    /// Discord webhook URL for accepted-share milestone alerts. Must be an https
+    /// Discord webhook.
     #[arg(long)]
     discord_webhook: Option<String>,
 
-    /// Only notify on solved blocks (solo); suppresses pool share-milestone pings.
+    /// Stay silent: suppress the accepted-share milestone pings. (Vestigial in
+    /// pool-only mode — a pool miner never solves a full block.)
     #[arg(long)]
     discord_solutions_only: bool,
 
