@@ -163,6 +163,8 @@ printf '%s\n' "$ADDR" > "$CFG"
 echo
 echo "Starting $VARIANT miner. Payout address: $ADDR"
 echo "(Change it later by deleting: $CFG)"
+echo "Tip: if no GPU is found, run  \"$BIN\" devices  (or --list-devices) to see"
+echo "     which cards this build detects, or reinstall with: ./install-csd-miner.sh cpu"
 echo "Press Ctrl+C to stop."
 echo
 exec "$BIN" --address "$ADDR"

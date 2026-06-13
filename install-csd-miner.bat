@@ -104,6 +104,8 @@ REM --- 5. Mine ---
 echo(
 echo Starting %VARIANT% miner. Payout address: !ADDR!
 echo ^(Change it later by deleting: %CFG%^)
+echo Tip: if no GPU is found, run  "%BIN%" devices  ^(or --list-devices^) to see
+echo      which cards this build detects, or reinstall with: install-csd-miner.bat cpu
 echo Press Ctrl+C to stop.
 echo(
 "%BIN%" --address !ADDR!

@@ -149,6 +149,22 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     device: usize,
 
+    /// GPU include-list as a comma-separated list of device indices (e.g.
+    /// `--gpu-id 0,2`). This single process still mines ONE device (`--device`);
+    /// the include-list is the launcher contract — `mine-auto`/`mine-all-gpus`
+    /// read it to decide which cards to spawn a process for (so you can skip a
+    /// bad card). Parsed + validated here (junk is rejected early via
+    /// [`csd_gpu_miner::hiveos::parse_gpu_ids`]) so it is also future-proof for
+    /// in-process multi-GPU (v0.2). Empty/absent ⇒ no filter (all cards).
+    #[arg(long)]
+    gpu_id: Option<String>,
+
+    /// List the GPU devices this build can see, then exit (flag alias for the
+    /// `devices` subcommand). Use it when `--backend auto` keeps falling back to
+    /// CPU and you want to know why.
+    #[arg(long)]
+    list_devices: bool,
+
     /// Log directory (rotates previous log on startup).
     #[arg(long, default_value = "logs")]
     log_dir: PathBuf,
@@ -388,7 +404,9 @@ fn main() -> Result<()> {
         return keygen::run();
     }
 
-    if matches!(cli.cmd, Some(Cmd::Devices)) {
+    // `--list-devices` is a flag alias for the `devices` subcommand: same probe,
+    // same early exit (xmrig/lolMiner spell it as a flag, not only a subcommand).
+    if matches!(cli.cmd, Some(Cmd::Devices)) || cli.list_devices {
         return print_devices();
     }
 
@@ -468,6 +486,31 @@ fn main() -> Result<()> {
             "no payout address: pass --address <addr20>, or set `address = \"<addr20>\"` in a config file (see config.example.toml / the README)"
         ),
     };
+
+    // Validate `--gpu-id` up front (junk fails fast, before any socket opens).
+    // v0.1.8 mines ONE device per process (`--device`); the include-list is a
+    // launcher-level filter (mine-auto/mine-all-gpus read it to pick which cards
+    // to spawn), so here we only parse + log it. When set, `--device` should be
+    // one of the listed ids — we warn (not error) if it isn't, since a single
+    // process legitimately runs one card of the set.
+    if let Some(list) = cli.gpu_id.as_deref() {
+        let ids = hiveos::parse_gpu_ids(list).map_err(|e| anyhow::anyhow!("--gpu-id: {e}"))?;
+        if ids.is_empty() {
+            tracing::info!("--gpu-id is empty: no GPU filter (all cards eligible)");
+        } else {
+            tracing::info!(
+                "--gpu-id include-list: {ids:?} (launcher filter; this process mines --device {})",
+                cli.device
+            );
+            if !ids.contains(&cli.device) {
+                tracing::warn!(
+                    "--device {} is not in --gpu-id {ids:?}; this single process mines --device {} regardless (--gpu-id is the launcher's per-process card selector)",
+                    cli.device,
+                    cli.device
+                );
+            }
+        }
+    }
 
     // SOLO/POOL mode validation. clap already rejects `--solo`/`--node` together
     // with `--pool`/`--url` (conflicts_with = "pool"); here we cover the two
@@ -752,6 +795,9 @@ fn drive<W: csd_gpu_miner::stratum::loop_stratum::WorkSource>(
                 b.threads,
                 cli.reserve
             );
+            tracing::warn!(
+                "auto: no GPU backend was usable — run `csd-gpu-miner devices` (or `--list-devices`) for the probe, or rebuild with `--features cuda` / `--features opencl` to compile GPU support in"
+            );
             run_stratum(&b, work, stop, build_mining_config(cli, true))
         }
     }
@@ -875,7 +921,8 @@ fn ctrlc_lite<F: Fn() + Send + 'static>(handler: F) {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_address;
+    use super::{validate_address, Cli};
+    use clap::Parser;
 
     #[test]
     fn accepts_40_lowercase_hex() {
@@ -912,5 +959,35 @@ mod tests {
     fn rejects_uppercase() {
         // Uppercase hex is rejected (addr20 addresses are lowercase hex).
         assert!(validate_address("0123456789ABCDEF0123456789abcdef01234567").is_err());
+    }
+
+    // --- P4 device-UX flag plumbing ---------------------------------------
+
+    #[test]
+    fn list_devices_flag_parses_and_defaults_off() {
+        // Default: the flag is OFF (a no-flags run is byte-identical to pre-P4).
+        let cli = Cli::try_parse_from(["csd-pool-miner", "--address", &"a".repeat(40)]).unwrap();
+        assert!(!cli.list_devices);
+        assert!(cli.gpu_id.is_none());
+
+        // Present: the flag is recognised and set.
+        let cli = Cli::try_parse_from(["csd-pool-miner", "--list-devices"]).unwrap();
+        assert!(cli.list_devices);
+    }
+
+    #[test]
+    fn gpu_id_flag_captures_raw_list_for_validation() {
+        // clap captures the raw string; main() validates it via parse_gpu_ids.
+        let cli =
+            Cli::try_parse_from(["csd-pool-miner", "--address", &"a".repeat(40), "--gpu-id", "0,2"])
+                .unwrap();
+        assert_eq!(cli.gpu_id.as_deref(), Some("0,2"));
+        // The shared parser (tested fully in hiveos.rs) turns it into indices and
+        // rejects junk — this is the exact call main() makes to fail fast.
+        assert_eq!(
+            csd_gpu_miner::hiveos::parse_gpu_ids(cli.gpu_id.as_deref().unwrap()).unwrap(),
+            vec![0, 2]
+        );
+        assert!(csd_gpu_miner::hiveos::parse_gpu_ids("0,x").is_err());
     }
 }

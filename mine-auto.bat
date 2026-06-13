@@ -14,12 +14,33 @@ REM ============================================================
 REM  Self-updating, multi-GPU launcher. Leave this window open.
 REM   * Runs one miner instance per GPU (each --device i, all to
 REM     your address) for the biggest combined hashrate.
-REM   * Every CHECK_MIN minutes it asks GitHub for the latest
-REM     release; when a NEW version is published it stops the
-REM     miners, downloads it, and restarts them automatically.
-REM   * If a miner window dies, it gets restarted on the next check.
+REM   * Checks GitHub for the latest release every CHECK_MIN
+REM     minutes. A new version is gated through THREE checks
+REM     before it ever runs (P4 hardening):
+REM       1. semver compare (the miner's own `check-update`, so
+REM          0.1.10 is correctly newer than 0.1.9 - a string
+REM          compare got this wrong),
+REM       2. download to a TEMP path "%BIN%.new" (NEVER onto the
+REM          live running binary - the old code curled straight
+REM          onto %BIN% and a partial download corrupted it),
+REM       3. SHA-256 verify against the release SHA256SUMS (the
+REM          miner's own `verify-file`) BEFORE the atomic swap.
+REM     A failed verify deletes the temp and keeps the running
+REM     binary; the rig never executes an unverified download.
+REM   * Liveness is checked on a SHORT cadence (LIVE_SEC),
+REM     decoupled from the slow update poll, with ESCALATING
+REM     BACKOFF so a crash-looping rig doesn't hammer.
 REM  Build (default OpenCL/amd = NVIDIA+AMD on just the driver):
 REM     mine-auto.bat nvidia
+REM
+REM  Env knobs (all optional):
+REM     CHECK_MIN     update-poll period in minutes      (default 15)
+REM     LIVE_SEC      liveness-check period in seconds    (default 30)
+REM     MAX_RESTARTS  rapid restarts before backing off   (default 5)
+REM     CSD_GPU_IDS   comma list of GPU ids to mine, e.g
+REM                   "0,2" to skip card 1 (default: all cards)
+REM     CSD_ON_CRASH  path to a .bat run once when the
+REM                   restart cap is hit (driver reset, etc.)
 REM ============================================================
 
 set "REPO=dangraagu/CSD-Mining-pool-public"
@@ -29,7 +50,9 @@ set "DIR=%LOCALAPPDATA%\csd-pool-miner"
 set "EXE=csd-pool-miner-%VARIANT%.exe"
 set "BIN=%DIR%\%EXE%"
 set "CFG=%DIR%\address.txt"
-set "CHECK_MIN=15"
+if not defined CHECK_MIN set "CHECK_MIN=15"
+if not defined LIVE_SEC set "LIVE_SEC=30"
+if not defined MAX_RESTARTS set "MAX_RESTARTS=5"
 if not exist "%DIR%" mkdir "%DIR%"
 
 echo(
@@ -45,42 +68,180 @@ if not defined ADDR (
 )
 if not defined ADDR ( echo [X] No address entered. & pause & exit /b 1 )
 
-REM --- count GPUs (pipe-free + array-safe so the for/f works) ---
-set "NGPU=1"
-for /f "usebackq delims=" %%n in (`powershell -NoProfile -Command "$g=@((Get-CimInstance Win32_VideoController).Name); $c=0; foreach($n in $g){ if($n -match 'NVIDIA' -or $n -match 'AMD' -or $n -match 'Radeon'){$c++} }; $c"`) do set "NGPU=%%n"
-if !NGPU! LSS 1 set "NGPU=1"
-set /a LAST=!NGPU!-1
-echo Rig has !NGPU! GPU(s). Mining to !ADDR!.
-echo Auto-checking GitHub for updates every %CHECK_MIN% min. Keep this open.
+REM --- which GPU device indices to mine ---
+REM Default: one process per detected card (0 .. NGPU-1). If CSD_GPU_IDS is set
+REM (e.g. "0,2"), mine exactly those indices instead (skip a bad card).
+set "GPU_ARG="
+if defined CSD_GPU_IDS (
+  set "DEVLIST=%CSD_GPU_IDS%"
+  set "GPU_ARG=--gpu-id %CSD_GPU_IDS%"
+  echo Using CSD_GPU_IDS filter: mining devices %CSD_GPU_IDS%.
+) else (
+  set "NGPU="
+  for /f "usebackq delims=" %%n in (`powershell -NoProfile -Command "$g=@((Get-CimInstance Win32_VideoController).Name); $c=0; foreach($n in $g){ if($n -match 'NVIDIA' -or $n -match 'AMD' -or $n -match 'Radeon'){$c++} }; $c"`) do set "NGPU=%%n"
+  if not defined NGPU set "NGPU=1"
+  if !NGPU! LSS 1 set "NGPU=1"
+  REM Build a space-separated device list 0 1 2 ... NGPU-1.
+  set "DEVLIST="
+  set /a LAST=!NGPU!-1
+  for /l %%i in (0,1,!LAST!) do set "DEVLIST=!DEVLIST! %%i"
+  echo Rig has !NGPU! GPU(s).
+)
+echo Mining to !ADDR!.
+echo Auto-checking GitHub for updates every %CHECK_MIN% min (liveness every %LIVE_SEC%s). Keep this open.
 echo(
 
 set "INSTALLED=none"
+set "RESTARTS=0"
+set "BACKOFF=0"
+set "HOOK_FIRED=0"
+set "ELAPSED=0"
+
+REM Run an update check immediately so we start on the latest published build.
+call :update_check
 
 :loop
-REM --- latest published version tag (no pipe -> safe in for/f) ---
-set "LATEST="
-for /f "usebackq delims=" %%v in (`powershell -NoProfile -Command "try { (Invoke-RestMethod -Uri 'https://api.github.com/repos/%REPO%/releases/latest' -Headers @{'User-Agent'='csd-miner'}).tag_name } catch { '' }"`) do set "LATEST=%%v"
-
-if defined LATEST if not "!LATEST!"=="!INSTALLED!" (
-  echo [%time%] update: !INSTALLED! -^> !LATEST!  ^(stopping, downloading, restarting^)
-  taskkill /IM "%EXE%" /F >nul 2>&1
-  curl -L -f -o "%BIN%" "https://github.com/%REPO%/releases/latest/download/%EXE%"
-  if !errorlevel!==0 (
-    set "INSTALLED=!LATEST!"
-    for /l %%i in (0,1,!LAST!) do start "CSD miner GPU %%i (!LATEST!)" "%BIN%" --address !ADDR! --device %%i --log-dir "%DIR%\gpu%%i-log"
-    echo [%time%] now mining !LATEST! on !NGPU! GPU(s).
+REM --- fast path: keep the miners alive with escalating backoff ---
+if not "!INSTALLED!"=="none" (
+  tasklist /FI "IMAGENAME eq %EXE%" 2>nul | find /I "%EXE%" >nul
+  if errorlevel 1 (
+    REM No miner process is running.
+    if !RESTARTS! GEQ %MAX_RESTARTS% (
+      if !BACKOFF!==0 ( set "BACKOFF=5" ) else ( set /a BACKOFF=!BACKOFF!*3 )
+      if !BACKOFF! GTR 60 set "BACKOFF=60"
+      echo [%time%] miners crash-looping ^(!RESTARTS! restarts^) - backing off !BACKOFF!s before retry.
+      if !HOOK_FIRED!==0 ( call :run_crash_hook & set "HOOK_FIRED=1" )
+      powershell -NoProfile -Command "Start-Sleep -Seconds !BACKOFF!"
+    )
+    echo [%time%] miners not running - restarting
+    call :start_miners
+    set /a RESTARTS=!RESTARTS!+1
   ) else (
-    echo [%time%] download failed; keeping current, will retry.
+    REM Healthy this tick: decay the crash-loop state.
+    if !RESTARTS! GTR 0 ( set "RESTARTS=0" & set "BACKOFF=0" & set "HOOK_FIRED=0" )
   )
 )
 
-REM --- restart miners if none are running (window closed / crashed) ---
-tasklist /FI "IMAGENAME eq %EXE%" 2>nul | find /I "%EXE%" >nul
-if errorlevel 1 if not "!INSTALLED!"=="none" (
-  echo [%time%] miners not running - restarting on !NGPU! GPU(s)
-  for /l %%i in (0,1,!LAST!) do start "CSD miner GPU %%i" "%BIN%" --address !ADDR! --device %%i --log-dir "%DIR%\gpu%%i-log"
+REM --- slow path: poll for a new release every CHECK_MIN minutes ---
+REM We tick every LIVE_SEC; accumulate elapsed seconds (ELAPSED is initialised
+REM to 0 before the loop) and run the update check when we cross CHECK_MIN*60.
+set /a ELAPSED=!ELAPSED!+%LIVE_SEC%
+set /a UPDATE_EVERY=%CHECK_MIN%*60
+if !ELAPSED! GEQ !UPDATE_EVERY! (
+  set "ELAPSED=0"
+  call :update_check
 )
 
-set /a WAIT=%CHECK_MIN%*60
-powershell -NoProfile -Command "Start-Sleep -Seconds !WAIT!"
+powershell -NoProfile -Command "Start-Sleep -Seconds %LIVE_SEC%"
 goto loop
+
+REM ============================================================
+REM  Subroutines
+REM ============================================================
+
+:update_check
+REM Query the latest published release tag (no pipe -> safe in for/f).
+set "LATEST="
+for /f "usebackq delims=" %%v in (`powershell -NoProfile -Command "try { (Invoke-RestMethod -Uri 'https://api.github.com/repos/%REPO%/releases/latest' -Headers @{'User-Agent'='csd-miner'}).tag_name } catch { '' }"`) do set "LATEST=%%v"
+if not defined LATEST goto :eof
+
+REM Decide whether LATEST is newer than INSTALLED. Prefer the miner's OWN
+REM check-update (one tested semver compare: 0.1.10 > 0.1.9). If the installed
+REM binary is missing or predates the subcommand (first hardened update), fall
+REM back to a plain string inequality.
+set "DOUPDATE=0"
+if exist "%BIN%" (
+  "%BIN%" check-update --help >nul 2>&1
+  if !errorlevel!==0 (
+    REM Subcommand present: exit 0 means "update available".
+    "%BIN%" check-update --current "!INSTALLED!" --latest "!LATEST!" >nul 2>&1
+    if !errorlevel!==0 ( set "DOUPDATE=1" )
+  ) else (
+    if not "!LATEST!"=="!INSTALLED!" set "DOUPDATE=1"
+  )
+) else (
+  if not "!LATEST!"=="!INSTALLED!" set "DOUPDATE=1"
+)
+if "!DOUPDATE!"=="0" goto :eof
+
+echo [%time%] update: !INSTALLED! -^> !LATEST!  ^(verify, then swap + restart^)
+
+REM 1. Download the new binary to a TEMP path - NEVER onto the live %BIN%.
+set "NEWBIN=%BIN%.new"
+if exist "!NEWBIN!" del /f /q "!NEWBIN!" >nul 2>&1
+curl -L -f -o "!NEWBIN!" "https://github.com/%REPO%/releases/latest/download/%EXE%"
+if not !errorlevel!==0 (
+  echo [%time%] download failed; keeping current, will retry.
+  if exist "!NEWBIN!" del /f /q "!NEWBIN!" >nul 2>&1
+  goto :eof
+)
+
+REM 2. Look up the expected SHA-256 from the release SHA256SUMS.
+set "WANT="
+set "SUMS=%DIR%\SHA256SUMS.tmp"
+if exist "!SUMS!" del /f /q "!SUMS!" >nul 2>&1
+curl -L -f -s -o "!SUMS!" "https://github.com/%REPO%/releases/latest/download/SHA256SUMS"
+if exist "!SUMS!" (
+  REM SHA256SUMS lines are "<hex>  <filename>"; pull the hex for our EXE.
+  for /f "usebackq tokens=1,2" %%a in (`findstr /i /e /c:" %EXE%" /c:"*%EXE%" "!SUMS!"`) do set "WANT=%%a"
+  del /f /q "!SUMS!" >nul 2>&1
+)
+
+REM 3. Verify before swapping. Prefer the miner's tested verify-file (the
+REM    currently-running %BIN% if it supports it, else the freshly downloaded
+REM    one). If no SHA256SUMS was published (pre-P4 release), log and accept the
+REM    download rather than hard-blocking updates.
+if defined WANT (
+  set "VERIFIER="
+  "%BIN%" verify-file --help >nul 2>&1
+  if !errorlevel!==0 ( set "VERIFIER=%BIN%" )
+  if not defined VERIFIER (
+    "!NEWBIN!" verify-file --help >nul 2>&1
+    if !errorlevel!==0 set "VERIFIER=!NEWBIN!"
+  )
+  if defined VERIFIER (
+    "!VERIFIER!" verify-file "!NEWBIN!" "!WANT!" >nul 2>&1
+    if not !errorlevel!==0 (
+      echo [%time%] [X] SHA-256 verify FAILED for %EXE% - discarding it, keeping the running binary.
+      del /f /q "!NEWBIN!" >nul 2>&1
+      goto :eof
+    )
+  ) else (
+    echo [%time%] [!] cannot verify ^(no verify-file subcommand available^) - skipping integrity check.
+  )
+) else (
+  echo [%time%] [!] no SHA256SUMS published for this release ^(or %EXE% not listed^) - skipping integrity verify ^(pre-P4 release^).
+)
+
+REM 4. Verified (or verify intentionally skipped): stop miners, atomically swap
+REM    the temp onto the live path, restart.
+taskkill /IM "%EXE%" /F >nul 2>&1
+move /Y "!NEWBIN!" "%BIN%" >nul
+if not !errorlevel!==0 (
+  echo [%time%] [X] could not swap in the new binary; keeping current.
+  if exist "!NEWBIN!" del /f /q "!NEWBIN!" >nul 2>&1
+  goto :eof
+)
+set "INSTALLED=!LATEST!"
+set "RESTARTS=0"
+set "BACKOFF=0"
+set "HOOK_FIRED=0"
+call :start_miners
+echo [%time%] now mining !INSTALLED! (build: %VARIANT%).
+goto :eof
+
+:start_miners
+REM Spawn one miner window per device index in DEVLIST.
+for %%i in (!DEVLIST!) do start "CSD miner GPU %%i (!INSTALLED!)" "%BIN%" --address !ADDR! --device %%i !GPU_ARG! --log-dir "%DIR%\gpu%%i-log"
+goto :eof
+
+:run_crash_hook
+if defined CSD_ON_CRASH (
+  if exist "!CSD_ON_CRASH!" (
+    echo [%time%] running CSD_ON_CRASH hook: !CSD_ON_CRASH!
+    call "!CSD_ON_CRASH!"
+  ) else (
+    echo [%time%] CSD_ON_CRASH set but "!CSD_ON_CRASH!" not found - skipping.
+  )
+)
+goto :eof
