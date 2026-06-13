@@ -43,7 +43,14 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// bridge simply hasn't pushed a frame lately), NOT a disconnect — see
 /// [`classify_read`], which keeps the session on a timeout. (Treating the
 /// timeout as fatal was the `os error 11` reconnect-storm bug on idle CPU rigs.)
-const READ_TIMEOUT: Duration = Duration::from_secs(120);
+///
+/// Kept SHORT (5s) so the reader observes a shutdown promptly. On `Drop`, a
+/// cross-handle `shutdown()` is not guaranteed to interrupt an in-flight `recv()`
+/// (notably on Windows), so the reader instead wakes on this timeout, re-checks
+/// `shutdown` at the top of its loop, and exits — bounding teardown to ~5s on
+/// every platform instead of stalling up to 120s. Safe because a timeout is
+/// classified `Idle` (it never reconnects), so a quiet link just re-reads.
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Reconnect backoff bounds.
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);

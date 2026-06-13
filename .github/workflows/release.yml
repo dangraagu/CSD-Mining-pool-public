@@ -10,6 +10,16 @@ name: release
 #   csd-pool-miner-cpu.exe    / csd-pool-miner-linux-cpu     (always; no GPU deps)
 #   csd-pool-miner-nvidia.exe / csd-pool-miner-linux-nvidia  (CUDA; best-effort)
 #   csd-pool-miner-amd.exe    / csd-pool-miner-linux-amd     (OpenCL; best-effort)
+#   csd-pool-miner-hiveos-<ver>.tar.gz                       (HiveOS custom miner)
+#   SHA256SUMS                                               (digests of all the above)
+#
+# The build jobs upload their artifacts; a final `release` job downloads them
+# all, generates ONE SHA256SUMS over every asset, and publishes the lot in a
+# single step. That single-publisher design is what lets SHA256SUMS cover assets
+# from BOTH OS jobs without two jobs racing to write the same file, and it is
+# what the self-update integrity check (mine-auto's verify-file) compares
+# against — without SHA256SUMS the updater has nothing to verify a download
+# against, so this job is load-bearing, not cosmetic.
 #
 # NOTE for the operator: before tagging a REAL release, set the pool endpoint in
 # src/endpoint.rs (it ships as a placeholder).
@@ -72,12 +82,12 @@ jobs:
         shell: pwsh
         run: Get-ChildItem dist
 
-      - name: Publish to GitHub Release (tags only)
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
         with:
-          files: dist/*
-          fail_on_unmatched_files: false
+          name: dist-windows
+          path: dist/*
+          if-no-files-found: error
 
   linux:
     runs-on: ubuntu-latest
@@ -114,11 +124,74 @@ jobs:
           cargo build --release --features opencl
           cp target/release/csd-gpu-miner dist/csd-pool-miner-linux-amd
 
+      # Package the HiveOS custom miner: the hiveos/ glue (h-manifest.conf,
+      # h-config.sh, h-run.sh, h-stats.sh) + the linux CPU binary renamed to the
+      # name the manifest expects (csd-gpu-miner). The tarball's top dir is the
+      # custom-miner name HiveOS extracts under /hive/miners/custom/.
+      - name: Package HiveOS custom miner
+        run: |
+          set -euo pipefail
+          # Derive the version: tag (strip the leading v) on a tag build, else the
+          # Cargo.toml version on a workflow_dispatch smoke run.
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            VER="${GITHUB_REF_NAME#v}"
+          else
+            VER="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          fi
+          PKG="csd-pool-miner"
+          STAGE="hiveos-pkg/$PKG"
+          mkdir -p "$STAGE"
+          cp hiveos/h-manifest.conf hiveos/h-config.sh hiveos/h-run.sh hiveos/h-stats.sh "$STAGE"/
+          chmod +x "$STAGE"/h-config.sh "$STAGE"/h-run.sh "$STAGE"/h-stats.sh
+          # The HiveOS binary must be named csd-gpu-miner (the manifest CUSTOM_BIN).
+          cp target/release/csd-gpu-miner "$STAGE"/csd-gpu-miner
+          chmod +x "$STAGE"/csd-gpu-miner
+          tar -czf "dist/${PKG}-hiveos-${VER}.tar.gz" -C hiveos-pkg "$PKG"
+          echo "packed dist/${PKG}-hiveos-${VER}.tar.gz"
+
       - name: List built artifacts
         run: ls -la dist
 
-      - name: Publish to GitHub Release (tags only)
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux
+          path: dist/*
+          if-no-files-found: error
+
+  # Single publisher: gather every built asset, emit ONE SHA256SUMS over all of
+  # them, then publish binaries + HiveOS tarball + SHA256SUMS together. Runs only
+  # on a tag (the build jobs still run on workflow_dispatch as a compile smoke
+  # test, but nothing is published there).
+  release:
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect assets + generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # Flatten dist-windows/ and dist-linux/ into one dist/.
+          find artifacts -type f -exec cp -t dist/ {} +
+          cd dist
+          # One checksums file over every published asset (sha256sum format:
+          # "<hex>  <filename>"), which verify-file / sha256sum -c read back.
+          # Build an explicit file list that EXCLUDES SHA256SUMS itself so the
+          # digests file can never (self-)reference a partially-written copy of
+          # itself regardless of glob/redirect ordering.
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\n' | sort > .asset-list
+          xargs -a .asset-list sha256sum -- > SHA256SUMS
+          rm -f .asset-list
+          echo "=== SHA256SUMS ==="
+          cat SHA256SUMS
+
+      - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
