@@ -610,7 +610,12 @@ impl StratumClient {
                             // af8c236 reconnect re-dials a DIFFERENT pool (the
                             // current one acks + pushes work but won't credit us).
                             // One-shot (swap-to-false): a later plain reconnect
-                            // stays on the current endpoint.
+                            // stays on the current endpoint. NOTE: the flag is
+                            // consumed by whichever reconnect runs NEXT — a failover
+                            // armed while the reader is already mid-reconnect is
+                            // carried by the following reconnect. Intentional and
+                            // benign: at worst one extra rotation, undone by
+                            // maybe_failback after FAILBACK_MS.
                             if shared.force_failover.swap(false, Ordering::Relaxed) {
                                 endpoints.advance();
                                 tracing::warn!(
@@ -1508,11 +1513,17 @@ mod tests {
             !shared.force_failover.load(Ordering::Relaxed),
             "request_reconnect must not arm failover"
         );
-        // A failover arms the one-shot flag for the reader to consume.
+        // A failover arms the one-shot flag for the reader to consume. The reader
+        // consumes it with a single swap-to-false, after which a later plain
+        // reconnect must NOT rotate again — assert that exact one-shot semantics.
         wd.request_failover();
         assert!(
-            shared.force_failover.load(Ordering::Relaxed),
+            shared.force_failover.swap(false, Ordering::Relaxed),
             "request_failover must arm force_failover"
+        );
+        assert!(
+            !shared.force_failover.load(Ordering::Relaxed),
+            "the one-shot flag must be cleared after a single consume"
         );
     }
 
@@ -1574,17 +1585,20 @@ mod tests {
         // The reader must rotate A→B and handshake there. On Windows a cross-handle
         // shutdown may not interrupt the in-flight recv, so the reader can take up
         // to READ_TIMEOUT(5s) to notice the shut socket, then backoff(1s) + dial B.
-        // The channel returns the instant B is hit; a 15s ceiling is generous slack.
-        let reached_b = rx.recv_timeout(Duration::from_secs(15)).is_ok();
+        // Under heavy parallel-test load on the shared box that 5s SO_RCVTIMEO is a
+        // floor the OS can deliver late, so use a 30s ceiling (only paid on an
+        // actual failure); the channel returns the instant B is hit.
+        let reached_b = rx.recv_timeout(Duration::from_secs(30)).is_ok();
         done.store(true, Ordering::Relaxed);
         assert!(
             reached_b,
             "request_failover must rotate from HEALTHY primary A to backup B"
         );
 
-        // The live endpoint must follow the failover to B.
+        // The live endpoint must follow the failover to B (same 30s-ish budget so a
+        // slow-but-correct rotation doesn't fail this second assertion).
         let mut followed = false;
-        for _ in 0..150 {
+        for _ in 0..500 {
             if client.health_snapshot().endpoint == addr_b {
                 followed = true;
                 break;

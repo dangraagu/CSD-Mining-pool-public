@@ -320,6 +320,14 @@ mod tests {
         assert!(!accept_deadman(now - 31 * m, now - 10 * m, now, accept_thr, job_fresh));
         // Jobs fresh but no job has ever arrived (0) ⇒ no trip.
         assert!(!accept_deadman(now - 31 * m, 0, now, accept_thr, job_fresh));
+
+        // Boundary (accept-stale uses `>=`): EXACTLY accept_threshold ⇒ trips.
+        assert!(accept_deadman(now - 30 * m, now - m, now, accept_thr, job_fresh));
+        // Boundary (job-fresh uses `>`): a job EXACTLY job_fresh_within old is still
+        // "fresh" (not stale) ⇒ with stale accepts, trips.
+        assert!(accept_deadman(now - 31 * m, now - 5 * m, now, accept_thr, job_fresh));
+        // One ms past the job-fresh edge ⇒ NOT fresh ⇒ no trip (job-staleness owns it).
+        assert!(!accept_deadman(now - 31 * m, now - 5 * m - 1, now, accept_thr, job_fresh));
     }
 
     #[test]
@@ -369,6 +377,30 @@ mod tests {
             ..snap
         };
         assert_eq!(watchdog_decision(snap4, cfg(), now), None);
+        // Storm-guard boundary: a reconnect EXACTLY accept_stale (30 min) ago no
+        // longer suppresses — the baseline is then 30 min stale ⇒ failover fires.
+        let snap5 = WatchdogSnapshot {
+            last_reconnect_ms: now - 30 * m,
+            ..snap
+        };
+        assert_eq!(
+            watchdog_decision(snap5, cfg(), now),
+            Some(WatchdogAction::Failover)
+        );
+        // ...but a reconnect 29 min ago still suppresses (baseline only 29 min old).
+        let snap6 = WatchdogSnapshot {
+            last_reconnect_ms: now - 29 * m,
+            ..snap
+        };
+        assert_eq!(watchdog_decision(snap6, cfg(), now), None);
+        // Clock step-back (last_reconnect_ms in the FUTURE): the baseline becomes a
+        // future stamp, now-baseline saturates to 0 ⇒ NO failover (the safe
+        // direction — never rotate on a skewed/NTP-stepped clock).
+        let snap7 = WatchdogSnapshot {
+            last_reconnect_ms: now + 10 * m,
+            ..snap
+        };
+        assert_eq!(watchdog_decision(snap7, cfg(), now), None);
     }
 
     #[test]
@@ -431,6 +463,7 @@ mod tests {
         });
         assert!(watchdog_tick(&trig, WatchdogCfg::default(), 1_000));
         assert_eq!(trig.reconnect_calls(), 1);
+        assert_eq!(trig.failover_calls(), 0, "a reconnect trigger must not fail over");
         // Healthy snapshot → no action, no reconnect.
         let ok = MockView::new(WatchdogSnapshot {
             consecutive_unacked: 1,
@@ -440,6 +473,7 @@ mod tests {
         });
         assert!(!watchdog_tick(&ok, WatchdogCfg::default(), 1_100));
         assert_eq!(ok.reconnect_calls(), 0);
+        assert_eq!(ok.failover_calls(), 0, "a healthy tick must not fail over");
     }
 
     #[test]
