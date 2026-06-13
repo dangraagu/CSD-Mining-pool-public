@@ -16,6 +16,9 @@ use csd_gpu_miner::backends::cpu::CpuBackend;
 use csd_gpu_miner::endpoint;
 use csd_gpu_miner::logging;
 use csd_gpu_miner::mining_config::MiningConfig;
+use csd_gpu_miner::notify::{self, DiscordNotifier};
+use csd_gpu_miner::solo::NodeWorkSource;
+use csd_gpu_miner::stats_server::{self, StatsHandle};
 use csd_gpu_miner::stratum::{run_stratum, StratumClient};
 
 #[cfg(feature = "opencl")]
@@ -52,6 +55,45 @@ struct Cli {
     /// omitted, the compiled-in default pool is used.
     #[arg(long = "pool", visible_alias = "url", value_delimiter = ',')]
     pool: Vec<String>,
+
+    /// SOLO mining: mine directly to your own csd-node instead of the pool.
+    /// Requires `--node`. Mutually exclusive with `--pool`/`--url` (you are
+    /// either pooling or soloing). In solo mode every block you find is yours
+    /// (no pool fee, no PPLNS) — but you also earn nothing until you find one.
+    #[arg(long, conflicts_with = "pool")]
+    solo: bool,
+
+    /// SOLO mining: your csd-node's HTTP endpoint as `http://host:port` (plain
+    /// HTTP only — no TLS). Passing `--node` turns on solo mode on its own (it
+    /// implies `--solo`). Mutually exclusive with `--pool`/`--url`. The miner
+    /// pulls work from `<node>/work/get` and submits blocks to `<node>/work/submit`.
+    #[arg(long, conflicts_with = "pool")]
+    node: Option<String>,
+
+    /// Telemetry: serve an xmrig-compatible `/1/summary` JSON endpoint on this
+    /// port (plus `/healthz`) for dashboards/monitoring. Omitted ⇒ no server.
+    #[arg(long)]
+    stats_port: Option<u16>,
+
+    /// Telemetry: bind IP for `--stats-port`. Default 127.0.0.1 (localhost only);
+    /// set 0.0.0.0 to expose on the LAN (an info-leak — pair with
+    /// `--stats-password`). Must be an IP, not a hostname.
+    #[arg(long, default_value = "127.0.0.1")]
+    stats_bind: String,
+
+    /// Telemetry: require this token on `/1/summary` (via `Authorization: Bearer`
+    /// or `?token=`). `/healthz` stays open. Omitted ⇒ no auth.
+    #[arg(long)]
+    stats_password: Option<String>,
+
+    /// Discord webhook URL for block-found (solo) / accepted-share milestone
+    /// (pool) alerts. Must be an https Discord webhook.
+    #[arg(long)]
+    discord_webhook: Option<String>,
+
+    /// Only notify on solved blocks (solo); suppresses pool share-milestone pings.
+    #[arg(long)]
+    discord_solutions_only: bool,
 
     /// Backend to use.
     #[arg(long, default_value = "auto")]
@@ -333,8 +375,8 @@ fn main() -> Result<()> {
     print_build_features();
 
     // Validate the payout address up front so a typo fails fast (before we open
-    // a socket to the pool) with a clear message. It may come from --address or
-    // the config file's `address =` key.
+    // a socket to the pool or node) with a clear message. It may come from
+    // --address or the config file's `address =` key.
     let address = match cli.address.as_deref() {
         Some(a) => validate_address(a)?,
         None => bail!(
@@ -342,6 +384,87 @@ fn main() -> Result<()> {
         ),
     };
 
+    // SOLO/POOL mode validation. clap already rejects `--solo`/`--node` together
+    // with `--pool`/`--url` (conflicts_with = "pool"); here we cover the two
+    // remaining shapes:
+    //   * `--solo` without `--node`  → error (solo needs a node to mine to).
+    //   * `--node` without `--solo`  → IMPLY solo (a node url means "mine solo").
+    // After this block, `cli.solo` is the single source of truth for the branch.
+    if cli.solo && cli.node.is_none() {
+        bail!(
+            "--solo requires --node <url>: tell the miner which csd-node to mine to, \
+             e.g. --solo --node http://127.0.0.1:8799"
+        );
+    }
+    if cli.node.is_some() && !cli.solo {
+        // `--node` on its own means the operator wants solo mining; flip it on
+        // rather than erroring, so `--node http://…` is enough.
+        cli.solo = true;
+    }
+
+    // G6: optional Discord notifier. Built once here (fail-fast on a bad webhook,
+    // before any socket opens) and shared into whichever arm runs. `None` ⇒ the
+    // notifier is OFF: no fire points post, and behaviour is byte-identical to a
+    // build without this flag. The URL is validated to an https Discord endpoint
+    // here (the only place validation happens); `DiscordNotifier::new` does not
+    // re-validate.
+    let notifier: Option<Arc<DiscordNotifier>> = match cli.discord_webhook.as_deref() {
+        Some(url) => {
+            notify::validate_webhook_url(url).map_err(|e| anyhow::anyhow!(e))?;
+            tracing::info!(
+                "discord: notifications enabled (solutions_only={})",
+                cli.discord_solutions_only
+            );
+            Some(Arc::new(DiscordNotifier::new(
+                url.to_string(),
+                cli.discord_solutions_only,
+            )))
+        }
+        None => None,
+    };
+
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop = stop.clone();
+        ctrlc_lite(move || {
+            tracing::warn!("ctrl-c, shutting down");
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+
+    // Branch on the work source. Both arms: build the source, optionally wire the
+    // D2 stats sink into it (when --stats-port is set) BEFORE spawning the stats
+    // server, then hand the source to `drive` which selects the backend and runs
+    // the same `run_stratum` loop. The pool arm is byte-identical in behaviour to
+    // the pre-solo build; the solo arm swaps the StratumClient for a NodeWorkSource.
+    if cli.solo {
+        let node_url = cli.node.clone().expect("validated: --solo implies --node");
+        let mut work = NodeWorkSource::connect(&node_url, &address)
+            .map_err(|e| anyhow::anyhow!("failed to connect to node {node_url}: {e}"))?;
+
+        // G6: wire the Discord notifier into the solo source (fires a block-found
+        // post on each accepted submit). No-op when --discord-webhook is unset.
+        if let Some(n) = &notifier {
+            work.attach_notifier(n.clone());
+        }
+
+        // D2: optional xmrig-compatible /1/summary telemetry. Off unless
+        // --stats-port. Attach the sink to the source BEFORE spawning the server
+        // so record_hashrate has somewhere to route from the first sample.
+        let _stats_server = if cli.stats_port.is_some() {
+            let handle = Arc::new(StatsHandle::new());
+            work.attach_stats(handle.clone());
+            Some(spawn_stats(handle, &address, &cli, &stop)?)
+        } else {
+            None
+        };
+
+        tracing::info!("solo: mining to {node_url} as {address}");
+        return drive(&work, &cli, stop);
+    }
+
+    // POOL mode (default): the existing flow, unchanged.
+    //
     // Resolve the pool endpoint(s): the operator's --url/--pool override(s) if
     // given (validated host:port), else the compiled-in default. The first is
     // the primary we connect to now; the full list will back failover (P1 §3).
@@ -358,28 +481,52 @@ fn main() -> Result<()> {
     // Hand the full ordered list to the client so the reader's reconnect path can
     // fail over to a backup pool (and fail back to the primary). With one
     // endpoint this is the same single-pool, no-failover behavior as before.
-    let client = StratumClient::connect_failover(&endpoints, &address)
+    let mut client = StratumClient::connect_failover(&endpoints, &address)
         .map_err(|e| anyhow::anyhow!("failed to connect to pool {endpoint}: {e}"))?;
 
-    let stop = Arc::new(AtomicBool::new(false));
-    {
-        let stop = stop.clone();
-        ctrlc_lite(move || {
-            tracing::warn!("ctrl-c, shutting down");
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        });
+    // G6: wire the Discord notifier into the pool client (the 30s heartbeat posts
+    // an accepted-share milestone when the total grows, unless
+    // --discord-solutions-only). No-op when --discord-webhook is unset.
+    if let Some(n) = &notifier {
+        client.attach_notifier(n.clone());
     }
 
+    // D2: optional xmrig-compatible /1/summary telemetry server. Off unless the
+    // operator passes --stats-port. It reads live hashrate + health from the
+    // shared StatsHandle (the mining loop pushes into it via record_hashrate);
+    // it never touches the share/submit/header path. Shares `spawn_stats` with
+    // the solo arm.
+    let _stats_server = if cli.stats_port.is_some() {
+        let handle = Arc::new(StatsHandle::new());
+        client.attach_stats(handle.clone());
+        Some(spawn_stats(handle, &address, &cli, &stop)?)
+    } else {
+        None
+    };
+
+    drive(&client, &cli, stop)
+}
+
+/// Select the backend (cuda → opencl → cpu, honoring `--backend`) and run the
+/// shared `run_stratum` loop against `work`. Generic over the [`WorkSource`] so
+/// the SAME selection logic drives both the pool `StratumClient` and the solo
+/// `NodeWorkSource` — the backend arms are unchanged; only the work-source
+/// argument differs from the pre-solo inline version.
+fn drive<W: csd_gpu_miner::stratum::loop_stratum::WorkSource>(
+    work: &W,
+    cli: &Cli,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<()> {
     match cli.backend {
         BackendChoice::Cpu => {
-            let n = cpu_hashing_threads(&cli);
+            let n = cpu_hashing_threads(cli);
             let b = CpuBackend::new(n);
             tracing::info!(
                 "backend=cpu (forced) hashing_threads={} reserved={}",
                 b.threads,
                 cli.reserve
             );
-            run_stratum(&b, &client, stop, build_mining_config(&cli, true))
+            run_stratum(&b, work, stop, build_mining_config(cli, true))
         }
 
         #[cfg(feature = "opencl")]
@@ -404,7 +551,7 @@ fn main() -> Result<()> {
                 b.blocks, b.threads_per_block, b.nonces_per_thread,
                 (b.blocks as u64) * (b.threads_per_block as u64) * (b.nonces_per_thread as u64),
             );
-            run_stratum(&b, &client, stop, build_mining_config(&cli, false))
+            run_stratum(&b, work, stop, build_mining_config(cli, false))
         }
         #[cfg(not(feature = "opencl"))]
         BackendChoice::Opencl => bail!("opencl backend not compiled in (rebuild with --features opencl)"),
@@ -436,7 +583,7 @@ fn main() -> Result<()> {
                 b.blocks, b.threads_per_block, b.nonces_per_thread,
                 (b.blocks as u64) * (b.threads_per_block as u64) * (b.nonces_per_thread as u64),
             );
-            run_stratum(&b, &client, stop, build_mining_config(&cli, false))
+            run_stratum(&b, work, stop, build_mining_config(cli, false))
         }
         #[cfg(not(feature = "cuda"))]
         BackendChoice::Cuda => bail!("cuda backend not compiled in (rebuild with --features cuda)"),
@@ -463,7 +610,7 @@ fn main() -> Result<()> {
                             b.blocks, b.threads_per_block, b.nonces_per_thread,
                             (b.blocks as u64) * (b.threads_per_block as u64) * (b.nonces_per_thread as u64),
                         );
-                        return run_stratum(&b, &client, stop, build_mining_config(&cli, false));
+                        return run_stratum(&b, work, stop, build_mining_config(cli, false));
                     }
                     Ok(Err(e)) => {
                         tracing::warn!("auto: CUDA init returned error: {}", e);
@@ -501,7 +648,7 @@ fn main() -> Result<()> {
                             b.blocks, b.threads_per_block, b.nonces_per_thread,
                             (b.blocks as u64) * (b.threads_per_block as u64) * (b.nonces_per_thread as u64),
                         );
-                        return run_stratum(&b, &client, stop, build_mining_config(&cli, false));
+                        return run_stratum(&b, work, stop, build_mining_config(cli, false));
                     }
                     Err(e) => {
                         tracing::warn!("auto: OpenCL init failed: {}", e);
@@ -513,16 +660,53 @@ fn main() -> Result<()> {
                 tracing::warn!("auto: OpenCL not compiled in");
             }
 
-            let n = cpu_hashing_threads(&cli);
+            let n = cpu_hashing_threads(cli);
             let b = CpuBackend::new(n);
             tracing::warn!(
                 "auto: SELECTED cpu (no GPU backend usable). hashing_threads={} reserved={}",
                 b.threads,
                 cli.reserve
             );
-            run_stratum(&b, &client, stop, build_mining_config(&cli, true))
+            run_stratum(&b, work, stop, build_mining_config(cli, true))
         }
     }
+}
+
+/// Spawn the D2 xmrig-compatible `/1/summary` stats server bound to
+/// `cli.stats_bind:cli.stats_port`, serving until `stop` is set. Shared by the
+/// pool and solo arms so the bind-parse + spawn happens in exactly one place;
+/// the caller builds the [`StatsHandle`], attaches it to its work source
+/// (`work.attach_stats(handle.clone())`), then passes the same handle here. The
+/// server reads health via a closure over the handle's last-pushed snapshot.
+fn spawn_stats(
+    handle: Arc<StatsHandle>,
+    address: &str,
+    cli: &Cli,
+    stop: &Arc<AtomicBool>,
+) -> anyhow::Result<std::thread::JoinHandle<()>> {
+    let port = cli.stats_port.expect("spawn_stats called only when stats_port is set");
+    let bind: std::net::SocketAddr = format!("{}:{}", cli.stats_bind, port)
+        .parse()
+        .map_err(|e| {
+            anyhow::anyhow!("invalid --stats-bind/--stats-port {}:{port}: {e}", cli.stats_bind)
+        })?;
+    let server = stats_server::spawn(
+        bind,
+        handle.clone(),
+        Box::new({
+            let h = handle.clone();
+            move || h.health()
+        }),
+        address.to_string(),
+        cli.stats_password.clone(),
+        stop.clone(),
+    )
+    .map_err(|e| anyhow::anyhow!("failed to bind stats port {bind}: {e}"))?;
+    tracing::info!(
+        "stats: xmrig /1/summary on http://{bind} (auth={})",
+        cli.stats_password.is_some()
+    );
+    Ok(server)
 }
 
 fn print_build_features() {

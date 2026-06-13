@@ -1,6 +1,8 @@
 /target
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock IS committed: this is a binary crate shipping a TLS/crypto tree
+# (ureq+rustls+ring), so the dependency graph is pinned for reproducible,
+# auditable builds of the public auto-updating miner.
 logs/
 
 # Wallet / key files — contain private keys, never commit to a public repo

@@ -23,8 +23,12 @@ pub mod consensus_types;
 pub mod endpoint;
 pub mod logging;
 pub mod mining_config;
+pub mod notify;
 pub mod selftest;
 pub mod sha256d_cpu;
+pub mod solo;
+pub mod stats;
+pub mod stats_server;
 pub mod stratum;
 
 /// Compatibility shim: re-exports the vendored [`consensus_types`] under the

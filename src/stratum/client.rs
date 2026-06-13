@@ -28,6 +28,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 
 use crate::endpoint::EndpointList;
+use crate::notify::{share_accepted_message, DiscordNotifier};
+use crate::stats_server::StatsHandle;
 use super::protocol::{
     authorize_request, serialize_line, subscribe_request, submit_request, NotifyParams,
     Notification, Response, SubscribeResult,
@@ -120,6 +122,22 @@ fn now_unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Pure decision for the G6 pool accepted-share milestone (heartbeat). Returns
+/// `Some(total)` to post when a milestone ping is due, `None` to stay silent:
+///   - `solutions_only` ⇒ always `None` (a pool miner can't observe block-found
+///     client-side, so "solutions only" means the pool path is silent).
+///   - else `Some(accepted)` iff `accepted > last_notified` (the running total
+///     grew since the last post — the caller advances its high-water mark to the
+///     returned value), `None` otherwise (no growth ⇒ no duplicate ping).
+///
+/// Free + pure so the gating is unit-tested directly without a live client.
+fn milestone_to_post(accepted: u64, last_notified: u64, solutions_only: bool) -> Option<u64> {
+    if solutions_only {
+        return None;
+    }
+    (accepted > last_notified).then_some(accepted)
 }
 
 /// Classify a received line as a `mining.submit` response, if it is one.
@@ -272,6 +290,19 @@ pub struct StratumClient {
     /// Reader-thread handle. `Option` so `Drop` can `join()` after signalling
     /// shutdown.
     reader: Option<JoinHandle<()>>,
+    /// Optional stats sink (D2): when the operator runs `--stats-port`, the
+    /// loop's hashrate samples + live health are pushed here for the telemetry
+    /// server. `None` ⇒ no stats endpoint and zero overhead.
+    stats: Option<Arc<StatsHandle>>,
+    /// Optional G6 Discord notifier. `None` until `--discord-webhook` wires one
+    /// in via [`StratumClient::attach_notifier`]; when set (and NOT
+    /// `--discord-solutions-only`), a heartbeat sample where the accepted-share
+    /// total grew posts the running total. A pool miner can't observe block-found
+    /// client-side, so `--discord-solutions-only` ⇒ the pool path stays silent.
+    notifier: Option<Arc<DiscordNotifier>>,
+    /// High-water mark of the accepted total we last notified on, so the
+    /// heartbeat only posts when `stats.accepted` has grown (no duplicate pings).
+    last_notified_accepted: AtomicU64,
 }
 
 /// Result of one handshake attempt.
@@ -363,6 +394,9 @@ impl StratumClient {
             writer,
             next_id: AtomicU64::new(100),
             reader: Some(reader),
+            stats: None,
+            notifier: None,
+            last_notified_accepted: AtomicU64::new(0),
         })
     }
 
@@ -629,6 +663,50 @@ impl StratumClient {
         }
     }
 
+    /// Attach a stats sink (D2). Called once at startup when `--stats-port` is
+    /// set, before the mining loop borrows the client (`&mut self`); `None`
+    /// until then, so the unconfigured build carries no stats overhead.
+    pub fn attach_stats(&mut self, handle: Arc<StatsHandle>) {
+        self.stats = Some(handle);
+    }
+
+    /// Push a combined-hashrate sample (GH/s) plus the current health snapshot
+    /// to the attached stats sink, if any. No-op when `--stats-port` is off.
+    pub fn record_hashrate_sample(&self, ghs: f64) {
+        if let Some(s) = &self.stats {
+            s.record(ghs);
+            s.set_health(self.health_snapshot());
+        }
+    }
+
+    /// Attach a G6 Discord notifier. Called once at startup when
+    /// `--discord-webhook` is set, before the mining loop borrows the client
+    /// (`&mut self`); `None` until then, so the unconfigured build carries no
+    /// notify overhead. When set (and not `--discord-solutions-only`), the
+    /// heartbeat posts an accepted-share milestone whenever the total grows.
+    pub fn attach_notifier(&mut self, n: Arc<DiscordNotifier>) {
+        self.notifier = Some(n);
+    }
+
+    /// Heartbeat-driven accepted-share milestone post (G6). Called from the
+    /// loop's 30s heartbeat (NOT the share path). No-op unless a notifier is
+    /// attached. With `--discord-solutions-only` the pool stays silent (a pool
+    /// miner never learns it solved a block, so there is no "solution" to post);
+    /// otherwise, if `stats.accepted` has grown since the last post, it sends the
+    /// running total. Best-effort + detached — never blocks the heartbeat. The
+    /// pure decision (what total, if any, to post) is factored into
+    /// [`milestone_to_post`] so it is unit-tested without a socket.
+    pub fn notify_heartbeat_sample(&self) {
+        if let Some(n) = &self.notifier {
+            let acc = self.shared.stats.accepted.load(Ordering::Relaxed);
+            let last = self.last_notified_accepted.load(Ordering::Relaxed);
+            if let Some(total) = milestone_to_post(acc, last, n.solutions_only()) {
+                self.last_notified_accepted.store(total, Ordering::Relaxed);
+                n.post(share_accepted_message(total, &self.worker_addr));
+            }
+        }
+    }
+
     /// Send a `mining.submit` line for a found share. Serializes writes through
     /// the writer mutex. Errors bubble up so the caller can log/account them.
     pub fn send_submit(
@@ -871,6 +949,20 @@ mod tests {
             shutdown: AtomicBool::new(false),
             stats: SessionStats::default(),
         })
+    }
+
+    #[test]
+    fn milestone_to_post_gates_on_growth_and_solutions_only() {
+        // solutions_only ⇒ always silent (pool can't observe block-found).
+        assert_eq!(milestone_to_post(10, 0, true), None);
+        assert_eq!(milestone_to_post(10, 5, true), None);
+        // Not solutions_only: post the new total iff it grew past last_notified.
+        assert_eq!(milestone_to_post(10, 5, false), Some(10));
+        assert_eq!(milestone_to_post(1, 0, false), Some(1)); // first accept
+        // No growth ⇒ no duplicate ping.
+        assert_eq!(milestone_to_post(5, 5, false), None);
+        assert_eq!(milestone_to_post(3, 5, false), None); // never decreases
+        assert_eq!(milestone_to_post(0, 0, false), None); // nothing accepted yet
     }
 
     #[test]

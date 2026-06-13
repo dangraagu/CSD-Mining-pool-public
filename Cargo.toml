@@ -1,6 +1,6 @@
 [package]
 name        = "csd-pool-miner"
-version     = "0.1.7"
+version     = "0.1.8"
 edition     = "2021"
 rust-version = "1.75"
 license     = "MIT OR Apache-2.0"
@@ -50,6 +50,11 @@ tracing     = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender   = "0.2"
 ctrlc       = "3"
+# G6 Discord webhook notifier (HTTPS-only). ureq = a BLOCKING, synchronous HTTP
+# client with rustls TLS and NO async runtime — so the miner stays tokio-free.
+# default-features off drops gzip/cookies/charset; "tls" = rustls + webpki-roots,
+# "json" = send_json. This is the only TLS dependency in the binary.
+ureq        = { version = "2", default-features = false, features = ["tls", "json"] }
 
 # Optional GPU backends; the default CPU-only build pulls in neither, and neither
 # needs a GPU toolchain on the BUILD host. CUDA embeds a pre-built PTX (see
