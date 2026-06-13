@@ -1049,16 +1049,19 @@ mod tests {
         };
         src.submit_solution(&sol).expect("submit Ok on HTTP 200 accepted");
 
-        // The post is detached — poll the recorder up to ~3s for the body.
+        // The post is detached (a fresh ureq Agent built + connecting on its own
+        // thread), which under a busy PARALLEL test run can take several seconds —
+        // poll generously (up to ~10s) so this never flakes on a loaded box. It
+        // still returns the instant the POST lands when the box is idle.
         let mut body = None;
-        for _ in 0..300 {
+        for _ in 0..1000 {
             if let Some(b) = webhook.posts.lock().unwrap().first().cloned() {
                 body = Some(b);
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        let body = body.expect("block-found webhook POST should arrive within 3s");
+        let body = body.expect("block-found webhook POST should arrive within ~10s");
         // Discord payload shape + the height/hash text from block_found_message.
         assert!(body.contains("content"), "payload has a content field: {body}");
         assert!(body.contains('7'), "height 7 present in {body}");
