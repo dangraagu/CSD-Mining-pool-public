@@ -9,8 +9,8 @@
 # Forced flags (cannot be overridden from the flightsheet, by design):
 #   --stats-port $CUSTOM_API_PORT --stats-bind 127.0.0.1
 #     so h-stats.sh can scrape /1/summary on localhost only (never exposed).
-# Everything else (address via --config, --pool, --backend, --gpu-id, …) comes
-# from h-config.sh's output.
+# Everything else (address via --config, --backend, --gpu-id, …) comes from
+# h-config.sh's output. The pool endpoint is compiled in and not configurable.
 
 cd "$(dirname "$0")" || exit 1
 # shellcheck source=/dev/null

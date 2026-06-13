@@ -28,7 +28,11 @@ use csd_gpu_miner::backends::opencl::OpenclBackend;
 #[cfg(feature = "cuda")]
 use csd_gpu_miner::backends::cuda::CudaBackend;
 
+// `#[path]` is pinned so these bin-only modules resolve to `src/` even when
+// `main.rs` is `#[path]`-included from an integration test under `tests/`.
+#[path = "config_file.rs"]
 mod config_file;
+#[path = "keygen.rs"]
 mod keygen;
 
 #[derive(Parser, Debug)]
@@ -37,7 +41,7 @@ mod keygen;
     version,
     about = "Standalone pool miner for Compute Substrate (mines to the CSD pool)."
 )]
-struct Cli {
+pub struct Cli {
     /// Path to a TOML config file. If omitted, `./config.toml` then the platform
     /// config dir (`~/.config/csd-pool-miner/config.toml`, or on Windows
     /// `%APPDATA%\csd-pool-miner\config.toml`) are tried. Explicit CLI flags
@@ -50,12 +54,6 @@ struct Cli {
     /// as `address =` in the config file; this flag wins if both are set.
     #[arg(long)]
     address: Option<String>,
-
-    /// Pool endpoint override(s) as `host:port`, comma-separated or repeated
-    /// (alias `--url`). The first is the primary; the rest back failover. If
-    /// omitted, the compiled-in default pool is used.
-    #[arg(long = "pool", visible_alias = "url", value_delimiter = ',')]
-    pool: Vec<String>,
 
     /// Telemetry: serve an xmrig-compatible `/1/summary` JSON endpoint on this
     /// port (plus `/healthz`) for dashboards/monitoring. Omitted ⇒ no server.
@@ -462,8 +460,8 @@ fn main() -> Result<()> {
         });
         // v0.1.9 #4: also probe pool reachability (non-fatal, diagnostic only) so
         // one `selftest` answers both "backends OK?" and "can I reach the pool?".
-        let endpoints = endpoint::resolve_endpoints(&cli.pool, &endpoint::pool_endpoint())
-            .unwrap_or_else(|_| vec![endpoint::pool_endpoint()]);
+        // The pool endpoint is compiled in and cannot be overridden.
+        let endpoints = vec![endpoint::pool_endpoint()];
         csd_gpu_miner::selftest::print_reachability(&endpoints);
         return result;
     }
@@ -546,18 +544,11 @@ fn main() -> Result<()> {
         });
     }
 
-    // Resolve the pool endpoint(s): the operator's --url/--pool override(s) if
-    // given (validated host:port), else the compiled-in default. The first is
-    // the primary we connect to now; the full list will back failover (P1 §3).
-    let endpoints = endpoint::resolve_endpoints(&cli.pool, &endpoint::pool_endpoint())
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // The pool endpoint is compiled in and cannot be overridden: the shipped
+    // binary always mines to the official pool. `connect_failover` still takes a
+    // list, so we hand it the single baked-in endpoint.
+    let endpoints = vec![endpoint::pool_endpoint()];
     let endpoint = endpoints[0].clone();
-    if endpoints.len() > 1 {
-        tracing::info!(
-            "csd-pool-miner: {} pool endpoints (failover order): {endpoints:?}",
-            endpoints.len()
-        );
-    }
     tracing::info!("csd-pool-miner: connecting to pool {endpoint} as address {address}");
     // Hand the full ordered list to the client so the reader's reconnect path can
     // fail over to a backup pool (and fail back to the primary). With one
