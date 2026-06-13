@@ -156,18 +156,13 @@ download_verify_swap() {
   if [ -z "$want" ]; then
     echo "[!] no SHA256SUMS published for this release (or '$BIN_NAME' not listed) - skipping integrity verify (pre-P4 release)." >&2
   else
-    # Verify via the staged binary's OWN verify-file if it is usable; else via
-    # the currently-installed one; else via sha256sum. We MUST verify before the
-    # swap, so prefer a tool that already exists (the running $BIN) over the
-    # not-yet-trusted staged file.
-    local verifier=""
+    # Verify with a TRUSTED tool ONLY: the already-running $BIN (if it supports
+    # verify-file) or the OS sha256sum. NEVER let the just-downloaded $staged
+    # verify itself — a malicious download would simply pass its own check. And
+    # if we have a digest but NO trusted verifier, FAIL CLOSED (refuse the swap)
+    # rather than run an unverified binary.
     if [ -x "$BIN" ] && "$BIN" verify-file --help >/dev/null 2>&1; then
-      verifier="$BIN"
-    elif [ -x "$staged" ] && "$staged" verify-file --help >/dev/null 2>&1; then
-      verifier="$staged"
-    fi
-    if [ -n "$verifier" ]; then
-      if ! "$verifier" verify-file "$staged" "$want" >/dev/null 2>&1; then
+      if ! "$BIN" verify-file "$staged" "$want" >/dev/null 2>&1; then
         echo "[X] SHA-256 verify FAILED for the downloaded $BIN_NAME - discarding it and keeping the running binary." >&2
         rm -f "$staged"
         return 1
@@ -181,7 +176,9 @@ download_verify_swap() {
         return 1
       fi
     else
-      echo "[!] cannot verify (no verify-file subcommand and no sha256sum) - skipping integrity check." >&2
+      echo "[X] have a SHA256SUMS digest but no trusted verifier (no running verify-file, no sha256sum) - refusing the update." >&2
+      rm -f "$staged"
+      return 1
     fi
   fi
 

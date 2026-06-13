@@ -192,22 +192,21 @@ REM    currently-running %BIN% if it supports it, else the freshly downloaded
 REM    one). If no SHA256SUMS was published (pre-P4 release), log and accept the
 REM    download rather than hard-blocking updates.
 if defined WANT (
-  set "VERIFIER="
+  REM Verify with the TRUSTED running %BIN% ONLY - never let the just-downloaded
+  REM staged binary verify itself (a malicious download would pass its own check).
+  REM If %BIN% predates verify-file, FAIL CLOSED rather than swap in unverified.
   "%BIN%" verify-file --help >nul 2>&1
-  if !errorlevel!==0 ( set "VERIFIER=%BIN%" )
-  if not defined VERIFIER (
-    "!NEWBIN!" verify-file --help >nul 2>&1
-    if !errorlevel!==0 set "VERIFIER=!NEWBIN!"
-  )
-  if defined VERIFIER (
-    "!VERIFIER!" verify-file "!NEWBIN!" "!WANT!" >nul 2>&1
+  if !errorlevel!==0 (
+    "%BIN%" verify-file "!NEWBIN!" "!WANT!" >nul 2>&1
     if not !errorlevel!==0 (
       echo [%time%] [X] SHA-256 verify FAILED for %EXE% - discarding it, keeping the running binary.
       del /f /q "!NEWBIN!" >nul 2>&1
       goto :eof
     )
   ) else (
-    echo [%time%] [!] cannot verify ^(no verify-file subcommand available^) - skipping integrity check.
+    echo [%time%] [X] cannot verify ^(running binary predates verify-file^) - refusing. Install v0.1.8+ once manually, then auto-update verifies.
+    del /f /q "!NEWBIN!" >nul 2>&1
+    goto :eof
   )
 ) else (
   echo [%time%] [!] no SHA256SUMS published for this release ^(or %EXE% not listed^) - skipping integrity verify ^(pre-P4 release^).
