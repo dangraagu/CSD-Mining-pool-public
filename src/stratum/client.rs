@@ -273,6 +273,11 @@ struct Shared {
     shutdown: AtomicBool,
     /// Accept/reject/stale share counters, written by the reader on each ack.
     stats: SessionStats,
+    /// The endpoint we are CURRENTLY connected to — updated by the reader on each
+    /// successful (re)connect. Distinct from `StratumClient.endpoint` (the static
+    /// primary) so the heartbeat + `/1/summary` show the TRUE pool after a
+    /// failover. Behind a `Mutex`; written on reconnect, read by `health_snapshot`.
+    current_endpoint: Mutex<String>,
 }
 
 impl Shared {
@@ -361,6 +366,7 @@ impl StratumClient {
             extranonce2_size: AtomicU64::new(hs.subscribe.extranonce2_size as u64),
             shutdown: AtomicBool::new(false),
             stats: SessionStats::default(),
+            current_endpoint: Mutex::new(endpoint.to_string()),
         });
 
         let extranonce1 = hs.subscribe.extranonce1_hex.clone();
@@ -666,7 +672,14 @@ impl StratumClient {
             stale: s.stale.load(Ordering::Relaxed),
             submitted: s.submitted.load(Ordering::Relaxed),
             job_age_s,
-            endpoint: self.endpoint.clone(),
+            // v0.1.9 #1: the endpoint we are CURRENTLY connected to (tracks
+            // failover), falling back to the static primary on a poisoned lock.
+            endpoint: self
+                .shared
+                .current_endpoint
+                .lock()
+                .map(|e| e.clone())
+                .unwrap_or_else(|_| self.endpoint.clone()),
         }
     }
 
@@ -926,6 +939,11 @@ fn reconnect(
                 }
                 *backoff = BACKOFF_MIN;
                 tracing::info!("stratum: reconnected to {ep}");
+                // v0.1.9 #1: record the endpoint we actually reconnected to so the
+                // heartbeat + /1/summary report the live pool after a failover.
+                if let Ok(mut cur) = shared.current_endpoint.lock() {
+                    *cur = ep.to_string();
+                }
                 return true;
             }
             Err(e) => {
@@ -955,6 +973,7 @@ mod tests {
             extranonce2_size: AtomicU64::new(xn2_size),
             shutdown: AtomicBool::new(false),
             stats: SessionStats::default(),
+            current_endpoint: Mutex::new("test-pool:3333".to_string()),
         })
     }
 
@@ -1399,6 +1418,24 @@ mod tests {
         assert!(
             reached_b,
             "reader must rotate from the dead primary A to backup B and re-subscribe"
+        );
+
+        // v0.1.9 #1: the live endpoint surfaced by health_snapshot() must FOLLOW
+        // the failover to B (it was the static primary A before). The reconnect
+        // updates current_endpoint just after re-subscribe, so poll briefly to
+        // avoid racing that write.
+        let mut endpoint_followed = false;
+        for _ in 0..100 {
+            if client.health_snapshot().endpoint == addr_b {
+                endpoint_followed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            endpoint_followed,
+            "health_snapshot().endpoint must track the failover to B; got {:?}",
+            client.health_snapshot().endpoint
         );
 
         drop(client);
