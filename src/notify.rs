@@ -1,10 +1,10 @@
-//! Discord webhook notifications (P3 G6) — **pure cores only**.
+//! Discord webhook notifications (P3 G6).
 //!
-//! This module holds the message formatters + the webhook-URL validator, which
-//! are pure and fully unit-tested. The actual HTTPS `POST` shell
-//! (`DiscordNotifier`) needs a TLS-capable HTTP client (`ureq`), a dependency
-//! deliberately deferred until the operator/security review signs off on adding
-//! TLS to this previously TLS-free binary — so it lands separately.
+//! The message formatters + the webhook-URL validator are pure and unit-tested.
+//! [`DiscordNotifier`] is the thin HTTPS `POST` shell over `ureq` (blocking,
+//! rustls, no async runtime). It is **best-effort + non-blocking**: every post
+//! is handed to a detached thread, so a slow / dead / rate-limited Discord can
+//! never stall or crash mining.
 
 /// A Discord `content` line announcing a solved block (the unambiguous "solution"
 /// signal, fired on a solo `/work/submit` accept). Contains the height, the block
@@ -23,6 +23,52 @@ pub fn share_accepted_message(accepted_total: u64, worker: &str) -> String {
 /// The JSON body a Discord webhook expects: `{"content": "<msg>"}`.
 pub fn discord_payload(content: &str) -> serde_json::Value {
     serde_json::json!({ "content": content })
+}
+
+/// A best-effort Discord webhook notifier. [`post`](Self::post) NEVER blocks the
+/// caller or panics: it hands the HTTPS POST to a DETACHED thread (never joined),
+/// so a hung / dead / 429-ing Discord cannot stall or crash the mining loop.
+/// Transport + HTTP errors are swallowed and logged at WARN.
+pub struct DiscordNotifier {
+    webhook: String,
+    solutions_only: bool,
+}
+
+impl DiscordNotifier {
+    /// Build a notifier. `webhook` should already be [`validate_webhook_url`]-ed.
+    /// `solutions_only` = fire ONLY on solved blocks (skip share milestones).
+    pub fn new(webhook: String, solutions_only: bool) -> Self {
+        DiscordNotifier {
+            webhook,
+            solutions_only,
+        }
+    }
+
+    /// Whether this notifier fires only on solved blocks (not share milestones).
+    pub fn solutions_only(&self) -> bool {
+        self.solutions_only
+    }
+
+    /// Fire-and-forget: POST `{"content": content}` to the webhook from a
+    /// detached thread. Returns immediately; connect/read are bounded by short
+    /// timeouts and any error is swallowed + logged — a webhook hiccup must
+    /// never affect mining.
+    pub fn post(&self, content: String) {
+        let webhook = self.webhook.clone();
+        // Detached on purpose — the mining loop never joins it.
+        let _ = std::thread::Builder::new()
+            .name("discord-notify".to_string())
+            .spawn(move || {
+                let agent = ureq::AgentBuilder::new()
+                    .timeout_connect(std::time::Duration::from_secs(5))
+                    .timeout_read(std::time::Duration::from_secs(10))
+                    .build();
+                match agent.post(&webhook).send_json(discord_payload(&content)) {
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("discord webhook post failed (ignored): {e}"),
+                }
+            });
+    }
 }
 
 /// Validate a Discord webhook URL before we ever POST to it.
@@ -107,5 +153,22 @@ mod tests {
         assert!(validate_webhook_url("https://evildiscord.com/api").is_err());
         // Empty / garbage.
         assert!(validate_webhook_url("not a url").is_err());
+    }
+
+    #[test]
+    fn discord_notifier_post_is_nonblocking_and_swallows_errors() {
+        // Pointed at a refused address: post() must return immediately (the work
+        // is detached) and never panic — proving a dead Discord can't stall
+        // mining. If post() blocked, this test would hang.
+        let n = DiscordNotifier::new("https://127.0.0.1:1".to_string(), false);
+        n.post("hello".to_string());
+        n.post("world".to_string());
+        assert!(!n.solutions_only());
+    }
+
+    #[test]
+    fn discord_notifier_solutions_only_getter() {
+        assert!(DiscordNotifier::new("https://discord.com/x".to_string(), true).solutions_only());
+        assert!(!DiscordNotifier::new("https://discord.com/x".to_string(), false).solutions_only());
     }
 }
