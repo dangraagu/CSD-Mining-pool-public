@@ -148,6 +148,15 @@ impl EndpointList {
             self.last_failback_ms = now_ms;
             return false;
         }
+        // On a backup with the failback clock never started (e.g. a deliberate
+        // failover advanced off the primary before any failback check ran): start
+        // it NOW and hold the backup for a full interval. Treating 0 as
+        // "infinitely long ago" would instantly snap back to a possibly-bad
+        // primary, defeating the failover (v0.1.9 #2 regression).
+        if self.last_failback_ms == 0 {
+            self.last_failback_ms = now_ms;
+            return false;
+        }
         if now_ms.saturating_sub(self.last_failback_ms) >= interval_ms {
             self.current = 0;
             self.last_failback_ms = now_ms;
@@ -275,6 +284,30 @@ mod tests {
     fn endpoint_list_no_failback_while_on_primary() {
         let mut el = EndpointList::new(vec!["a:1".into(), "b:2".into()]);
         assert!(!el.maybe_failback(999_999, 5000)); // already primary → never fails back
+        assert!(el.is_primary());
+    }
+
+    #[test]
+    fn maybe_failback_holds_backup_when_clock_unstarted() {
+        // Regression (v0.1.9 #2): a deliberate failover advances to a backup
+        // BEFORE any maybe_failback has run on the primary, so last_failback_ms is
+        // still 0. That must NOT be read as "infinitely long ago" → an instant
+        // snap-back to a (possibly bad) primary. Instead it starts the clock and
+        // holds the backup for a full interval.
+        let mut el = EndpointList::new(vec!["a:1".into(), "b:2".into()]);
+        el.advance(); // jump straight to the backup; the failback clock never started
+        assert!(!el.is_primary());
+        // First check on the backup with an unstarted clock: start it, stay put.
+        assert!(!el.maybe_failback(1_000_000, 5000));
+        assert!(
+            !el.is_primary(),
+            "must hold the backup, not instantly snap back to the primary"
+        );
+        // Before the interval elapses: still on the backup.
+        assert!(!el.maybe_failback(1_004_000, 5000)); // 4000ms < 5000
+        assert!(!el.is_primary());
+        // After the interval: now it fails back to the primary, as designed.
+        assert!(el.maybe_failback(1_006_000, 5000)); // 6000ms >= 5000
         assert!(el.is_primary());
     }
 }
