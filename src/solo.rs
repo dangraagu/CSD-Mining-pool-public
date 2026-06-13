@@ -939,6 +939,9 @@ mod tests {
         posts: Arc<Mutex<Vec<String>>>,
         shutdown: Arc<AtomicBool>,
         handle: Option<std::thread::JoinHandle<()>>,
+        /// Fires once per recorded POST so a waiter can BLOCK (event-driven)
+        /// instead of busy-polling `posts` — deterministic + no wasted CPU.
+        signal: std::sync::mpsc::Receiver<()>,
     }
 
     impl WebhookRecorder {
@@ -947,6 +950,7 @@ mod tests {
             let port = listener.local_addr().unwrap().port();
             let posts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
             let shutdown = Arc::new(AtomicBool::new(false));
+            let (tx, signal) = std::sync::mpsc::channel::<()>();
 
             let posts_t = Arc::clone(&posts);
             let shutdown_t = Arc::clone(&shutdown);
@@ -996,6 +1000,10 @@ mod tests {
                         .lock()
                         .unwrap()
                         .push(String::from_utf8_lossy(&body_bytes).to_string());
+                    // Wake any waiter the instant a POST lands (event-driven). The
+                    // push above happens-before this send, so a waiter that observes
+                    // the signal is guaranteed to see the body in `posts`.
+                    let _ = tx.send(());
                     // Minimal valid Discord-style 200 reply so ureq sees success.
                     let _ = sock.write_all(
                         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
@@ -1008,6 +1016,7 @@ mod tests {
                 posts,
                 shutdown,
                 handle: Some(handle),
+                signal,
             }
         }
     }
@@ -1051,19 +1060,24 @@ mod tests {
         };
         src.submit_solution(&sol).expect("submit Ok on HTTP 200 accepted");
 
-        // The post is detached (a fresh ureq Agent built + connecting on its own
-        // thread), which under a busy PARALLEL test run can take several seconds —
-        // poll generously (up to ~10s) so this never flakes on a loaded box. It
-        // still returns the instant the POST lands when the box is idle.
-        let mut body = None;
-        for _ in 0..1000 {
-            if let Some(b) = webhook.posts.lock().unwrap().first().cloned() {
-                body = Some(b);
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let body = body.expect("block-found webhook POST should arrive within ~10s");
+        // The POST is detached (a fresh ureq Agent built + connecting on its own
+        // thread). BLOCK on the recorder's signal — it fires the instant the POST
+        // lands — instead of busy-polling, so this is deterministic and wastes no
+        // CPU on the shared box. A generous 10s ceiling keeps it from ever flaking
+        // under heavy parallel-test load; it returns immediately when idle. The
+        // recorder's push happens-before its send, so the body is in `posts` by the
+        // time recv returns.
+        webhook
+            .signal
+            .recv_timeout(Duration::from_secs(10))
+            .expect("block-found webhook POST should arrive within ~10s");
+        let body = webhook
+            .posts
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .expect("a POST body was recorded once the signal fired");
         // Discord payload shape + the height/hash text from block_found_message.
         assert!(body.contains("content"), "payload has a content field: {body}");
         assert!(body.contains('7'), "height 7 present in {body}");
