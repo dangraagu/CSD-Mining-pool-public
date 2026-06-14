@@ -147,6 +147,8 @@ Add it as a Custom miner with your addr20 as the wallet; it reports hashrate and
 accepted/rejected shares to the HiveOS dashboard (by scraping the miner's own
 stats endpoint, so the kH/s is always correct).
 
+**Step-by-step setup: [docs/HIVEOS.md](docs/HIVEOS.md).**
+
 ## Auto-update (24/7 rigs)
 
 `mine-auto.sh` (Linux) / `mine-auto.bat` (Windows) run every card and keep the
