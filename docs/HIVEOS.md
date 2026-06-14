@@ -10,12 +10,14 @@ Every release ships a ready-made HiveOS **Custom-miner package**, so setup is ju
 
    | Field | Value |
    |---|---|
-   | Installation URL | `https://github.com/dangraagu/CSD-Mining-pool-public/releases/download/v0.1.7/csd-pool-miner-hiveos-0.1.7.tar.gz` |
+   | Installation URL | `https://github.com/dangraagu/CSD-Mining-pool-public/releases/download/v0.1.8/csd-pool-miner-0.1.8.tar.gz` |
    | Miner name | `csd-pool-miner` |
    | Hash algorithm | *anything — not used* |
    | Wallet and worker template | `%WAL%` |
    | Pool URL | *leave blank — ignored (the pool is built into the binary)* |
    | Extra config arguments | *backend flag — see step 3* |
+
+   > ⚠️ **The Miner name must be EXACTLY `csd-pool-miner`** — NOT `csd-pool-miner-hiveos`. HiveOS derives the install folder from this name, and the package's folder is `csd-pool-miner`; a mismatched name makes HiveOS look for a folder that isn't there and the rig reports **"Miner screen is not running."**
 
 3. **Pick your backend** in *Extra config arguments*:
    - NVIDIA → `--backend cuda`
@@ -29,4 +31,4 @@ Every release ships a ready-made HiveOS **Custom-miner package**, so setup is ju
 
 - **The Pool URL field does nothing.** The pool endpoint is compiled into the binary and can't be changed — just set the wallet and apply.
 - **Do not put `--pool` in Extra config arguments** — the miner will reject it and won't start.
-- **Updating:** HiveOS does not auto-update custom miners. To move to a newer version, change the *Installation URL* to that release's `csd-pool-miner-hiveos-<version>.tar.gz` and re-apply the Flight Sheet.
+- **Updating:** HiveOS does not auto-update custom miners. To move to a newer version, change the *Installation URL* to that release's `csd-pool-miner-<version>.tar.gz` and re-apply the Flight Sheet.

@@ -142,7 +142,7 @@ affects mining.
 ## HiveOS
 
 A HiveOS **Custom-miner package** ships with each release
-(`csd-pool-miner-hiveos-<version>.tar.gz`, also in the [`hiveos/`](hiveos/) dir).
+(`csd-pool-miner-<version>.tar.gz`, also in the [`hiveos/`](hiveos/) dir).
 Add it as a Custom miner with your addr20 as the wallet; it reports hashrate and
 accepted/rejected shares to the HiveOS dashboard (by scraping the miner's own
 stats endpoint, so the kH/s is always correct).

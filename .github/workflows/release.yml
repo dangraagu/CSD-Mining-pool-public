@@ -148,8 +148,8 @@ jobs:
           # The HiveOS binary must be named csd-gpu-miner (the manifest CUSTOM_BIN).
           cp target/release/csd-gpu-miner "$STAGE"/csd-gpu-miner
           chmod +x "$STAGE"/csd-gpu-miner
-          tar -czf "dist/${PKG}-hiveos-${VER}.tar.gz" -C hiveos-pkg "$PKG"
-          echo "packed dist/${PKG}-hiveos-${VER}.tar.gz"
+          tar -czf "dist/${PKG}-${VER}.tar.gz" -C hiveos-pkg "$PKG"
+          echo "packed dist/${PKG}-${VER}.tar.gz"
 
       - name: List built artifacts
         run: ls -la dist
