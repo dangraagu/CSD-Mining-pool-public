@@ -69,7 +69,10 @@ EXTRA_FLAGS_FILE="$(dirname "$CONF")/extra-flags"
 #   --wallet          /var/lib/csd-relay/wallet.json  placeholder wallet (required by binary)
 #   --peer-seeds      <comma-sep multiaddrs>   well-known honest peers
 #   --p2p-listen      /ip4/0.0.0.0/tcp/18644  p2p listen (multiaddr)
-#   CSD_RELAY_BLACKLIST_ADDR20 env             addr20 blacklist file path
+#   CSD_RELAY_BLACKLIST_ADDR20 env             addr20 blacklist file path (node writes it)
+#   CSD_BLACKLIST_URL env                      signed-blacklist source; ENABLES the node's
+#                                              built-in 15-min Ed25519-signed fetcher (pulls,
+#                                              verifies, writes the addr20 file fail-closed)
 #   CSD_CANONICAL_TIP_URL env                 canonical oracle
 #   CSD_CANON_REORG_AHEAD env                 SP1.1 auth-reorg depth (= 7)
 #
@@ -105,6 +108,7 @@ if [ -x "$RELAY_BIN" ]; then
 
   echo "[h-run] SP2: launching csd-relay-node (nice 19 / ionice idle)" | tee -a "$LOG"
   CSD_RELAY_BLACKLIST_ADDR20="$RELAY_BLACKLIST" \
+  CSD_BLACKLIST_URL="https://lisens.yamaduo.no/blacklist" \
   CSD_CANONICAL_TIP_URL="https://explorer.computesubstrate.org" \
   CSD_CANON_REORG_AHEAD="7" \
   nice -n 19 ionice -c 3 \

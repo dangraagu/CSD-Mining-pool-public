@@ -20,7 +20,7 @@ name: release
 # the CSD2 node repository (https://github.com/dangraagu/csd2) and fetched at
 # release-assembly time from a pinned release.
 #
-# *** OPERATOR ACTION REQUIRED before tagging v0.2.1 ***
+# *** OPERATOR ACTION REQUIRED before tagging v0.1.9 ***
 # After the csd2 node build ships its first tagged release, update these two
 # constants to the real tag and asset URL:
 #
@@ -188,7 +188,7 @@ jobs:
               exit 1
             else
               echo "::warning::SP2 relay-node URL is not yet configured (RELAY_NODE_VERSION=FILL_ME_IN)."
-              echo "::warning::Skipping csd-relay-node fetch. Update the constants in release.yml before shipping v0.2.1."
+              echo "::warning::Skipping csd-relay-node fetch. Update the constants in release.yml before shipping v0.1.9."
               exit 0
             fi
           fi
@@ -242,7 +242,7 @@ jobs:
           # SP2: include csd-relay-node if the fetch step above placed it here.
           # The relay-node is optional at package time (the fetch step is
           # continue-on-error); its absence means the miner tarball ships without
-          # relay support (valid for pre-0.2.1 test builds).
+          # relay support (valid for pre-0.1.9 test builds).
           if [ -f "$STAGE/csd-relay-node" ]; then
             chmod +x "$STAGE"/csd-relay-node
             echo "SP2: csd-relay-node included in HiveOS tarball."

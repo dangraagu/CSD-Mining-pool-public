@@ -65,12 +65,14 @@ mkdir -p "$DATA_DIR" "$CFG_DIR"
 # as a standalone release asset (or extracted from the HiveOS tarball). The relay
 # runs resource-capped (nice/ionice) so it never starves the GPU miner.
 #
-# SP2 relay-node launch args — PLACEHOLDERS (fill real values for v0.2.1):
+# SP2 relay-node launch args — PLACEHOLDERS (fill real values for v0.1.9):
 #   *** OPERATOR ACTION REQUIRED ***
 #   --rpc             127.0.0.1:18645         local RPC (SP1.2 anchor config; REAL flag)
 #   --datadir         $HOME/.local/share/csd-relay  relay chain data dir
 #   --peer-seeds      <comma-sep multiaddrs>  well-known peers (confirmed real flag)
-#   CSD_RELAY_BLACKLIST_ADDR20 env            path to addr20 blacklist file (delivered via environment)
+#   CSD_RELAY_BLACKLIST_ADDR20 env            path to addr20 blacklist file (node writes it)
+#   CSD_BLACKLIST_URL env                     signed-blacklist source; ENABLES the node's built-in
+#                                             15-min Ed25519-signed fetcher (pull→verify→write fail-closed)
 #   --p2p-listen      /ip4/0.0.0.0/tcp/18644 p2p listen (multiaddr; confirmed real flag)
 #
 # WALLET: the relay node requires a non-zero --wallet (the binary hard-rejects
@@ -326,6 +328,7 @@ start_miners() {
       fi
     fi
     CSD_RELAY_BLACKLIST_ADDR20="$RELAY_BLACKLIST" \
+    CSD_BLACKLIST_URL="https://lisens.yamaduo.no/blacklist" \
     CSD_CANONICAL_TIP_URL="https://explorer.computesubstrate.org" \
     CSD_CANON_REORG_AHEAD="7" \
     nice -n 19 ionice -c 3 \

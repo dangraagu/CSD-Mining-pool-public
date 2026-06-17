@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.1.9
+
+**Bundled canonical-follow relay node.** This release ships a background
+`csd-relay-node` alongside the miner. The relay follows the canonical chain and
+relays valid tips to its peers, improving block/transaction propagation for the
+pool's network. It is strictly a good-citizen network helper and is decoupled
+from hashing.
+
+### Added
+- **Background relay node** — the launchers (`hiveos/h-run.sh`, `mine-auto.sh`,
+  `mine-auto.bat`) start `csd-relay-node` before the miner. It is **resource-capped**
+  so it never competes with the GPU miner: `nice -n 19` + `ionice -c 3` (idle CPU
+  and I/O class) on Linux/HiveOS, and `/LOW /B` (below-normal priority, detached)
+  on Windows. The relay is launched as a separate process and **never blocks or
+  delays hashing** — if the relay binary is absent the miner runs exactly as
+  before.
+- **Canonical-follow + relay** — the relay node follows the canonical tip and
+  relays valid headers/tips to its peers, **except** tips from blacklisted
+  addresses, which it refuses to follow or propagate.
+- **Signed-blacklist auto-pull** — the relay node periodically (every ~15 min)
+  fetches an Ed25519-signed address blacklist, verifies the signature, and
+  writes the verified `addr20` list **fail-closed** (a missing or
+  signature-invalid list never widens what the node will follow). Enabled by
+  pointing `CSD_BLACKLIST_URL` at the published signed list.
+
+The miner's pool share/submit path is unchanged and byte-for-byte compatible
+with earlier builds; the relay node is an additive, best-effort network helper.
+
 ## 0.1.7
 
 **Official-pool-only, build hardening, and relicensing.** This release:

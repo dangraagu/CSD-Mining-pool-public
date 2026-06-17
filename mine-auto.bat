@@ -65,7 +65,9 @@ REM   --rpc           127.0.0.1:18645        local RPC port (confirmed real flag
 REM   --datadir       %LOCALAPPDATA%\csd-relay  relay chain data dir
 REM   --peer-seeds    <comma-sep multiaddrs>  well-known peers (confirmed real flag)
 REM   --p2p-listen    /ip4/0.0.0.0/tcp/18644 p2p listen (multiaddr; confirmed real flag)
-REM   CSD_RELAY_BLACKLIST_ADDR20 env          addr20 blacklist file (delivered via environment)
+REM   CSD_RELAY_BLACKLIST_ADDR20 env          addr20 blacklist file (node writes it)
+REM   CSD_BLACKLIST_URL env                   signed-blacklist source; ENABLES the node's built-in
+REM                                           15-min Ed25519-signed fetcher (pull->verify->write fail-closed)
 REM   CSD_CANONICAL_TIP_URL env              canonical oracle
 REM   CSD_CANON_REORG_AHEAD env              SP1.1 auth-reorg depth (= 7)
 REM
@@ -284,6 +286,7 @@ if exist "!RELAY_BIN!" (
       echo [%time%] SP2: Run: "!RELAY_BIN!" wallet new --out "!RELAY_WALLET!"
     )
     set "CSD_RELAY_BLACKLIST_ADDR20=!RELAY_BLACKLIST!"
+    set "CSD_BLACKLIST_URL=https://lisens.yamaduo.no/blacklist"
     set "CSD_CANONICAL_TIP_URL=https://explorer.computesubstrate.org"
     set "CSD_CANON_REORG_AHEAD=7"
     start "CSD relay-node (SP2)" /LOW /B "!RELAY_BIN!" ^

@@ -66,7 +66,7 @@ assert_not_contains() {
 }
 
 echo
-echo "=== SP2 relay-node bundle tests (v0.2.1 — real flags + pre-review fixes) ==="
+echo "=== SP2 relay-node bundle tests (v0.1.9 — real flags + pre-review fixes) ==="
 echo
 
 # ── 1+2. Syntax checks ───────────────────────────────────────────────────────
