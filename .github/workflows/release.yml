@@ -10,8 +10,32 @@ name: release
 #   csd-pool-miner-cpu.exe    / csd-pool-miner-linux-cpu     (always; no GPU deps)
 #   csd-pool-miner-nvidia.exe / csd-pool-miner-linux-nvidia  (CUDA; best-effort)
 #   csd-pool-miner-amd.exe    / csd-pool-miner-linux-amd     (OpenCL; best-effort)
-#   csd-pool-miner-hiveos-<ver>.tar.gz                       (HiveOS custom miner)
+#   csd-pool-miner-<ver>.tar.gz                              (HiveOS custom miner; also incl. csd-relay-node)
+#   csd-relay-node                                           (SP2: canonical-anchor relay, fetched from csd2 release)
 #   SHA256SUMS                                               (digests of all the above)
+#
+# SP2 — csd-relay-node binary source
+# ────────────────────────────────────────────────────────────────────────────────
+# The relay-node binary is NOT built here; it is the csd-node binary produced by
+# the CSD2 node repository (https://github.com/dangraagu/csd2) and fetched at
+# release-assembly time from a pinned release.
+#
+# *** OPERATOR ACTION REQUIRED before tagging v0.2.1 ***
+# After the csd2 node build ships its first tagged release, update these two
+# constants to the real tag and asset URL:
+#
+#   RELAY_NODE_VERSION    = the csd2 release tag (e.g. "v0.1.0")
+#   RELAY_NODE_ASSET_URL  = direct download URL of the Linux binary asset
+#
+# Until then, the linux packaging step downloads a placeholder (or fails
+# gracefully with a warning) so the miner assets still publish.
+# ────────────────────────────────────────────────────────────────────────────────
+# SP2_RELAY_CONSTANTS_START
+#   RELAY_NODE_VERSION="FILL_ME_IN"
+#   RELAY_NODE_REPO="dangraagu/csd2"
+#   RELAY_NODE_ASSET="csd-node-linux"
+#   RELAY_NODE_ASSET_URL="https://github.com/${RELAY_NODE_REPO}/releases/download/${RELAY_NODE_VERSION}/${RELAY_NODE_ASSET}"
+# SP2_RELAY_CONSTANTS_END
 #
 # The build jobs upload their artifacts; a final `release` job downloads them
 # all, generates ONE SHA256SUMS over every asset, and publishes the lot in a
@@ -126,10 +150,77 @@ jobs:
           cargo build --release --features opencl
           cp target/release/csd-gpu-miner dist/csd-pool-miner-linux-amd
 
+      # SP2: Fetch the pre-built csd-relay-node Linux binary from the pinned csd2
+      # release. This binary is NOT built here — it is the csd-node produced by the
+      # separate CSD2 node repo.  The relay-node ends up in:
+      #   - dist/csd-relay-node          (standalone download, SHA256SUMS covered)
+      #   - hiveos-pkg/csd-pool-miner/   (inside the HiveOS tarball)
+      #
+      # OPERATOR: update RELAY_NODE_VERSION + RELAY_NODE_ASSET_URL before tagging.
+      # While these are set to FILL_ME_IN the step warns but does NOT block the
+      # miner release (continue-on-error: true). Flip that to false once the real
+      # binary URL is wired in.
+      - name: Fetch csd-relay-node binary (SP2)
+        continue-on-error: true
+        env:
+          # ── SP2 relay-node source constants ────────────────────────────────────
+          # Update ALL THREE of these when the csd2 repo cuts its first tagged release.
+          # RELAY_NODE_SHA256 must be the sha256 hex of the RELAY_NODE_ASSET file at
+          # that release (run: sha256sum csd-node-linux). Without it the fetch step
+          # downloads but does NOT verify; set it to hard-gate the integrity check.
+          RELAY_NODE_VERSION: "FILL_ME_IN"
+          RELAY_NODE_REPO: "dangraagu/csd2"
+          RELAY_NODE_ASSET: "csd-node-linux"
+          RELAY_NODE_SHA256: "FILL_ME_IN"
+          # ───────────────────────────────────────────────────────────────────────
+        run: |
+          set -euo pipefail
+          mkdir -p dist hiveos-pkg/csd-pool-miner
+
+          # Hard-gate: fail the build (on a real tag push) if the operator has not
+          # wired in a real version.  On workflow_dispatch smoke runs the step is
+          # continue-on-error so this is a warning only; once the step's
+          # continue-on-error is flipped to false (after real URL + SHA are set)
+          # this becomes a hard build blocker.
+          if [ "$RELAY_NODE_VERSION" = "FILL_ME_IN" ]; then
+            if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+              echo "::error::SP2 relay-node version is still FILL_ME_IN — cannot ship a tagged release without a real relay binary. Update RELAY_NODE_VERSION + RELAY_NODE_SHA256 in release.yml."
+              exit 1
+            else
+              echo "::warning::SP2 relay-node URL is not yet configured (RELAY_NODE_VERSION=FILL_ME_IN)."
+              echo "::warning::Skipping csd-relay-node fetch. Update the constants in release.yml before shipping v0.2.1."
+              exit 0
+            fi
+          fi
+
+          RELAY_URL="https://github.com/${RELAY_NODE_REPO}/releases/download/${RELAY_NODE_VERSION}/${RELAY_NODE_ASSET}"
+          echo "SP2: downloading csd-relay-node from $RELAY_URL"
+          curl -fL --retry 3 -o dist/csd-relay-node "$RELAY_URL"
+
+          # SHA256 integrity check: verify the downloaded binary against the pinned
+          # hash BEFORE chmod+cp so a tampered/truncated download is rejected here.
+          if [ "$RELAY_NODE_SHA256" = "FILL_ME_IN" ]; then
+            echo "::warning::SP2: RELAY_NODE_SHA256 is FILL_ME_IN — skipping integrity verify. Set it to the expected sha256 hex of ${RELAY_NODE_ASSET} at ${RELAY_NODE_VERSION} before shipping."
+          else
+            GOT="$(sha256sum dist/csd-relay-node | awk '{print $1}')"
+            if [ "$GOT" != "$RELAY_NODE_SHA256" ]; then
+              echo "::error::SP2: SHA256 mismatch for csd-relay-node! got=$GOT want=$RELAY_NODE_SHA256"
+              rm -f dist/csd-relay-node
+              exit 1
+            fi
+            echo "SP2: csd-relay-node SHA256 OK ($GOT)"
+          fi
+
+          chmod +x dist/csd-relay-node
+          # Also stage a copy for the HiveOS tarball (picked up in the next step).
+          cp dist/csd-relay-node hiveos-pkg/csd-pool-miner/csd-relay-node
+          echo "SP2: csd-relay-node fetched OK ($(du -sh dist/csd-relay-node | cut -f1))"
+
       # Package the HiveOS custom miner: the hiveos/ glue (h-manifest.conf,
       # h-config.sh, h-run.sh, h-stats.sh) + the linux CPU binary renamed to the
-      # name the manifest expects (csd-gpu-miner). The tarball's top dir is the
-      # custom-miner name HiveOS extracts under /hive/miners/custom/.
+      # name the manifest expects (csd-gpu-miner), + the relay-node binary (SP2).
+      # The tarball's top dir is the custom-miner name HiveOS extracts under
+      # /hive/miners/custom/.
       - name: Package HiveOS custom miner
         run: |
           set -euo pipefail
@@ -148,6 +239,16 @@ jobs:
           # The HiveOS binary must be named csd-gpu-miner (the manifest CUSTOM_BIN).
           cp target/release/csd-gpu-miner "$STAGE"/csd-gpu-miner
           chmod +x "$STAGE"/csd-gpu-miner
+          # SP2: include csd-relay-node if the fetch step above placed it here.
+          # The relay-node is optional at package time (the fetch step is
+          # continue-on-error); its absence means the miner tarball ships without
+          # relay support (valid for pre-0.2.1 test builds).
+          if [ -f "$STAGE/csd-relay-node" ]; then
+            chmod +x "$STAGE"/csd-relay-node
+            echo "SP2: csd-relay-node included in HiveOS tarball."
+          else
+            echo "::warning::SP2: csd-relay-node NOT found in $STAGE — tarball ships without relay binary."
+          fi
           tar -czf "dist/${PKG}-${VER}.tar.gz" -C hiveos-pkg "$PKG"
           echo "packed dist/${PKG}-${VER}.tar.gz"
 

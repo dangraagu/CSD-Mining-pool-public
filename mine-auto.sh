@@ -60,6 +60,38 @@ LIVE_SEC="${LIVE_SEC:-30}"
 MAX_RESTARTS="${MAX_RESTARTS:-5}"
 mkdir -p "$DATA_DIR" "$CFG_DIR"
 
+# ── SP2: csd-relay-node paths ─────────────────────────────────────────────────
+# The relay binary lives alongside the miner binary in DATA_DIR; it is downloaded
+# as a standalone release asset (or extracted from the HiveOS tarball). The relay
+# runs resource-capped (nice/ionice) so it never starves the GPU miner.
+#
+# SP2 relay-node launch args — PLACEHOLDERS (fill real values for v0.2.1):
+#   *** OPERATOR ACTION REQUIRED ***
+#   --rpc             127.0.0.1:18645         local RPC (SP1.2 anchor config; REAL flag)
+#   --datadir         $HOME/.local/share/csd-relay  relay chain data dir
+#   --peer-seeds      <comma-sep multiaddrs>  well-known peers (confirmed real flag)
+#   CSD_RELAY_BLACKLIST_ADDR20 env            path to addr20 blacklist file (delivered via environment)
+#   --p2p-listen      /ip4/0.0.0.0/tcp/18644 p2p listen (multiaddr; confirmed real flag)
+#
+# WALLET: the relay node requires a non-zero --wallet (the binary hard-rejects
+# zero/absent wallets). The relay never mines (no bridge polls it), so the wallet
+# is just a placeholder. If the wallet file is absent, we generate one below
+# before launch using:
+#   <relay-bin> wallet new --out <path>
+# TODO(operator): confirm the exact wallet-new subcommand name against `csd-relay-node --help`.
+# If it differs (e.g. `keygen`, `new-wallet`), update RELAY_WALLET_CMD below.
+#
+RELAY_BIN_NAME="csd-relay-node"
+RELAY_BIN="$DATA_DIR/$RELAY_BIN_NAME"
+RELAY_DATADIR="${XDG_DATA_HOME:-$HOME/.local/share}/csd-relay"
+RELAY_WALLET="$DATA_DIR/relay-wallet.json"
+RELAY_BLACKLIST="$CFG_DIR/relay-blacklist.txt"
+RELAY_LOG="$DATA_DIR/relay.log"
+RELAY_PID=0   # tracked PID of the background relay process; 0 = not running
+# TODO(operator): confirm exact subcommand; update if it differs from "wallet new --out <path>"
+RELAY_WALLET_CMD=("$RELAY_BIN" wallet new --out "$RELAY_WALLET")
+# ── end SP2 constants ─────────────────────────────────────────────────────────
+
 echo
 echo " === CSD Pool Miner - auto-update (build: $VARIANT) ==="
 echo
@@ -252,11 +284,66 @@ stop_miners() {
   # Belt and braces: kill any stragglers by binary name.
   pkill -f "$BIN_NAME" 2>/dev/null || true
   PIDS=()
+  # SP2: also stop the relay-node if we spawned it.
+  # We kill by PID (precise) then belt-and-braces by binary name.
+  if [ "$RELAY_PID" -gt 0 ]; then
+    kill "$RELAY_PID" 2>/dev/null || true
+    wait "$RELAY_PID" 2>/dev/null || true
+    RELAY_PID=0
+  fi
+  pkill -f "$RELAY_BIN_NAME" 2>/dev/null || true
 }
 
 start_miners() {
   PIDS=()
   local i LOGDIR gpu_arg=()
+
+  # ── SP2: launch csd-relay-node FIRST, resource-capped ─────────────────────
+  # Resource cap:
+  #   nice -n 19     lowest user scheduling priority
+  #   ionice -c 3    idle I/O class (disk only when nothing else is queued)
+  # NOTE: taskset -c 0 is intentionally ABSENT — pinning to core 0 would share
+  # the system/IRQ core and harm latency. Let the scheduler place the relay.
+  #
+  # The relay uses spare cycles only. It is launched once here (not per-GPU)
+  # because it serves the whole node, not individual mining threads.
+  #
+  # Guard: if the relay is already running (e.g. crash-restart of this script)
+  # skip re-launching to avoid double-launch and port conflicts.
+  if [ "$RELAY_PID" -gt 0 ] && kill -0 "$RELAY_PID" 2>/dev/null; then
+    echo "[$(date '+%H:%M:%S')] SP2: relay already running (PID=$RELAY_PID) — skipping re-launch."
+  elif [ -x "$RELAY_BIN" ]; then
+    mkdir -p "$RELAY_DATADIR" "$(dirname "$RELAY_LOG")"
+    # Wallet: required by the binary even when not mining. Generate a throwaway
+    # placeholder on first run.
+    if [ ! -f "$RELAY_WALLET" ]; then
+      echo "[$(date '+%H:%M:%S')] SP2: relay wallet absent — generating placeholder wallet..."
+      # TODO(operator): if the subcommand name differs, update RELAY_WALLET_CMD above.
+      if "${RELAY_WALLET_CMD[@]}" >> "$RELAY_LOG" 2>&1; then
+        echo "[$(date '+%H:%M:%S')] SP2: relay wallet created at $RELAY_WALLET"
+      else
+        echo "[$(date '+%H:%M:%S')] SP2: WARNING — wallet generation failed; relay may refuse to start. Check $RELAY_LOG." >&2
+      fi
+    fi
+    CSD_RELAY_BLACKLIST_ADDR20="$RELAY_BLACKLIST" \
+    CSD_CANONICAL_TIP_URL="https://explorer.computesubstrate.org" \
+    CSD_CANON_REORG_AHEAD="7" \
+    nice -n 19 ionice -c 3 \
+      "$RELAY_BIN" \
+      --rpc 127.0.0.1:18645 \
+      --datadir "$RELAY_DATADIR" \
+      --wallet "$RELAY_WALLET" \
+      --peer-seeds /ip4/81.167.197.88/tcp/17999/p2p/12D3KooWA2GFgHLyXSZFVnzuchdesWhqnu7HWw637RXF9P6vW6zK,/ip4/141.94.163.242/tcp/18007/p2p/12D3KooWKGhuUhAwGDf3MtqL581h3gttvFg9Z2p1ej9wFTdKfdSM,/ip4/135.125.170.218/tcp/18007/p2p/12D3KooWSDqQj345ir2Ak5TUKHMn3wPTNsdJCbfPVq66aac29nKt \
+      --p2p-listen /ip4/0.0.0.0/tcp/18644 \
+      >> "$RELAY_LOG" 2>&1 &
+    RELAY_PID="$!"
+    echo "[$(date '+%H:%M:%S')] SP2: csd-relay-node started (PID=$RELAY_PID, log: $RELAY_LOG)"
+  else
+    echo "[$(date '+%H:%M:%S')] SP2: $RELAY_BIN not found — relay not started (install csd-relay-node in $DATA_DIR to enable)."
+    RELAY_PID=0
+  fi
+  # ── end SP2 relay launch ──────────────────────────────────────────────────
+
   # Pass the full include-list to each process via --gpu-id (validated by the
   # binary; informational for a single-device process but keeps the contract
   # explicit and ready for in-process multi-GPU).

@@ -55,6 +55,37 @@ if not defined LIVE_SEC set "LIVE_SEC=30"
 if not defined MAX_RESTARTS set "MAX_RESTARTS=5"
 if not exist "%DIR%" mkdir "%DIR%"
 
+REM ── SP2: csd-relay-node paths ────────────────────────────────────────────────
+REM The relay binary is downloaded as a standalone release asset alongside the
+REM miner. On Windows it is started with  start /LOW /B  (lowest priority,
+REM background/detached) so it NEVER starves the GPU miner.
+REM
+REM SP2 relay-node launch args (REAL flags confirmed against binary):
+REM   --rpc           127.0.0.1:18645        local RPC port (confirmed real flag)
+REM   --datadir       %LOCALAPPDATA%\csd-relay  relay chain data dir
+REM   --peer-seeds    <comma-sep multiaddrs>  well-known peers (confirmed real flag)
+REM   --p2p-listen    /ip4/0.0.0.0/tcp/18644 p2p listen (multiaddr; confirmed real flag)
+REM   CSD_RELAY_BLACKLIST_ADDR20 env          addr20 blacklist file (delivered via environment)
+REM   CSD_CANONICAL_TIP_URL env              canonical oracle
+REM   CSD_CANON_REORG_AHEAD env              SP1.1 auth-reorg depth (= 7)
+REM
+REM NOTE: Windows does not have ionice or taskset equivalents in cmd.exe.
+REM /LOW is the practical CPU priority cap available without third-party tools.
+REM
+REM WALLET: relay requires --wallet (binary hard-rejects absent/zero wallet).
+REM The relay never mines (no bridge polls it). If the wallet file is absent,
+REM the operator must generate one manually:
+REM   csd-relay-node.exe wallet new --out %RELAY_WALLET%
+REM TODO(operator): confirm exact subcommand against `csd-relay-node.exe --help`.
+REM
+set "RELAY_EXE=csd-relay-node.exe"
+set "RELAY_BIN=%DIR%\%RELAY_EXE%"
+set "RELAY_DATADIR=%LOCALAPPDATA%\csd-relay"
+set "RELAY_WALLET=%RELAY_DATADIR%\wallet.json"
+set "RELAY_BLACKLIST=%DIR%\relay-blacklist.txt"
+set "RELAY_LOG=%DIR%\relay.log"
+REM ── end SP2 constants ────────────────────────────────────────────────────────
+
 echo(
 echo  === CSD Pool Miner - auto-update (build: %VARIANT%) ===
 echo(
@@ -212,9 +243,11 @@ if defined WANT (
   echo [%time%] [!] no SHA256SUMS published for this release ^(or %EXE% not listed^) - skipping integrity verify ^(pre-P4 release^).
 )
 
-REM 4. Verified (or verify intentionally skipped): stop miners, atomically swap
-REM    the temp onto the live path, restart.
+REM 4. Verified (or verify intentionally skipped): stop miners + relay, atomically
+REM    swap the temp onto the live path, restart (relay re-launched by start_miners).
 taskkill /IM "%EXE%" /F >nul 2>&1
+REM SP2: also stop the relay so it is re-launched cleanly by :start_miners.
+taskkill /IM "%RELAY_EXE%" /F >nul 2>&1
 move /Y "!NEWBIN!" "%BIN%" >nul
 if not !errorlevel!==0 (
   echo [%time%] [X] could not swap in the new binary; keeping current.
@@ -230,6 +263,42 @@ echo [%time%] now mining !INSTALLED! (build: %VARIANT%).
 goto :eof
 
 :start_miners
+REM SP2: launch csd-relay-node FIRST at lowest priority (/LOW), detached (/B).
+REM Resource cap: /LOW = Windows below-normal priority class (closest to nice 19).
+REM The relay has no GPU affinity API on Windows; it runs on whatever cores the
+REM scheduler assigns, but /LOW ensures it never preempts the miner threads.
+REM
+REM Guard: if the relay is already running, tasklist will show it; skip re-launch.
+REM (Avoids double-launch on crash-restart of mine-auto.bat.)
+if exist "!RELAY_BIN!" (
+  tasklist /FI "IMAGENAME eq %RELAY_EXE%" 2>nul | find /I "%RELAY_EXE%" >nul
+  if not errorlevel 1 (
+    echo [%time%] SP2: relay already running - skipping re-launch.
+  ) else (
+    echo [%time%] SP2: launching csd-relay-node /LOW /B
+    if not exist "!RELAY_DATADIR!" mkdir "!RELAY_DATADIR!"
+    REM TODO(operator): if relay wallet absent, generate first:
+    REM   csd-relay-node.exe wallet new --out "!RELAY_WALLET!"
+    if not exist "!RELAY_WALLET!" (
+      echo [%time%] SP2: WARNING - relay wallet not found at !RELAY_WALLET!. Relay may fail to start.
+      echo [%time%] SP2: Run: "!RELAY_BIN!" wallet new --out "!RELAY_WALLET!"
+    )
+    set "CSD_RELAY_BLACKLIST_ADDR20=!RELAY_BLACKLIST!"
+    set "CSD_CANONICAL_TIP_URL=https://explorer.computesubstrate.org"
+    set "CSD_CANON_REORG_AHEAD=7"
+    start "CSD relay-node (SP2)" /LOW /B "!RELAY_BIN!" ^
+      --rpc 127.0.0.1:18645 ^
+      --datadir "!RELAY_DATADIR!" ^
+      --wallet "!RELAY_WALLET!" ^
+      --peer-seeds /ip4/81.167.197.88/tcp/17999/p2p/12D3KooWA2GFgHLyXSZFVnzuchdesWhqnu7HWw637RXF9P6vW6zK,/ip4/141.94.163.242/tcp/18007/p2p/12D3KooWKGhuUhAwGDf3MtqL581h3gttvFg9Z2p1ej9wFTdKfdSM,/ip4/135.125.170.218/tcp/18007/p2p/12D3KooWSDqQj345ir2Ak5TUKHMn3wPTNsdJCbfPVq66aac29nKt ^
+      --p2p-listen /ip4/0.0.0.0/tcp/18644 ^
+      >> "!RELAY_LOG!" 2>&1
+    echo [%time%] SP2: csd-relay-node started ^(log: !RELAY_LOG!^)
+  )
+) else (
+  echo [%time%] SP2: !RELAY_BIN! not found - relay not started.
+  echo [%time%] SP2: Download csd-relay-node.exe into %DIR% to enable relay support.
+)
 REM Spawn one miner window per device index in DEVLIST.
 for %%i in (!DEVLIST!) do start "CSD miner GPU %%i (!INSTALLED!)" "%BIN%" --address !ADDR! --device %%i !GPU_ARG! --log-dir "%DIR%\gpu%%i-log"
 goto :eof
