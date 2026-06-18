@@ -168,10 +168,10 @@ jobs:
           # RELAY_NODE_SHA256 must be the sha256 hex of the RELAY_NODE_ASSET file at
           # that release (run: sha256sum csd-node-linux). Without it the fetch step
           # downloads but does NOT verify; set it to hard-gate the integrity check.
-          RELAY_NODE_VERSION: "FILL_ME_IN"
-          RELAY_NODE_REPO: "dangraagu/csd2"
+          RELAY_NODE_VERSION: "relay-v0.1.9"
+          RELAY_NODE_REPO: "dangraagu/CSD-Mining-pool-public"
           RELAY_NODE_ASSET: "csd-node-linux"
-          RELAY_NODE_SHA256: "FILL_ME_IN"
+          RELAY_NODE_SHA256: "5f6e44fefbf46dfce1edddb50733e76249198e6ee6ced6bae19761df2fcd44dc"
           # ───────────────────────────────────────────────────────────────────────
         run: |
           set -euo pipefail
