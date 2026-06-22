@@ -135,6 +135,8 @@ miner logs accepted shares; the reliability + GPU watchdogs handle the rest.
 
 ## Updating the miner
 
+### Manual (one-off)
+
 Replace the binary and restart:
 
 ```bash
@@ -142,12 +144,82 @@ sudo install -m 0755 target/release/csd-gpu-miner /usr/local/bin/csd-pool-miner
 sudo systemctl restart csd-pool-miner          # or: restart 'csd-pool-miner@*'
 ```
 
+### Automatic updates (recommended for a 24/7 rig)
+
+The bare miner unit has **no** update path, so without this a systemd rig stays
+frozen on whatever version you installed. A small **oneshot + timer** pair keeps
+it current with the same fail-safe, fail-closed logic the `mine-auto.*`
+launchers use:
+
+| File | Role |
+|------|------|
+| `csd-pool-miner-update.sh`      | The update helper: resolve latest → verify → atomic swap → restart. |
+| `csd-pool-miner-update.service` | `Type=oneshot` wrapper that runs the helper. |
+| `csd-pool-miner-update.timer`   | Fires the oneshot ~every 15 min (and once after boot). |
+
+How it stays safe:
+
+- **Latest is resolved over the CDN**, not the GitHub API. It GETs
+  `releases/latest/download/latest-version.txt`, which is **not** subject to the
+  unauthenticated API's 60-requests/hour/IP limit — so a whole farm behind one
+  public IP keeps updating instead of silently freezing on HTTP 403.
+- **Integrity is fail-CLOSED.** The download is staged to a temp path and
+  SHA-256-verified against the release `SHA256SUMS` (via the installed binary's
+  `verify-file`, else the OS `sha256sum`) **before** the atomic swap. A missing
+  `SHA256SUMS`, an unlisted asset, a digest mismatch, or no trusted verifier all
+  **refuse** the update — the rig keeps running its existing, known-good binary.
+- **It can't brick the miner.** The updater is a *separate* unit from the miner.
+  It only ever touches the miner via `systemctl restart` **after** a verified
+  swap; any failure logs and exits 0, leaving the running miner untouched.
+
+Install it (after the miner unit is in place):
+
+```bash
+# 1. the helper script (note: installed name has NO .sh extension)
+sudo install -m 0755 deploy/systemd/csd-pool-miner-update.sh /usr/local/bin/csd-pool-miner-update
+
+# 2. the oneshot + timer
+sudo install -m 0644 deploy/systemd/csd-pool-miner-update.service /etc/systemd/system/
+sudo install -m 0644 deploy/systemd/csd-pool-miner-update.timer   /etc/systemd/system/
+
+# 3. enable the timer (this does NOT need to touch the running miner)
+sudo systemctl daemon-reload
+sudo systemctl enable --now csd-pool-miner-update.timer
+```
+
+Pick which build to track (optional). By default the helper auto-detects a GPU
+(NVIDIA → `nvidia`, AMD/OpenCL → `amd`, else `cpu`) and falls back to the `cpu`
+asset on a 404. To pin it, add a line to `/etc/csd-pool-miner.env` (the updater
+reads the same EnvironmentFile as the miner):
+
+```ini
+CSD_UPDATE_VARIANT=nvidia      # nvidia | amd | cpu
+```
+
+Watch / control it:
+
+```bash
+systemctl list-timers csd-pool-miner-update.timer     # when it next fires
+journalctl -u csd-pool-miner-update.service -f        # what each run did
+sudo systemctl start csd-pool-miner-update.service    # force a check right now
+sudo systemctl disable --now csd-pool-miner-update.timer   # stop auto-updates
+```
+
+> A successful update restarts `csd-pool-miner` (and any running
+> `csd-pool-miner@<i>` instances) onto the new binary. If you'd rather pin a
+> version, leave the timer disabled and update manually as above.
+
 ## Uninstall
 
 ```bash
 sudo systemctl disable --now csd-pool-miner            # and/or csd-pool-miner@0 …
+# if you enabled automatic updates:
+sudo systemctl disable --now csd-pool-miner-update.timer
 sudo rm /etc/systemd/system/csd-pool-miner.service
 sudo rm /etc/systemd/system/csd-pool-miner@.service
+sudo rm -f /etc/systemd/system/csd-pool-miner-update.service
+sudo rm -f /etc/systemd/system/csd-pool-miner-update.timer
+sudo rm -f /usr/local/bin/csd-pool-miner-update
 sudo systemctl daemon-reload
 # optional cleanup:
 sudo rm -f /etc/csd-pool-miner.env

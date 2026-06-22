@@ -1,0 +1,50 @@
+# csd-pool-miner — auto-update oneshot (FIX #1).
+#
+# Driven by csd-pool-miner-update.timer (~every 15 min). Resolves the latest
+# release via the CDN version-pointer, verifies the download against SHA256SUMS
+# (FAIL CLOSED), atomically swaps the binary, and ONLY THEN restarts the miner.
+#
+# This unit is SEPARATE from the miner unit by design: a failed update logs and
+# exits 0 (the script swallows all errors), so it can NEVER stop or crash-loop
+# the running miner. The miner keeps mining on its existing binary until a
+# verified newer one is in place. A bricked rig is never the outcome.
+#
+# Install (as root):
+#   install -m 0755 deploy/systemd/csd-pool-miner-update.sh /usr/local/bin/csd-pool-miner-update
+#   install -m 0644 deploy/systemd/csd-pool-miner-update.service /etc/systemd/system/
+#   install -m 0644 deploy/systemd/csd-pool-miner-update.timer   /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now csd-pool-miner-update.timer
+#
+# See deploy/systemd/README.md ("Automatic updates") for the full walkthrough.
+
+[Unit]
+Description=CSD Pool Miner auto-update (check + verified swap, then restart the miner)
+Documentation=https://github.com/dangraagu/CSD-Mining-pool-public
+# Updating needs the network (download). Don't block boot on it.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# Runs as root: the script writes /usr/local/bin/csd-pool-miner and calls
+# `systemctl restart csd-pool-miner`, both of which need privilege. It does NOT
+# mine and is short-lived. The SAME EnvironmentFile as the miner is read so
+# CSD_UPDATE_VARIANT / CSD_BIN overrides can live alongside CSD_ADDRESS.
+EnvironmentFile=-/etc/csd-pool-miner.env
+ExecStart=/usr/local/bin/csd-pool-miner-update
+
+# The script is internally fail-safe (exits 0 on any error), but make doubly sure
+# a non-zero exit never parks the timer's unit in a failed state.
+SuccessExitStatus=0 1
+
+# Light hardening. ProtectSystem=full (not strict) so the script can write the
+# binary under /usr/local/bin and the staging dir under /var/lib; ReadWritePaths
+# names exactly those. No device access is needed (this unit never touches a GPU).
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/usr/local/bin /var/lib/csd-pool-miner
+# Don't let a wedged download hang forever; the timer will try again next cycle.
+TimeoutStartSec=300

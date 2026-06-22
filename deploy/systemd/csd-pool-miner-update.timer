@@ -1,0 +1,31 @@
+# csd-pool-miner — auto-update timer (FIX #1).
+#
+# Fires csd-pool-miner-update.service ~every 15 minutes (and shortly after boot),
+# so a systemd rig stays current instead of being frozen on whatever version was
+# installed. The oneshot it triggers is fully fail-safe (see the .service).
+#
+# Enable (as root):
+#   systemctl enable --now csd-pool-miner-update.timer
+# Inspect:
+#   systemctl list-timers csd-pool-miner-update.timer
+#   journalctl -u csd-pool-miner-update.service -f
+
+[Unit]
+Description=Periodic CSD Pool Miner auto-update check (every ~15 min)
+Documentation=https://github.com/dangraagu/CSD-Mining-pool-public
+
+[Timer]
+# First check a minute after boot (catch up if the rig was off during a release),
+# then every 15 minutes of active time thereafter.
+OnBootSec=1min
+OnUnitActiveSec=15min
+# Persistent: if the machine was off when a check was due, run it once on the
+# next boot instead of silently skipping the missed window.
+Persistent=true
+# Spread fleet load: jitter each rig's check by up to 90s so a farm doesn't
+# stampede the CDN at the same instant.
+RandomizedDelaySec=90
+Unit=csd-pool-miner-update.service
+
+[Install]
+WantedBy=timers.target
