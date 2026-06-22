@@ -33,6 +33,7 @@ pub mod sha256d_cpu;
 pub mod stats;
 pub mod stats_server;
 pub mod stratum;
+pub mod winsvc;
 
 /// Compatibility shim: re-exports the vendored [`consensus_types`] under the
 /// `csd_consensus` path, so `csd_consensus::Type` import paths keep working

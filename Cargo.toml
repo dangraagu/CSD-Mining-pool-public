@@ -28,6 +28,16 @@ cuda        = ["dep:cudarc"]
 opencl      = ["dep:opencl3"]
 # Explicit CPU-only marker (no GPU toolchain required). Carries no deps.
 cpu-only    = []
+# OPTIONAL native Windows Service (secondary build ONLY — NOT in the lean
+# fleet/primary release). Lets the miner register itself with the Windows
+# Service Control Manager (`--install-service`) and run headless under it
+# (`--run-as-service`) with auto-restart on crash + clean stop/shutdown
+# handling. The pure flag/mode parsing is ALWAYS compiled (and unit-tested);
+# only the SCM glue is gated. The dep (`windows-service`) is declared under a
+# `cfg(windows)` target table, so this feature is a NO-OP on non-Windows and
+# the default `cpu-only` build pulls in NOTHING here. `dep:windows-service`
+# means enabling `winsvc` is what activates the (Windows-only) crate.
+winsvc      = ["dep:windows-service"]
 
 [dependencies]
 anyhow      = "1.0"
@@ -64,6 +74,17 @@ ureq        = { version = "2", default-features = false, features = ["tls", "jso
 # behind it; the NVRTC compiler itself is never invoked.
 cudarc      = { version = "0.19", features = ["cuda-13020", "driver", "nvrtc"], optional = true }
 opencl3     = { version = "0.9", optional = true }
+
+# OPTIONAL (feature = "winsvc") native Windows Service support. Declared under a
+# Windows-only target table so it is never resolved/fetched on Linux/macOS — the
+# `winsvc` feature there activates nothing (the SCM glue is `cfg(windows)` too).
+# `windows-service` is a thin, safe wrapper over the SCM APIs in `windows-sys`
+# (`advapi32`/`kernel32`, already part of Windows); it links no third-party DLL,
+# uses no packer/obfuscator, and opens no network endpoint. Its only transitive
+# additions over what the binary already pulls in (windows-sys 0.61, windows-link,
+# bitflags are present) are `windows-service` + `widestring`.
+[target.'cfg(windows)'.dependencies]
+windows-service = { version = "0.8", optional = true }
 
 [profile.release]
 opt-level     = 3

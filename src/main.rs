@@ -36,7 +36,7 @@ mod config_file;
 #[path = "keygen.rs"]
 mod keygen;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(
     name = "csd-pool-miner",
     version,
@@ -200,6 +200,27 @@ pub struct Cli {
     #[arg(long)]
     list_devices: bool,
 
+    /// (Windows, `winsvc` build only) Register this miner with the Windows
+    /// Service Control Manager as an auto-start service, then exit. The service
+    /// re-launches this exe in `--run-as-service` mode with the SAME mining flags
+    /// you pass here (e.g. `--address`, `--backend`), and auto-restarts on crash.
+    /// Run from an elevated (Administrator) console. No-op on non-Windows / a
+    /// build without the `winsvc` feature (errors with how to enable it).
+    #[arg(long)]
+    install_service: bool,
+
+    /// (Windows, `winsvc` build only) Stop (if running) and remove the
+    /// `csd-pool-miner` Windows service, then exit. Run elevated.
+    #[arg(long)]
+    uninstall_service: bool,
+
+    /// (Windows, `winsvc` build only) Run under the Windows Service Control
+    /// Manager. This is the mode the SCM invokes for the installed service; you
+    /// normally do NOT type it (use `--install-service` then `sc start
+    /// csd-pool-miner`). Started by hand it will fail to reach the SCM.
+    #[arg(long)]
+    run_as_service: bool,
+
     /// Log directory (rotates previous log on startup).
     #[arg(long, default_value = "logs")]
     log_dir: PathBuf,
@@ -213,6 +234,20 @@ pub struct Cli {
 
     #[command(subcommand)]
     cmd: Option<Cmd>,
+}
+
+impl Cli {
+    /// Resolve which Windows-service action (if any) the parsed flags request.
+    /// Thin wrapper over [`csd_gpu_miner::winsvc::parse_service_mode`] so the
+    /// flag→mode mapping (and its mutual-exclusion rule) is reachable from
+    /// integration tests without exposing the private flag fields.
+    pub fn service_mode(&self) -> Result<Option<csd_gpu_miner::winsvc::ServiceMode>> {
+        csd_gpu_miner::winsvc::parse_service_mode(
+            self.install_service,
+            self.uninstall_service,
+            self.run_as_service,
+        )
+    }
 }
 
 /// Validate an addr20 payout address and return its canonical 40-lowercase-hex
@@ -236,7 +271,7 @@ fn validate_address(addr: &str) -> Result<String> {
     Ok(body.to_string())
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 enum Cmd {
     /// Create a brand-new CSD payout wallet (keypair + addr20) locally, print
     /// it, and save it to ./csd-wallet.txt. The private key is generated on
@@ -681,6 +716,49 @@ fn main() -> Result<()> {
         return result;
     }
 
+    // Windows-service modes (OPTIONAL `winsvc` build). `--install-service` /
+    // `--uninstall-service` talk to the SCM and exit; `--run-as-service` hands
+    // the mining body to the SCM dispatcher (which supplies the stop flag its
+    // Stop/Shutdown handler flips). All three are off in the default build and
+    // a no-op on non-Windows (a clear error). Resolved here, before mining
+    // setup, so the install/uninstall paths never open a socket.
+    match cli.service_mode()? {
+        Some(csd_gpu_miner::winsvc::ServiceMode::Run) => {
+            // Mine under the SCM: it owns the stop flag, so we do NOT install the
+            // Ctrl-C handler here (`install_ctrlc = false`).
+            let cli_for_service = cli.clone();
+            return csd_gpu_miner::winsvc::run_service_action(
+                csd_gpu_miner::winsvc::ServiceMode::Run,
+                Box::new(move |stop| run_mining(&cli_for_service, stop, false)),
+            );
+        }
+        Some(mode) => {
+            // Install / uninstall: no mining body needed (the closure is never
+            // invoked for these modes), so hand a clearly-unreachable one.
+            return csd_gpu_miner::winsvc::run_service_action(
+                mode,
+                Box::new(|_stop| {
+                    unreachable!("install/uninstall do not run the miner body")
+                }),
+            );
+        }
+        None => {}
+    }
+
+    // Normal foreground mining: own the stop flag + install the Ctrl-C handler.
+    let stop = Arc::new(AtomicBool::new(false));
+    run_mining(&cli, stop, true)
+}
+
+/// Validate inputs, connect to the pool, optionally start telemetry, and drive
+/// the mining loop until `stop` is set. Shared by the normal foreground path and
+/// the Windows-service `--run-as-service` path; the only difference is who owns
+/// the stop flag and whether the Ctrl-C handler is installed (`install_ctrlc`).
+fn run_mining(
+    cli: &Cli,
+    stop: Arc<AtomicBool>,
+    install_ctrlc: bool,
+) -> Result<()> {
     print_build_features();
 
     // Validate the payout address up front so a typo fails fast (before we open
@@ -750,8 +828,9 @@ fn main() -> Result<()> {
         None => None,
     };
 
-    let stop = Arc::new(AtomicBool::new(false));
-    {
+    // Install the Ctrl-C handler only for the foreground path; under the Windows
+    // SCM the service's Stop/Shutdown handler owns the same `stop` flag instead.
+    if install_ctrlc {
         let stop = stop.clone();
         ctrlc_lite(move || {
             tracing::warn!("ctrl-c, shutting down");
@@ -785,12 +864,12 @@ fn main() -> Result<()> {
     let _stats_server = if cli.stats_port.is_some() {
         let handle = Arc::new(StatsHandle::new());
         client.attach_stats(handle.clone());
-        Some(spawn_stats(handle, &address, &cli, &stop)?)
+        Some(spawn_stats(handle, &address, cli, &stop)?)
     } else {
         None
     };
 
-    drive(&client, &cli, stop)
+    drive(&client, cli, stop)
 }
 
 /// Select the backend (cuda → opencl → cpu, honoring `--backend`) and run the
