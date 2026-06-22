@@ -114,16 +114,27 @@ download() {
   fi
 }
 
-# Query the GitHub API for the latest release tag (empty string on failure).
+# Resolve the latest published version (empty string on any failure).
+#
+# FIX #8: fetch it from the releases/latest/download/ CDN asset latest-version.txt
+# — NOT api.github.com/.../releases/latest. The unauthenticated API is capped at
+# 60 req/hr/IP, so ~20 rigs behind ONE public IP (a farm) get HTTP 403, an empty
+# tag, and the whole farm SILENTLY stops updating. The CDN download path has no
+# such per-IP limit. Output is the bare version (e.g. "0.1.10", no leading 'v').
+# On offline/404 we return empty and the caller cleanly no-ops (keeps mining) —
+# we deliberately do NOT fall back to the rate-limited API.
 latest_tag() {
-  local api="https://api.github.com/repos/$REPO/releases/latest"
+  local url="https://github.com/$REPO/releases/latest/download/latest-version.txt" out
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL -H 'User-Agent: csd-miner' "$api" 2>/dev/null \
-      | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[^"]*"([^"]+)".*/\1/'
+    out="$(curl -fsSL -H 'User-Agent: csd-miner' "$url" 2>/dev/null)" || return 0
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO- --header='User-Agent: csd-miner' "$api" 2>/dev/null \
-      | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[^"]*"([^"]+)".*/\1/'
+    out="$(wget -qO- --header='User-Agent: csd-miner' "$url" 2>/dev/null)" || return 0
+  else
+    return 0
   fi
+  # First non-empty line, whitespace-stripped, with any leading 'v' removed.
+  out="$(printf '%s\n' "$out" | sed -e 's/[[:space:]]//g' -e '/^$/d' | head -n1)"
+  printf '%s' "${out#v}"
 }
 
 # Decide whether $LATEST is newer than $INSTALLED. Prefer the miner's OWN
@@ -188,7 +199,14 @@ download_verify_swap() {
 
   want="$(expected_sha "$BIN_NAME")"
   if [ -z "$want" ]; then
-    echo "[!] no SHA256SUMS published for this release (or '$BIN_NAME' not listed) - skipping integrity verify (pre-P4 release)." >&2
+    # FIX #9: FAIL CLOSED. Every live release (v0.1.7+) publishes SHA256SUMS, so a
+    # missing SHA256SUMS (or our asset not being listed in it) is anomalous, not
+    # routine — refuse the update and keep running the EXISTING binary rather than
+    # swapping in an unverified download. (The old behaviour accepted the download
+    # here, which was a fail-OPEN integrity hole.)
+    echo "[X] refusing unverified update: no SHA256SUMS published (or '$BIN_NAME' not listed in it). Keeping the running binary." >&2
+    rm -f "$staged"
+    return 1
   else
     # Verify with a TRUSTED tool ONLY: the already-running $BIN (if it supports
     # verify-file) or the OS sha256sum. NEVER let the just-downloaded $staged

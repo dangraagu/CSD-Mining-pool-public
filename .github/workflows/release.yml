@@ -13,6 +13,8 @@ name: release
 #   csd-pool-miner-<ver>.tar.gz                              (HiveOS custom miner; also incl. csd-relay-node)
 #   csd-pool-miner.tar.gz                                    (stable-named alias of the above for releases/latest/download)
 #   csd-relay-node                                           (SP2: canonical-anchor relay, fetched from csd2 release)
+#   latest-version.txt                                       (just the version string, e.g. "0.1.10"; CDN-served so the
+#                                                             launchers resolve "latest" WITHOUT the 60/hr GitHub API limit)
 #   SHA256SUMS                                               (digests of all the above)
 #
 # SP2 — csd-relay-node binary source
@@ -260,6 +262,16 @@ jobs:
           # (generated in the release job over every dist/ file) covers both.
           cp "dist/${PKG}-${VER}.tar.gz" "dist/${PKG}.tar.gz"
           echo "packed dist/${PKG}.tar.gz (stable-named alias for releases/latest)"
+          # FIX #8: publish a tiny version-pointer asset. The launchers resolve
+          # "latest" by GETting this over the releases/latest/download/ CDN, which
+          # is NOT subject to the unauthenticated api.github.com 60-req/hr/IP limit
+          # (the limit that silently froze whole farms behind one public IP). Bare
+          # version, no leading 'v', single line. SHA256SUMS (generated in the
+          # release job over every dist/ file) covers it too, so a tampered
+          # version-pointer is detectable — but it only selects WHICH version to
+          # fetch; the binary itself is still SHA-verified before any swap.
+          printf '%s\n' "$VER" > dist/latest-version.txt
+          echo "wrote dist/latest-version.txt ($VER)"
 
       - name: List built artifacts
         run: ls -la dist

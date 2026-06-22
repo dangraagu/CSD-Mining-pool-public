@@ -66,16 +66,25 @@ download() {
   fi
 }
 
-# Latest published release tag, or empty string on any failure.
+# Latest published version, or empty string on any failure.
+#
+# FIX #8: resolve it from the releases/latest/download/ CDN asset
+# latest-version.txt instead of api.github.com (unauthenticated cap = 60
+# req/hr/IP, so a farm behind one public IP gets 403 + an empty tag + a silently
+# frozen fleet). The CDN download path has no per-IP limit. Bare version, no
+# leading 'v'. Empty on offline/404 → caller no-ops (keeps mining); we never fall
+# back to the rate-limited API.
 latest_tag() {
-  local api="https://api.github.com/repos/$REPO/releases/latest"
+  local url="https://github.com/$REPO/releases/latest/download/latest-version.txt" out
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL -H 'User-Agent: csd-miner' "$api" 2>/dev/null \
-      | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[^"]*"([^"]+)".*/\1/'
+    out="$(curl -fsSL -H 'User-Agent: csd-miner' "$url" 2>/dev/null)" || return 0
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO- --header='User-Agent: csd-miner' "$api" 2>/dev/null \
-      | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[^"]*"([^"]+)".*/\1/'
+    out="$(wget -qO- --header='User-Agent: csd-miner' "$url" 2>/dev/null)" || return 0
+  else
+    return 0
   fi
+  out="$(printf '%s\n' "$out" | sed -e 's/[[:space:]]//g' -e '/^$/d' | head -n1)"
+  printf '%s' "${out#v}"
 }
 
 # Decide whether $2 (latest) is newer than $1 (installed). Prefer the miner's
@@ -127,7 +136,12 @@ download_verify_swap() {
 
   want="$(expected_sha "$BIN_NAME")"
   if [ -z "$want" ]; then
-    echo "[!] no SHA256SUMS published for this release (or '$BIN_NAME' not listed) - skipping integrity verify (pre-P4 release)." >&2
+    # FIX #9: FAIL CLOSED. Live releases (v0.1.7+) always publish SHA256SUMS, so a
+    # missing SHA256SUMS (or our asset not listed) is anomalous — refuse the
+    # update and keep the EXISTING binary rather than swapping in an unverified
+    # download. (Previously this accepted the download: a fail-OPEN hole.)
+    echo "[X] refusing unverified update: no SHA256SUMS published (or '$BIN_NAME' not listed in it). Keeping the running binary." >&2
+    rm -f "$staged"; return 1
   else
     # Verify with a TRUSTED tool ONLY: the already-running $BIN's verify-file,
     # else the OS sha256sum. NEVER let the just-downloaded file verify itself.

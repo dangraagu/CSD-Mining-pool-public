@@ -14,12 +14,16 @@
 # the SAME proven three-check logic mine-auto.sh uses:
 #   1. numeric semver compare via the binary's own `check-update` (so 0.1.10 >
 #      0.1.9 — a string compare gets that wrong), string-`!=` fallback only when
-#      no usable binary exists yet,
+#      no usable binary exists yet. "Latest" is resolved from the
+#      releases/latest/download/ CDN asset latest-version.txt (FIX #8), NOT the
+#      60-req/hr api.github.com endpoint that silently froze whole farms,
 #   2. download to a TEMP path ("$CUSTOM_BIN.new") — NEVER onto the live binary,
 #   3. SHA-256 verify the temp against the release SHA256SUMS with a TRUSTED
 #      verifier (the already-installed $CUSTOM_BIN's `verify-file`, else OS
-#      sha256sum) BEFORE the atomic swap. A failed/again-unverifiable download is
-#      discarded and the running binary is kept.
+#      sha256sum) BEFORE the atomic swap. FAIL CLOSED: a missing SHA256SUMS, an
+#      asset not listed in it, a SHA mismatch, or no trusted verifier all REFUSE
+#      the update (FIX #9) — the download is discarded and the running binary is
+#      kept. The rig never executes an unverified binary, and never bricks.
 #
 # Because HiveOS forbids a foreground loop in h-run.sh (the exec-rename hazard),
 # auto-update is split into TWO layers:
@@ -117,16 +121,25 @@ ua_download() {
   fi
 }
 
-# Latest published release tag, or empty string on any failure.
+# Latest published version, or empty string on any failure.
+#
+# FIX #8: resolve via the releases/latest/download/ CDN asset latest-version.txt,
+# NOT api.github.com. The unauthenticated API caps at 60 req/hr/IP, so a farm of
+# HiveOS rigs behind one public IP gets 403 + an empty tag + a fleet that
+# silently stops updating. The CDN download path has no per-IP limit. Bare
+# version (no leading 'v'); empty on offline/404 → caller keeps mining on the
+# installed binary. We never fall back to the rate-limited API.
 ua_latest_tag() {
-  api="https://api.github.com/repos/$REPO/releases/latest"
+  url="https://github.com/$REPO/releases/latest/download/latest-version.txt"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL -H 'User-Agent: csd-miner' "$api" 2>/dev/null \
-      | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[^"]*"([^"]+)".*/\1/'
+    out="$(curl -fsSL -H 'User-Agent: csd-miner' "$url" 2>/dev/null)" || return 0
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO- --header='User-Agent: csd-miner' "$api" 2>/dev/null \
-      | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[^"]*"([^"]+)".*/\1/'
+    out="$(wget -qO- --header='User-Agent: csd-miner' "$url" 2>/dev/null)" || return 0
+  else
+    return 0
   fi
+  out="$(printf '%s\n' "$out" | sed -e 's/[[:space:]]//g' -e '/^$/d' | head -n1)"
+  printf '%s' "${out#v}"
 }
 
 # Decide whether $2 (latest) is newer than $1 (installed). Prefer the binary's
@@ -180,7 +193,13 @@ ua_download_verify_swap() {
 
   want="$(ua_expected_sha "$asset")"
   if [ -z "$want" ]; then
-    echo "[h-run] auto-update: no SHA256SUMS for this release (or '$asset' not listed) — skipping integrity verify (pre-P4 release)." | tee -a "$LOG"
+    # FIX #9: FAIL CLOSED. Live releases (v0.1.7+) always publish SHA256SUMS, so a
+    # missing SHA256SUMS (or '$asset' not listed) is anomalous — refuse the update
+    # and keep the EXISTING $CUSTOM_BIN rather than swapping in an unverified
+    # download. (Previously this accepted the download: a fail-OPEN hole.) The rig
+    # keeps mining on the known-good binary; a bricked rig is never the outcome.
+    echo "[h-run] auto-update: refusing unverified update — no SHA256SUMS for this release (or '$asset' not listed). Keeping the running binary." | tee -a "$LOG"
+    rm -f "$staged"; return 1
   else
     # Verify with a TRUSTED tool ONLY: the already-installed $UPDATE_BIN's
     # verify-file, else the OS sha256sum. NEVER let the just-downloaded file

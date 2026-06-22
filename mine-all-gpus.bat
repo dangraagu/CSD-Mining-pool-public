@@ -124,9 +124,13 @@ REM failure leaves the running binary/miners untouched (FAIL-SAFE).
 :update_once
 set "MODE=%~1"
 
-REM Latest published release tag (no pipe -> safe in for/f).
+REM FIX #8: resolve the latest version from the releases/latest/download/ CDN
+REM asset latest-version.txt, NOT api.github.com (unauthenticated cap = 60
+REM req/hr/IP, so a farm behind one public IP gets 403 + an empty tag + a frozen
+REM fleet). The CDN download has no per-IP limit. Empty on offline/404 -> clean
+REM no-op (keep mining); we never fall back to the rate-limited API.
 set "LATEST="
-for /f "usebackq delims=" %%v in (`powershell -NoProfile -Command "try { (Invoke-RestMethod -Uri 'https://api.github.com/repos/%REPO%/releases/latest' -Headers @{'User-Agent'='csd-miner'}).tag_name } catch { '' }"`) do set "LATEST=%%v"
+for /f "usebackq delims=" %%v in (`powershell -NoProfile -Command "try { $t=(Invoke-WebRequest -Uri 'https://github.com/%REPO%/releases/latest/download/latest-version.txt' -Headers @{'User-Agent'='csd-miner'} -UseBasicParsing).Content; ($t -split \"`n\")[0].Trim().TrimStart('v') } catch { '' }"`) do set "LATEST=%%v"
 if not defined LATEST goto :eof
 
 REM Decide whether LATEST is newer than INSTALLED. Prefer the binary's OWN
@@ -177,31 +181,46 @@ if exist "!SUMS!" (
 )
 
 REM 3. Verify before swapping. Prefer the TRUSTED running %BIN%'s verify-file -
-REM    never let the just-downloaded staged binary verify itself. If %BIN%
-REM    predates verify-file, FAIL CLOSED. If no SHA256SUMS was published
-REM    (pre-P4 release), log and accept the download rather than blocking.
-if defined WANT (
-  if exist "%BIN%" (
-    "%BIN%" verify-file --help >nul 2>&1
-    if !errorlevel!==0 (
-      "%BIN%" verify-file "!NEWBIN!" "!WANT!" >nul 2>&1
-      if not !errorlevel!==0 (
-        echo [%time%] [X] SHA-256 verify FAILED for %EXE% - discarding it, keeping the running binary.
-        del /f /q "!NEWBIN!" >nul 2>&1
-        goto :eof
-      )
-    ) else (
-      echo [%time%] [X] cannot verify ^(running binary predates verify-file^) - refusing. Install v0.1.8+ once, then auto-update verifies.
+REM    never let the just-downloaded staged binary verify itself. On first run
+REM    (no prior %BIN% to verify with) fall back to PowerShell Get-FileHash as the
+REM    OS trusted verifier - mirroring the Linux launchers' sha256sum fallback -
+REM    so even the very first install is integrity-checked, not blindly accepted.
+REM FIX #9: FAIL CLOSED. No SHA256SUMS (or %EXE% not listed), a hash mismatch, or
+REM no usable verifier all REFUSE the update and keep whatever %BIN% exists. Live
+REM releases (v0.1.7+) always publish SHA256SUMS, so a missing one is anomalous,
+REM not routine. We NEVER swap in an unverified binary.
+if not defined WANT (
+  echo [%time%] [X] refusing unverified update: no SHA256SUMS published ^(or %EXE% not listed in it^). Keeping the running binary.
+  del /f /q "!NEWBIN!" >nul 2>&1
+  goto :eof
+)
+set "VERIFIED=0"
+if exist "%BIN%" (
+  "%BIN%" verify-file --help >nul 2>&1
+  if !errorlevel!==0 (
+    "%BIN%" verify-file "!NEWBIN!" "!WANT!" >nul 2>&1
+    if !errorlevel!==0 ( set "VERIFIED=1" ) else (
+      echo [%time%] [X] SHA-256 verify FAILED for %EXE% - discarding it, keeping the running binary.
       del /f /q "!NEWBIN!" >nul 2>&1
       goto :eof
     )
-  ) else (
-    REM First run, no prior binary to verify with: accept the staged download so
-    REM we have something to run; subsequent updates verify against it.
-    echo [%time%] [!] no prior binary to verify with ^(first install^) - accepting the download.
   )
-) else (
-  echo [%time%] [!] no SHA256SUMS published for this release ^(or %EXE% not listed^) - skipping integrity verify ^(pre-P4 release^).
+)
+if "!VERIFIED!"=="0" (
+  REM No trusted running binary verifier (first install, or %BIN% predates
+  REM verify-file). Use PowerShell Get-FileHash as the OS verifier.
+  set "GOT="
+  for /f "usebackq delims=" %%h in (`powershell -NoProfile -Command "try { (Get-FileHash -Algorithm SHA256 -LiteralPath '!NEWBIN!').Hash.ToLower() } catch { '' }"`) do set "GOT=%%h"
+  if not defined GOT (
+    echo [%time%] [X] refusing unverified update: have a SHA256SUMS digest but no usable verifier ^(no verify-file, Get-FileHash failed^). Keeping current.
+    del /f /q "!NEWBIN!" >nul 2>&1
+    goto :eof
+  )
+  if /i not "!GOT!"=="!WANT!" (
+    echo [%time%] [X] SHA-256 verify FAILED for %EXE% ^(got !GOT! want !WANT!^) - discarding it.
+    del /f /q "!NEWBIN!" >nul 2>&1
+    goto :eof
+  )
 )
 
 REM 4. Verified (or verify intentionally skipped): swap atomically. In poll mode,
@@ -218,6 +237,6 @@ REM Normalise INSTALLED to a bare semver for the next compare.
 for /f "usebackq delims=" %%v in (`powershell -NoProfile -Command "$m=[regex]::Match('!INSTALLED!','[0-9]+\.[0-9]+\.[0-9]+'); if($m.Success){$m.Value}else{'!INSTALLED!'}"`) do set "INSTALLED=%%v"
 if /i "!MODE!"=="poll" (
   call :start_all
-  echo [%time%] now mining !INSTALLED! on !NGPU! GPU(s) (build: %VARIANT%).
+  echo [%time%] now mining !INSTALLED! on !NGPU! GPU^(s^) ^(build: %VARIANT%^).
 )
 goto :eof

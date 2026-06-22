@@ -173,9 +173,14 @@ REM  Subroutines
 REM ============================================================
 
 :update_check
-REM Query the latest published release tag (no pipe -> safe in for/f).
+REM FIX #8: resolve the latest version from the releases/latest/download/ CDN
+REM asset latest-version.txt, NOT api.github.com. The unauthenticated API caps at
+REM 60 req/hr/IP, so ~20 rigs behind ONE public IP (a farm) get HTTP 403, an empty
+REM tag, and the whole farm SILENTLY stops updating. The CDN download path has no
+REM such per-IP limit. On offline/404 LATEST stays empty and we cleanly no-op
+REM (keep mining) - we do NOT fall back to the rate-limited API.
 set "LATEST="
-for /f "usebackq delims=" %%v in (`powershell -NoProfile -Command "try { (Invoke-RestMethod -Uri 'https://api.github.com/repos/%REPO%/releases/latest' -Headers @{'User-Agent'='csd-miner'}).tag_name } catch { '' }"`) do set "LATEST=%%v"
+for /f "usebackq delims=" %%v in (`powershell -NoProfile -Command "try { $t=(Invoke-WebRequest -Uri 'https://github.com/%REPO%/releases/latest/download/latest-version.txt' -Headers @{'User-Agent'='csd-miner'} -UseBasicParsing).Content; ($t -split \"`n\")[0].Trim().TrimStart('v') } catch { '' }"`) do set "LATEST=%%v"
 if not defined LATEST goto :eof
 
 REM Decide whether LATEST is newer than INSTALLED. Prefer the miner's OWN
@@ -242,7 +247,12 @@ if defined WANT (
     goto :eof
   )
 ) else (
-  echo [%time%] [!] no SHA256SUMS published for this release ^(or %EXE% not listed^) - skipping integrity verify ^(pre-P4 release^).
+  REM FIX #9: FAIL CLOSED. Live releases ^(v0.1.7+^) always publish SHA256SUMS, so a
+  REM missing SHA256SUMS ^(or %EXE% not listed^) is anomalous - refuse the update and
+  REM keep running the EXISTING binary rather than swapping in an unverified one.
+  echo [%time%] [X] refusing unverified update: no SHA256SUMS published ^(or %EXE% not listed in it^). Keeping the running binary.
+  del /f /q "!NEWBIN!" >nul 2>&1
+  goto :eof
 )
 
 REM 4. Verified (or verify intentionally skipped): stop miners + relay, atomically
