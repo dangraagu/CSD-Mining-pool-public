@@ -6,21 +6,33 @@
 //! `--stats-port` HTTP server that serves it (and pulls the live hashrate +
 //! [`HealthSnapshot`]) is wired separately.
 
+use crate::nvml::TelemetrySample;
 use crate::stratum::client::HealthSnapshot;
 
 /// Build an xmrig `/1/summary`-shaped JSON summary from the worker id, the live
 /// [`HealthSnapshot`], the three hashrate windows (10s / 60s / 15m, in **GH/s**),
-/// and uptime. Pure → unit-tested. xmrig reports hashrate in H/s, so the GH/s
-/// inputs are scaled by 1e9.
+/// uptime, and an optional GPU [`TelemetrySample`] (temp/power). Pure →
+/// unit-tested. xmrig reports hashrate in H/s, so the GH/s inputs are scaled by
+/// 1e9.
+///
+/// GPU telemetry (`telemetry`): when the optional `nvml` feature is OFF (or NVML
+/// is unavailable, or the metric isn't readable on this card) both `temp_c` and
+/// `power_w` are `None` and the corresponding `health.gpu_temp_c` /
+/// `health.gpu_power_w` fields are **omitted** from the JSON — so the default
+/// build's summary is byte-identical to the pre-nvml build (zero behaviour
+/// change). When present they live under a csd `"health"` extension object
+/// (xmrig consumers ignore unknown fields); HiveOS reads `gpu_temp_c` from there
+/// to populate its `temp[]`.
 pub fn summary_json(
     worker: &str,
     health: &HealthSnapshot,
     hashrate_ghs: [f64; 3],
     uptime_s: u64,
+    telemetry: TelemetrySample,
 ) -> serde_json::Value {
     let hs: Vec<f64> = hashrate_ghs.iter().map(|g| g * 1e9).collect();
     let highest = hs.iter().copied().fold(0.0_f64, f64::max);
-    serde_json::json!({
+    let mut v = serde_json::json!({
         "id": "csd-pool-miner",
         "worker_id": worker,
         "version": env!("CARGO_PKG_VERSION"),
@@ -47,7 +59,22 @@ pub fn summary_json(
             "reconnects": health.reconnects,
             "failovers": health.failovers,
         },
-    })
+    });
+
+    // csd GPU-telemetry extension. Only emit a metric that is actually readable
+    // (Some) — a `None` (feature off / non-NVIDIA host / unsupported sensor) is
+    // OMITTED, so the default build's JSON is unchanged vs the fleet release.
+    let mut hobj = serde_json::Map::new();
+    if let Some(t) = telemetry.temp_c {
+        hobj.insert("gpu_temp_c".to_string(), serde_json::json!(t));
+    }
+    if let Some(p) = telemetry.power_w {
+        hobj.insert("gpu_power_w".to_string(), serde_json::json!(p));
+    }
+    if !hobj.is_empty() {
+        v["health"] = serde_json::Value::Object(hobj);
+    }
+    v
 }
 
 /// The routes the `--stats-port` server answers.
@@ -165,7 +192,7 @@ mod tests {
             reconnects: 4,
             failovers: 2,
         };
-        let v = summary_json("csd1abc", &h, [1.0, 1.2, 1.1], 3600);
+        let v = summary_json("csd1abc", &h, [1.0, 1.2, 1.1], 3600, TelemetrySample::none());
         assert_eq!(v["worker_id"], "csd1abc");
         assert_eq!(v["uptime"], 3600);
         assert_eq!(v["results"]["shares_good"], 5);
@@ -178,6 +205,49 @@ mod tests {
         assert_eq!(total.len(), 3);
         assert_eq!(total[0], 1.0e9); // 1 GH/s → 1e9 H/s
         assert_eq!(v["hashrate"]["highest"], 1.2e9);
+    }
+
+    fn h_fixture() -> HealthSnapshot {
+        HealthSnapshot {
+            accepted: 5,
+            rejected: 1,
+            stale: 2,
+            submitted: 9,
+            job_age_s: Some(3),
+            endpoint: "pool.test:3333".to_string(),
+            reconnects: 0,
+            failovers: 0,
+        }
+    }
+
+    #[test]
+    fn summary_omits_gpu_telemetry_when_absent() {
+        // No telemetry (feature off / NVML unavailable) ⇒ NO `health` object at
+        // all, so the default build's summary is byte-identical to pre-nvml.
+        let v = summary_json("w", &h_fixture(), [1.0, 1.0, 1.0], 1, TelemetrySample::none());
+        assert!(v.get("health").is_none(), "absent telemetry must omit the health object");
+    }
+
+    #[test]
+    fn summary_includes_gpu_temp_and_power_when_present() {
+        let s = TelemetrySample { temp_c: Some(63.0), power_w: Some(142.5) };
+        let v = summary_json("w", &h_fixture(), [1.0, 1.0, 1.0], 1, s);
+        assert_eq!(v["health"]["gpu_temp_c"], 63.0);
+        assert_eq!(v["health"]["gpu_power_w"], 142.5);
+    }
+
+    #[test]
+    fn summary_emits_only_the_readable_metric() {
+        // Temp readable but power not (or vice-versa): only the readable one shows.
+        let temp_only = TelemetrySample { temp_c: Some(70.0), power_w: None };
+        let v = summary_json("w", &h_fixture(), [1.0, 1.0, 1.0], 1, temp_only);
+        assert_eq!(v["health"]["gpu_temp_c"], 70.0);
+        assert!(v["health"].get("gpu_power_w").is_none(), "absent power omitted");
+
+        let power_only = TelemetrySample { temp_c: None, power_w: Some(99.0) };
+        let v2 = summary_json("w", &h_fixture(), [1.0, 1.0, 1.0], 1, power_only);
+        assert_eq!(v2["health"]["gpu_power_w"], 99.0);
+        assert!(v2["health"].get("gpu_temp_c").is_none(), "absent temp omitted");
     }
 
     #[test]

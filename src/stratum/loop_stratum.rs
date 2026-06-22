@@ -36,6 +36,7 @@ use crate::sha256d_cpu::{finish_sha256d_from_midstate_fast, midstate_of_first_ch
 use crate::stratum::client::{HealthSnapshot, StratumClient, StratumJob};
 use crate::stratum::mapping::{build_submit, compose_extranonce, notify_to_template};
 use crate::stratum::watchdog::{spawn_watchdog, WatchdogCfg, WatchdogView};
+use crate::thermal::ThermalGate;
 use crate::consensus_types::WorkTemplate;
 
 /// A solved share, handed from the mining loop to [`WorkSource::submit_solution`].
@@ -370,6 +371,14 @@ struct LoopGpuView<'a, B: Recoverable, W: WorkSource> {
     /// the gpu_watchdog module), but this keeps the door open and documents that
     /// `escalate_exit` is a hard process kill.
     exit_on_escalate: bool,
+    /// The thermal-throttle gate (OPTIONAL `nvml` build). While it is paused, the
+    /// loop deliberately skips GPU launches to let the card cool — so the GPU is
+    /// idle ON PURPOSE, not hung. The watchdog MUST NOT mistake that for a stall:
+    /// `jobs_flowing()` reports FALSE whenever the gate is paused, which makes
+    /// `gpu_watchdog_tick` reset the floored streak and stand down for the
+    /// duration. On the default build (no thermal limit) the gate is never paused,
+    /// so this is a no-op and behaviour is byte-identical to the pre-nvml loop.
+    thermal_gate: Arc<ThermalGate>,
 }
 
 impl<'a, B: Recoverable + Sync, W: WorkSource + Sync> GpuWatchdogView for LoopGpuView<'a, B, W> {
@@ -393,9 +402,23 @@ impl<'a, B: Recoverable + Sync, W: WorkSource + Sync> GpuWatchdogView for LoopGp
         ghs
     }
     fn jobs_flowing(&self) -> bool {
+        // A thermal pause makes the GPU intentionally idle: report "no work
+        // flowing" so the watchdog treats it as benign idle (resets the floored
+        // streak) instead of a hung GPU. This is the SAFETY wire that stops the
+        // exit(17) stall path from firing during a deliberate temperature pause.
+        if self.thermal_gate.is_paused() {
+            return false;
+        }
         jobs_flowing_from_health(&self.client.health())
     }
     fn conn_healthy(&self) -> bool {
+        // Same rationale as `jobs_flowing`: while thermally paused the GPU is idle
+        // by design, so the link-health gate (which also stands the watchdog down)
+        // reports false too. Belt-and-braces — either gate alone is sufficient,
+        // but both make the "paused ⇒ not a stall" intent explicit.
+        if self.thermal_gate.is_paused() {
+            return false;
+        }
         conn_healthy_from_health(&self.client.health())
     }
     fn recover(&self) -> bool {
@@ -530,7 +553,39 @@ pub fn run_stratum<B: MiningBackend + Recoverable + Sync, W: WorkSource + Sync>(
     )
 }
 
-/// Run the pooled Stratum mining loop with an optional **GPU stall watchdog**.
+/// Run the pooled Stratum mining loop with BOTH the optional GPU stall watchdog
+/// and an optional **thermal-throttle gate** (OPTIONAL `nvml` build).
+///
+/// Identical to [`run_stratum_with_gpu_watchdog`] but additionally honours a
+/// shared [`ThermalGate`]: while the gate is paused (the GPU is over its
+/// configured temperature limit), the loop SKIPS GPU launches so the card can
+/// cool, and the GPU stall watchdog stands down (the loop view reports the GPU
+/// as intentionally idle, NOT floored — so a thermal pause can never trip the
+/// hung-GPU exit(17)). A never-paused gate (the default build, or no
+/// `--temp-limit`) makes this byte-identical to
+/// [`run_stratum_with_gpu_watchdog`]. The gate is driven by the caller's thermal
+/// poller (see [`crate::thermal::spawn_thermal_poller`]).
+pub fn run_stratum_with_gpu_watchdog<B: MiningBackend + Recoverable + Sync, W: WorkSource + Sync>(
+    backend: &B,
+    client: &W,
+    stop: Arc<AtomicBool>,
+    cfg: MiningConfig,
+    gpu_wd_cfg: GpuWatchdogCfg,
+) -> Result<()> {
+    // Default: a gate that is never paused (no thermal throttle). Identical
+    // behaviour to the pre-thermal loop.
+    run_stratum_full(
+        backend,
+        client,
+        stop,
+        cfg,
+        gpu_wd_cfg,
+        Arc::new(ThermalGate::new()),
+    )
+}
+
+/// Run the pooled Stratum mining loop with an optional **GPU stall watchdog**
+/// plus an optional **thermal-throttle gate**.
 ///
 /// Identical to [`run_stratum`] but additionally samples the GPU-only hashrate
 /// every `gpu_wd_cfg.poll`; if it stays floored while fresh jobs flow over a
@@ -540,12 +595,19 @@ pub fn run_stratum<B: MiningBackend + Recoverable + Sync, W: WorkSource + Sync>(
 /// `backend`/`client` without a `'static` bound; it joins automatically when the
 /// loop returns. With `gpu_wd_cfg.enabled == false` the watchdog thread exits
 /// immediately and behaviour is byte-identical to the pre-watchdog loop.
-pub fn run_stratum_with_gpu_watchdog<B: MiningBackend + Recoverable + Sync, W: WorkSource + Sync>(
+///
+/// `thermal_gate`: while it is paused (GPU over its configured temperature
+/// limit), the loop SKIPS GPU launches and the watchdog stands down (the GPU is
+/// idle by design, not stalled). A never-paused gate (the default build) is a
+/// no-op. Most callers/tests use [`run_stratum_with_gpu_watchdog`], which passes
+/// a never-paused gate; the `nvml` build's `main` passes a live gate.
+pub fn run_stratum_full<B: MiningBackend + Recoverable + Sync, W: WorkSource + Sync>(
     backend: &B,
     client: &W,
     stop: Arc<AtomicBool>,
     cfg: MiningConfig,
     gpu_wd_cfg: GpuWatchdogCfg,
+    thermal_gate: Arc<ThermalGate>,
 ) -> Result<()> {
     // Re-derive fresh work this often even if no new notify arrived, so a
     // long-lived job picks up difficulty changes and ntime drift promptly.
@@ -620,6 +682,7 @@ pub fn run_stratum_with_gpu_watchdog<B: MiningBackend + Recoverable + Sync, W: W
             gpu_sample: Arc::clone(&gpu_sample),
             sample_stale_after_ms,
             exit_on_escalate: true,
+            thermal_gate: Arc::clone(&thermal_gate),
         };
         let gpu_wd_stop = Arc::clone(&stop);
         scope.spawn(move || {
@@ -712,6 +775,22 @@ pub fn run_stratum_with_gpu_watchdog<B: MiningBackend + Recoverable + Sync, W: W
                 if j.notify.job_id != work.job_id {
                     break;
                 }
+            }
+
+            // THERMAL THROTTLE (OPTIONAL nvml build): if the GPU is over its
+            // configured temperature limit, the thermal poller has paused the
+            // gate. Skip GPU launches entirely while paused so the card cools —
+            // do NOT dispatch `hash_range`, do NOT roll xn2, just nap and re-check
+            // (the poller resumes the gate once the temperature falls below the
+            // resume threshold). The GPU stall watchdog stands down meanwhile
+            // because the loop view reports the GPU as intentionally idle (see
+            // `LoopGpuView::jobs_flowing`), so a thermal pause can never be
+            // mistaken for a hung GPU. On the default build the gate is never
+            // paused, so this branch is never taken. We still break out promptly
+            // on `stop` (checked at the top of the loop) and on a refresh/new job.
+            if thermal_gate.is_paused() {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
             }
 
             // Compose the full 8-byte extranonce: low = pool xn1, high = our xn2.
@@ -1753,6 +1832,7 @@ mod tests {
             gpu_sample: Arc::clone(&sample),
             sample_stale_after_ms: 1_000,
             exit_on_escalate: false, // never kill the test runner
+            thermal_gate: Arc::new(ThermalGate::new()), // never paused here
         };
         // Before any sample: healthy sentinel (not floored).
         assert!(view.gpu_ghs().is_infinite(), "no sample yet ⇒ not floored");
@@ -1765,6 +1845,107 @@ mod tests {
         // kernel that stopped completing launches.
         sample.publish(3.0, now_unix_ms().saturating_sub(2_000));
         assert_eq!(view.gpu_ghs(), 0.0, "stale heartbeat ⇒ floored");
+    }
+
+    // --- THERMAL pause must NOT be misread as a hung GPU (the safety wire) ---
+
+    /// A standalone [`LoopGpuView`] with a hand-driven thermal gate + a work
+    /// source reporting FRESH jobs. The whole point: while the gate is PAUSED,
+    /// `jobs_flowing()`/`conn_healthy()` must report FALSE (the GPU is idle by
+    /// design), even though the work source says jobs are flowing — so the stall
+    /// watchdog stands down. When the gate is NOT paused, they track the work
+    /// source as normal.
+    #[test]
+    fn loop_gpu_view_thermal_pause_reports_not_flowing() {
+        struct Noop;
+        impl Recoverable for Noop {}
+        // Fresh jobs ⇒ without a thermal pause, jobs_flowing()/conn_healthy() = true.
+        let work = MockWorkSource::new(mock_job(), 1.0).with_fresh_jobs();
+        let backend = Noop;
+        let sample = Arc::new(GpuHashrateSample::new());
+        let gate = Arc::new(ThermalGate::new());
+        let view = LoopGpuView {
+            backend: &backend,
+            client: &work,
+            gpu_sample: Arc::clone(&sample),
+            sample_stale_after_ms: 1_000,
+            exit_on_escalate: false,
+            thermal_gate: Arc::clone(&gate),
+        };
+        // NOT paused: fresh jobs ⇒ both true (the watchdog could act on a real floor).
+        assert!(view.jobs_flowing(), "fresh jobs + not paused ⇒ flowing");
+        assert!(view.conn_healthy(), "fresh jobs + not paused ⇒ healthy");
+        // PAUSE the gate (GPU over temperature limit): both go FALSE so the
+        // watchdog treats the GPU as benign idle, never a stall.
+        gate.apply(crate::thermal::ThermalState::Paused);
+        assert!(!view.jobs_flowing(), "thermally paused ⇒ NOT flowing (idle by design)");
+        assert!(!view.conn_healthy(), "thermally paused ⇒ NOT healthy-for-stall");
+        // Resume: back to tracking the (fresh) work source.
+        gate.apply(crate::thermal::ThermalState::Running);
+        assert!(view.jobs_flowing(), "resumed ⇒ flowing again");
+        assert!(view.conn_healthy(), "resumed ⇒ healthy again");
+    }
+
+    /// The end-to-end safety property in pure form: drive `gpu_watchdog_tick`
+    /// (the real watchdog decision+state machine) against the live
+    /// [`LoopGpuView`] while the GPU reads a FLOORED 0.0 GH/s for many samples,
+    /// but the thermal gate is PAUSED. Because the paused view reports
+    /// `jobs_flowing == false`, every tick must RESET the floored streak and
+    /// return `Ok` — NEVER `Recover`/`Exit`. This is the test that proves an
+    /// intentional thermal pause cannot trip the hung-GPU exit(17).
+    #[test]
+    fn thermal_pause_prevents_watchdog_from_flooring_a_paused_gpu() {
+        struct Noop;
+        impl Recoverable for Noop {}
+        let work = MockWorkSource::new(mock_job(), 1.0).with_fresh_jobs();
+        let backend = Noop;
+        let sample = Arc::new(GpuHashrateSample::new());
+        // Publish a genuinely floored, FRESH sample: absent the thermal pause this
+        // would (with jobs flowing) be a textbook stall the watchdog acts on.
+        sample.publish(0.0, now_unix_ms());
+        let gate = Arc::new(ThermalGate::new());
+        gate.apply(crate::thermal::ThermalState::Paused); // GPU paused for temperature
+        let view = LoopGpuView {
+            backend: &backend,
+            client: &work,
+            gpu_sample: Arc::clone(&sample),
+            sample_stale_after_ms: 60_000, // keep the sample "fresh" for the test
+            exit_on_escalate: false,       // never kill the runner even on a bug
+            thermal_gate: Arc::clone(&gate),
+        };
+        // A watchdog cfg that would act FAST on a real floor (dwell 1, recovery on).
+        let cfg = GpuWatchdogCfg {
+            enabled: true,
+            floor_ghs: 0.001,
+            dwell_samples: 1,
+            recover_window: Duration::from_secs(3600),
+            max_recoveries: 3,
+            poll: Duration::from_millis(5),
+        };
+        let mut st = GpuWatchdogState::default();
+        let mut now = now_unix_ms();
+        for _ in 0..20 {
+            let action = gpu_watchdog_tick(&view, cfg, &mut st, now);
+            assert_eq!(
+                action,
+                crate::gpu_watchdog::GpuWatchdogAction::Ok,
+                "a thermally-paused GPU must never be acted on (no Recover/Exit)"
+            );
+            // The streak must stay reset (paused ⇒ not-flowing ⇒ reset every tick).
+            assert_eq!(st.floored_streak, 0, "paused ⇒ floored streak stays reset");
+            now += 15_000;
+        }
+        // Now RESUME the gate and keep the SAME floored sample fresh: the watchdog
+        // must once again be able to see the floor (jobs flowing) and act — proving
+        // the stand-down was due to the pause, not a permanently-broken watchdog.
+        gate.apply(crate::thermal::ThermalState::Running);
+        sample.publish(0.0, now); // still floored, fresh
+        let action = gpu_watchdog_tick(&view, cfg, &mut st, now);
+        assert_eq!(
+            action,
+            crate::gpu_watchdog::GpuWatchdogAction::Recover,
+            "once resumed, a real floor with fresh jobs is actionable again"
+        );
     }
 
     /// Drive the REAL `run_stratum_with_gpu_watchdog` with the watchdog ENABLED
@@ -1926,6 +2107,124 @@ mod tests {
             work.submits.lock().unwrap().is_empty(),
             "no share at diff 1024 in the brief window"
         );
+    }
+
+    /// Drive the REAL `run_stratum_full` with the thermal gate PAUSED from the
+    /// start: the loop must SKIP GPU launches (never dispatch the backend) while
+    /// paused, and shut down cleanly on `stop`. Then a second run with the gate
+    /// un-paused proves the same setup DOES dispatch — so the skip is caused by
+    /// the pause, not by a wiring mistake.
+    #[test]
+    fn thermal_paused_loop_skips_gpu_launches() {
+        // --- paused: backend must NOT be dispatched ---
+        let work = Arc::new(MockWorkSource::new(mock_job(), 1024.0));
+        let backend = Arc::new(MockBackend::new(vec![]));
+        let stop = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(ThermalGate::new());
+        gate.apply(crate::thermal::ThermalState::Paused); // start paused (GPU hot)
+
+        let work_for_loop = Arc::clone(&work);
+        let backend_for_loop = Arc::clone(&backend);
+        let stop_for_loop = Arc::clone(&stop);
+        let gate_for_loop = Arc::clone(&gate);
+        let handle = std::thread::spawn(move || {
+            let cfg = MiningConfig { cpu_threads: 0, cpu_share: 0.0 };
+            run_stratum_full(
+                backend_for_loop.as_ref(),
+                work_for_loop.as_ref(),
+                stop_for_loop,
+                cfg,
+                GpuWatchdogCfg { enabled: false, ..GpuWatchdogCfg::default() },
+                gate_for_loop,
+            )
+        });
+        // Give the loop ample time to spin: while paused it must keep skipping.
+        std::thread::sleep(Duration::from_millis(200));
+        let calls_while_paused = backend.calls.load(Ordering::Relaxed);
+        stop.store(true, Ordering::Relaxed);
+        assert!(handle.join().expect("no panic").is_ok());
+        assert_eq!(
+            calls_while_paused, 0,
+            "a thermally-paused loop must NOT dispatch the GPU backend, got {calls_while_paused} calls"
+        );
+        assert!(work.submits.lock().unwrap().is_empty(), "paused ⇒ no submits");
+
+        // --- not paused (same setup): backend IS dispatched (control) ---
+        let work2 = Arc::new(MockWorkSource::new(mock_job(), 1024.0));
+        let backend2 = Arc::new(MockBackend::new(vec![]));
+        let stop2 = Arc::new(AtomicBool::new(false));
+        let gate2 = Arc::new(ThermalGate::new()); // never paused
+        let work2_l = Arc::clone(&work2);
+        let backend2_l = Arc::clone(&backend2);
+        let stop2_l = Arc::clone(&stop2);
+        let gate2_l = Arc::clone(&gate2);
+        let handle2 = std::thread::spawn(move || {
+            let cfg = MiningConfig { cpu_threads: 0, cpu_share: 0.0 };
+            run_stratum_full(
+                backend2_l.as_ref(),
+                work2_l.as_ref(),
+                stop2_l,
+                cfg,
+                GpuWatchdogCfg { enabled: false, ..GpuWatchdogCfg::default() },
+                gate2_l,
+            )
+        });
+        for _ in 0..300 {
+            if backend2.calls.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop2.store(true, Ordering::Relaxed);
+        assert!(handle2.join().expect("no panic").is_ok());
+        assert!(
+            backend2.calls.load(Ordering::Relaxed) > 0,
+            "the un-paused control run MUST dispatch the backend (proves the skip is the pause)"
+        );
+    }
+
+    /// A thermal pause that LIFTS mid-run: start paused (no dispatch), then
+    /// un-pause the gate — the loop must resume and dispatch the backend. Proves
+    /// resume actually re-enables launches (not a one-way latch).
+    #[test]
+    fn thermal_resume_re_enables_gpu_launches() {
+        let work = Arc::new(MockWorkSource::new(mock_job(), 1024.0));
+        let backend = Arc::new(MockBackend::new(vec![]));
+        let stop = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(ThermalGate::new());
+        gate.apply(crate::thermal::ThermalState::Paused);
+
+        let work_l = Arc::clone(&work);
+        let backend_l = Arc::clone(&backend);
+        let stop_l = Arc::clone(&stop);
+        let gate_l = Arc::clone(&gate);
+        let handle = std::thread::spawn(move || {
+            let cfg = MiningConfig { cpu_threads: 0, cpu_share: 0.0 };
+            run_stratum_full(
+                backend_l.as_ref(),
+                work_l.as_ref(),
+                stop_l,
+                cfg,
+                GpuWatchdogCfg { enabled: false, ..GpuWatchdogCfg::default() },
+                gate_l,
+            )
+        });
+        // Paused first: no dispatch.
+        std::thread::sleep(Duration::from_millis(120));
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 0, "paused ⇒ no dispatch yet");
+        // Lift the pause: the loop must start dispatching.
+        gate.apply(crate::thermal::ThermalState::Running);
+        let mut dispatched = false;
+        for _ in 0..300 {
+            if backend.calls.load(Ordering::Relaxed) > 0 {
+                dispatched = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert!(handle.join().expect("no panic").is_ok());
+        assert!(dispatched, "resuming the gate must re-enable GPU launches");
     }
 
     /// With the watchdog DISABLED (the `run_stratum` shim's path), behaviour is

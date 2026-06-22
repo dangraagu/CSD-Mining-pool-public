@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::nvml::TelemetrySample;
 use crate::stats::{self, HashrateWindows, StatsRoute};
 use crate::stratum::client::HealthSnapshot;
 
@@ -48,6 +49,11 @@ pub struct StatsHandle {
     /// Keeping it here (rather than calling the live work source per request)
     /// means the server needs only the handle, not a reference to the client.
     health: Mutex<HealthSnapshot>,
+    /// Latest GPU telemetry sample (temp/power), pushed by the optional thermal/
+    /// telemetry poller (the `nvml` build). Defaults to an empty sample
+    /// (`None`/`None`) so the unconfigured / non-nvml build serves no GPU
+    /// temp/power — byte-identical to the pre-nvml summary.
+    telemetry: Mutex<TelemetrySample>,
     /// Process/server start, in UNIX-epoch milliseconds.
     started_ms: u64,
 }
@@ -58,6 +64,7 @@ impl StatsHandle {
         StatsHandle {
             hashrate: Mutex::new(HashrateWindows::new()),
             health: Mutex::new(HealthSnapshot::default()),
+            telemetry: Mutex::new(TelemetrySample::none()),
             started_ms: now_ms(),
         }
     }
@@ -97,6 +104,23 @@ impl StatsHandle {
     /// The last-pushed health snapshot (default/empty until the loop pushes one).
     pub fn health(&self) -> HealthSnapshot {
         self.health.lock().map(|h| h.clone()).unwrap_or_default()
+    }
+
+    /// Push the latest GPU telemetry sample (temp/power) — the optional thermal/
+    /// telemetry poller calls this on the `nvml` build. A poisoned lock is
+    /// silently skipped (telemetry must never take a thread down). No-op in
+    /// practice on the default build (the poller never runs, so this is never
+    /// called and the served sample stays empty).
+    pub fn set_telemetry(&self, t: TelemetrySample) {
+        if let Ok(mut slot) = self.telemetry.lock() {
+            *slot = t;
+        }
+    }
+
+    /// The last-pushed GPU telemetry sample (empty `None`/`None` until a poller
+    /// pushes one — i.e. always empty on the non-nvml build).
+    pub fn telemetry(&self) -> TelemetrySample {
+        self.telemetry.lock().map(|t| *t).unwrap_or_default()
     }
 }
 
@@ -229,7 +253,9 @@ fn serve_one(
                 let health = (health)();
                 let windows = handle.windows();
                 let uptime = handle.uptime_s();
-                let body = stats::summary_json(worker, &health, windows, uptime).to_string();
+                let telemetry = handle.telemetry();
+                let body =
+                    stats::summary_json(worker, &health, windows, uptime, telemetry).to_string();
                 stats::http_response(200, "application/json", &body)
             } else {
                 stats::http_response(401, "text/plain", "unauthorized")
@@ -625,6 +651,35 @@ mod tests {
         assert_eq!(got.accepted, 11);
         assert_eq!(got.submitted, 14);
         assert_eq!(got.endpoint, "pool.x:3333");
+    }
+
+    #[test]
+    fn stats_handle_telemetry_round_trips() {
+        let h = StatsHandle::new();
+        // Empty until a poller pushes (always empty on the non-nvml build).
+        assert_eq!(h.telemetry(), TelemetrySample::none());
+        h.set_telemetry(TelemetrySample { temp_c: Some(58.0), power_w: Some(120.0) });
+        let got = h.telemetry();
+        assert_eq!(got.temp_c, Some(58.0));
+        assert_eq!(got.power_w, Some(120.0));
+    }
+
+    #[test]
+    fn summary_serves_pushed_gpu_telemetry() {
+        let (addr, join, stop, h) = start_server(None);
+        // No telemetry pushed yet ⇒ summary has no `health` object.
+        let resp0 = http_get_raw(addr, "GET /1/summary HTTP/1.1\r\n\r\n");
+        let (_s0, body0) = split_response(&resp0);
+        let v0: serde_json::Value = serde_json::from_str(&body0).expect("json");
+        assert!(v0.get("health").is_none(), "no telemetry ⇒ no health object");
+        // Push a telemetry sample; it must now show through `/1/summary`.
+        h.set_telemetry(TelemetrySample { temp_c: Some(67.0), power_w: Some(155.0) });
+        let resp = http_get_raw(addr, "GET /1/summary HTTP/1.1\r\n\r\n");
+        let (_s, body) = split_response(&resp);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["health"]["gpu_temp_c"], 67.0);
+        assert_eq!(v["health"]["gpu_power_w"], 155.0);
+        stop_and_join(stop, join);
     }
 
     /// End-to-end D2: wire the server exactly as `main` does — the health closure
