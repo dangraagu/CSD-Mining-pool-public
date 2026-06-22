@@ -225,34 +225,50 @@ if exist "!SUMS!" (
   del /f /q "!SUMS!" >nul 2>&1
 )
 
-REM 3. Verify before swapping. Prefer the miner's tested verify-file (the
-REM    currently-running %BIN% if it supports it, else the freshly downloaded
-REM    one). If no SHA256SUMS was published (pre-P4 release), log and accept the
-REM    download rather than hard-blocking updates.
-if defined WANT (
-  REM Verify with the TRUSTED running %BIN% ONLY - never let the just-downloaded
-  REM staged binary verify itself (a malicious download would pass its own check).
-  REM If %BIN% predates verify-file, FAIL CLOSED rather than swap in unverified.
+REM 3. Verify before swapping. Prefer the TRUSTED running %BIN%'s verify-file -
+REM    never let the just-downloaded staged binary verify itself (a malicious
+REM    download would pass its own check). FIX C-2: if %BIN% is absent or PREDATES
+REM    the verify-file subcommand (a pre-v0.1.8 binary), fall back to PowerShell
+REM    Get-FileHash as the OS trusted verifier - mirroring sibling mine-all-gpus.bat
+REM    and the Linux launchers' sha256sum fallback - so a pre-verify-file rig can
+REM    still verify + auto-advance instead of freezing forever on the old binary.
+REM FIX #9: FAIL CLOSED. No SHA256SUMS (or %EXE% not listed), a hash mismatch, or
+REM no usable verifier at all REFUSE the update and keep whatever %BIN% exists.
+REM Live releases (v0.1.7+) always publish SHA256SUMS, so a missing one is
+REM anomalous, not routine. We NEVER swap in an unverified binary.
+if not defined WANT (
+  echo [%time%] [X] refusing unverified update: no SHA256SUMS published ^(or %EXE% not listed in it^). Keeping the running binary.
+  del /f /q "!NEWBIN!" >nul 2>&1
+  goto :eof
+)
+set "VERIFIED=0"
+if exist "%BIN%" (
   "%BIN%" verify-file --help >nul 2>&1
   if !errorlevel!==0 (
     "%BIN%" verify-file "!NEWBIN!" "!WANT!" >nul 2>&1
-    if not !errorlevel!==0 (
+    if !errorlevel!==0 ( set "VERIFIED=1" ) else (
       echo [%time%] [X] SHA-256 verify FAILED for %EXE% - discarding it, keeping the running binary.
       del /f /q "!NEWBIN!" >nul 2>&1
       goto :eof
     )
-  ) else (
-    echo [%time%] [X] cannot verify ^(running binary predates verify-file^) - refusing. Install v0.1.8+ once manually, then auto-update verifies.
+  )
+)
+if "!VERIFIED!"=="0" (
+  REM No trusted running-binary verifier (first install, or %BIN% predates
+  REM verify-file). Use PowerShell Get-FileHash as the OS verifier. FAIL CLOSED if
+  REM it is unavailable (empty hash) or the digest does not match.
+  set "GOT="
+  for /f "usebackq delims=" %%h in (`powershell -NoProfile -Command "try { (Get-FileHash -Algorithm SHA256 -LiteralPath '!NEWBIN!').Hash.ToLower() } catch { '' }"`) do set "GOT=%%h"
+  if not defined GOT (
+    echo [%time%] [X] refusing unverified update: have a SHA256SUMS digest but no usable verifier ^(no verify-file, Get-FileHash failed^). Keeping current.
     del /f /q "!NEWBIN!" >nul 2>&1
     goto :eof
   )
-) else (
-  REM FIX #9: FAIL CLOSED. Live releases ^(v0.1.7+^) always publish SHA256SUMS, so a
-  REM missing SHA256SUMS ^(or %EXE% not listed^) is anomalous - refuse the update and
-  REM keep running the EXISTING binary rather than swapping in an unverified one.
-  echo [%time%] [X] refusing unverified update: no SHA256SUMS published ^(or %EXE% not listed in it^). Keeping the running binary.
-  del /f /q "!NEWBIN!" >nul 2>&1
-  goto :eof
+  if /i not "!GOT!"=="!WANT!" (
+    echo [%time%] [X] SHA-256 verify FAILED for %EXE% ^(got !GOT! want !WANT!^) - discarding it.
+    del /f /q "!NEWBIN!" >nul 2>&1
+    goto :eof
+  )
 )
 
 REM 4. Verified (or verify intentionally skipped): stop miners + relay, atomically

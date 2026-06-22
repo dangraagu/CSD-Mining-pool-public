@@ -180,7 +180,12 @@ ua_expected_sha() {
 ua_download_verify_swap() {
   variant="$(update_variant)"
   asset="csd-pool-miner-linux-$variant"
-  staged="$UPDATE_BIN.new"
+  # FIX C-4: per-process staging temp ("$UPDATE_BIN.new.$$") so the startup
+  # check and the background sidecar (two PIDs) can never collide on a single
+  # fixed ".new" file — a concurrent writer would otherwise corrupt the other's
+  # download. Every return path below rm's "$staged"; the success path mv's it
+  # away. Any stale ".new.*" from a hard-killed updater is swept at startup.
+  staged="$UPDATE_BIN.new.$$"
   if ! ua_download "https://github.com/$REPO/releases/latest/download/$asset" "$staged"; then
     if [ "$variant" != "cpu" ]; then
       echo "[h-run] auto-update: '$variant' build unavailable (404/failed); falling back to cpu build." | tee -a "$LOG"
@@ -297,8 +302,35 @@ hive_update_check_startup
 # running across the exec below (it becomes an init-owned orphan), polling for a
 # newer release and triggering a clean restart when one verifies. Output goes to
 # the miner log. It NEVER touches the live binary except via the verified swap.
-( hive_update_sidecar ) >> "$LOG" 2>&1 &
-echo "[h-run] auto-update sidecar started (PID=$!, poll every ${CHECK_MIN} min)." | tee -a "$LOG"
+#
+# FIX C-1: REAP any prior sidecar from a previous launch of THIS slot before
+# spawning a fresh one. A HiveOS-initiated restart that is NOT the sidecar's own
+# pkill (flightsheet edit, OC apply, GPU-watchdog restart, manual restart) re-runs
+# h-run.sh -> a NEW sidecar, while the OLD (sleeping) sidecar wakes, sees the miner
+# alive, and keeps polling -> N concurrent sidecars accumulate over uptime
+# (redundant CDN polls + multiple pkills on update). We tag the sidecar with the
+# UNIQUE marker `csd-hive-update-sidecar` (carried as argv[0] of its `bash -c`, so
+# it is visible to `pgrep -f`/`pkill -f` via /proc/<pid>/cmdline) and pkill that
+# marker here BEFORE spawning the new one — mirroring the relay orphan-cleanup at
+# the SP2 launch below. The marker is unique: it does NOT substring-match the
+# miner (csd-gpu-miner), the relay (csd-relay-node), or the launcher (h-run.sh),
+# so the reap can never kill the freshly-launched instance, the miner, or the
+# relay. A bare `pkill -f h-run.sh` is intentionally AVOIDED for that reason.
+SIDE_MARKER="csd-hive-update-sidecar"
+pkill -f "$SIDE_MARKER" 2>/dev/null || true
+# Sweep any stale per-pid staging temp ("$UPDATE_BIN.new.*", FIX C-4) left by an
+# updater that was hard-killed mid-download (e.g. a reaped sidecar), so they never
+# accumulate. The live binary itself is "$UPDATE_BIN" (no suffix) and is untouched.
+rm -f "$UPDATE_BIN".new.* 2>/dev/null || true
+# The sidecar is a shell function; to make its marker land in the process argv we
+# launch it via `bash -c '<fn>' <marker>` (argv[0]=<marker>). That child bash
+# needs the function and its whole call graph + the constants they read, so we
+# export them. Keep this export list in sync if a new ua_* helper is added.
+export -f hive_update_sidecar ua_latest_tag ua_installed_version ua_should_update \
+          ua_download_verify_swap ua_download ua_expected_sha update_variant
+export UPDATE_BIN REPO CHECK_MIN MINER_PROC LOG EXTRA_FLAGS
+bash -c 'hive_update_sidecar' "$SIDE_MARKER" >> "$LOG" 2>&1 &
+echo "[h-run] auto-update sidecar started (PID=$!, marker=$SIDE_MARKER, poll every ${CHECK_MIN} min)." | tee -a "$LOG"
 
 # ── SP2: csd-relay-node — canonical-anchor relay ─────────────────────────────
 # Must launch BEFORE exec (exec replaces this shell; once exec runs we cannot
