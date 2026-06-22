@@ -1,2 +1,6 @@
 *.sh   text eol=lf
+# systemd units + their EnvironmentFile are parsed on Linux; a stray CRLF would
+# corrupt directive values (e.g. a trailing \r inside ${CSD_ADDRESS}). Pin LF.
+*.service              text eol=lf
+deploy/systemd/*.env*  text eol=lf
 *      text=auto

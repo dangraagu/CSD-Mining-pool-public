@@ -1,0 +1,84 @@
+# csd-pool-miner — native Linux systemd service (single GPU / single process).
+#
+# This mines ONE GPU in this process (the miner is one-GPU-per-process by
+# design). For a multi-GPU rig use the templated unit `csd-pool-miner@.service`
+# (one instance per card) — see deploy/systemd/README.md.
+#
+# Install (as root):
+#   install -m 0755 target/release/csd-gpu-miner /usr/local/bin/csd-pool-miner
+#   install -m 0644 deploy/systemd/csd-pool-miner.service /etc/systemd/system/
+#   install -m 0640 deploy/systemd/csd-pool-miner.env.example /etc/csd-pool-miner.env
+#   # edit /etc/csd-pool-miner.env and set CSD_ADDRESS=<your 40-hex addr20>
+#   useradd --system --no-create-home --shell /usr/sbin/nologin csdminer || true
+#   systemctl daemon-reload && systemctl enable --now csd-pool-miner
+#
+# Full step-by-step (user creation, GPU group, logs) is in
+# deploy/systemd/README.md.
+
+[Unit]
+Description=CSD Pool Miner (GPU/CPU miner for the Compute Substrate pool)
+Documentation=https://github.com/dangraagu/CSD-Mining-pool-public
+# Don't start until the network stack is up (the miner dials the pool over TCP).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Run unprivileged — the miner needs no root. Create this account once (see the
+# README); add it to the GPU device group (`video`/`render`) so the NVIDIA/AMD
+# build can open the card.
+User=csdminer
+Group=csdminer
+
+# Payout address (and any other overrides) live OUTSIDE the unit so the same
+# packaged file works on every rig. The file MUST define CSD_ADDRESS=<addr20>.
+# `-` ⇒ tolerate the file being absent at parse time (the miner then errors with
+# a clear "no address" message, which is the desired, visible failure).
+EnvironmentFile=-/etc/csd-pool-miner.env
+
+# One GPU per process. The address is taken from the EnvironmentFile and expanded
+# by systemd. Add extra flags (e.g. --device N, --backend cuda) here or, better,
+# via CSD_EXTRA_ARGS in the env file if you templatise this.
+ExecStart=/usr/local/bin/csd-pool-miner --address ${CSD_ADDRESS}
+
+# --- restart policy -------------------------------------------------------
+# Always come back: crash, OOM, network kill, or a clean watchdog exit.
+Restart=always
+# Back off a few seconds so a hard crash-loop can't hammer the pool or the PSU.
+RestartSec=5
+# Slow the loop down if it keeps dying: at most 5 starts per 60s, else systemd
+# parks the unit in `failed` (clear it with `systemctl reset-failed`).
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# The GPU watchdog exits the process with code 17 (EXIT_GPU_STALLED) to mean
+# "stalled GPU — restart me". `Restart=always` already covers any non-zero exit,
+# but naming the code explicitly makes the intent self-documenting and keeps the
+# restart unconditional for a stalled GPU even if the Restart= mode is ever
+# narrowed. KEEP THIS IN LOCK-STEP with gpu_watchdog::EXIT_GPU_STALLED — the test
+# tests/systemd_service.rs fails the build if they ever diverge.
+RestartForceExitStatus=17
+
+# --- light hardening (safe for a GPU miner) -------------------------------
+# These restrict the service without blocking GPU access. If your driver stack
+# objects (rare), comment the offending line; none of them are load-bearing for
+# correctness. Note: GPU device nodes live under /dev, so we do NOT set
+# PrivateDevices=yes (that would hide the card).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+# The miner writes a rotating log under its working dir; give it one writable
+# state dir at /var/lib/csd-pool-miner (created+owned by systemd).
+StateDirectory=csd-pool-miner
+WorkingDirectory=/var/lib/csd-pool-miner
+
+# Don't let a wedged process linger on stop.
+TimeoutStopSec=20
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target

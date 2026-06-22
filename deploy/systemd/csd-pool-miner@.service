@@ -1,0 +1,54 @@
+# csd-pool-miner — templated multi-GPU systemd service.
+#
+# One instance per GPU. The instance name `%i` is the GPU device index, so:
+#   systemctl enable --now csd-pool-miner@0 csd-pool-miner@1 csd-pool-miner@2
+# starts three processes, each mining exactly one card (--device %i). All share
+# the SAME payout address from /etc/csd-pool-miner.env (the pool sums their
+# shares). A per-instance file /etc/csd-pool-miner.<i>.env can override anything
+# for a single card (it is loaded AFTER the shared one, so it wins).
+#
+# See deploy/systemd/README.md for the full multi-GPU walkthrough.
+
+[Unit]
+Description=CSD Pool Miner on GPU %i (Compute Substrate pool)
+Documentation=https://github.com/dangraagu/CSD-Mining-pool-public
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+User=csdminer
+Group=csdminer
+
+# Shared address/overrides first, then optional per-GPU overrides (later file
+# wins). Both are optional at parse time (`-`); CSD_ADDRESS must be set in one.
+EnvironmentFile=-/etc/csd-pool-miner.env
+EnvironmentFile=-/etc/csd-pool-miner.%i.env
+
+# Mine the card whose index is the instance name (%i). One GPU per process.
+ExecStart=/usr/local/bin/csd-pool-miner --address ${CSD_ADDRESS} --device %i
+
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+# Keep in lock-step with gpu_watchdog::EXIT_GPU_STALLED (guarded by
+# tests/systemd_service.rs).
+RestartForceExitStatus=17
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+# Per-instance writable state dir: /var/lib/csd-pool-miner/<i>.
+StateDirectory=csd-pool-miner/%i
+WorkingDirectory=/var/lib/csd-pool-miner/%i
+
+TimeoutStopSec=20
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target
