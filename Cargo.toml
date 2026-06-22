@@ -28,6 +28,14 @@ cuda        = ["dep:cudarc"]
 opencl      = ["dep:opencl3"]
 # Explicit CPU-only marker (no GPU toolchain required). Carries no deps.
 cpu-only    = []
+# OPTIONAL NVIDIA GPU telemetry + temperature-limit safety (secondary build
+# ONLY — NOT in the lean fleet/primary release). Pulls in `nvml-wrapper`, which
+# loads the NVIDIA Management Library (`nvml.dll` / `libnvidia-ml.so`) at RUNTIME
+# via the driver — no CUDA Toolkit, no build-time link to any NVIDIA lib, so the
+# crate still builds on a host with no NVIDIA anything. On a non-NVIDIA host (or
+# when NVML can't load) telemetry degrades to disabled and the miner keeps
+# running. The default `cpu-only` build pulls in NOTHING here.
+nvml        = ["dep:nvml-wrapper"]
 # OPTIONAL native Windows Service (secondary build ONLY — NOT in the lean
 # fleet/primary release). Lets the miner register itself with the Windows
 # Service Control Manager (`--install-service`) and run headless under it
@@ -74,6 +82,11 @@ ureq        = { version = "2", default-features = false, features = ["tls", "jso
 # behind it; the NVRTC compiler itself is never invoked.
 cudarc      = { version = "0.19", features = ["cuda-13020", "driver", "nvrtc"], optional = true }
 opencl3     = { version = "0.9", optional = true }
+# OPTIONAL (feature = "nvml") NVIDIA telemetry. `nvml-wrapper` is a thin, safe
+# wrapper over NVML that dlopen's the driver's management library at runtime —
+# it does NOT link any NVIDIA lib at build time, so this compiles on any host.
+# default-features kept (no extra surface); not a packer/obfuscator.
+nvml-wrapper = { version = "0.10", optional = true }
 
 # OPTIONAL (feature = "winsvc") native Windows Service support. Declared under a
 # Windows-only target table so it is never resolved/fetched on Linux/macOS — the

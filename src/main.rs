@@ -20,8 +20,10 @@ use csd_gpu_miner::notify::{self, DiscordNotifier};
 use csd_gpu_miner::http;
 use csd_gpu_miner::stats_server::{self, StatsHandle};
 use csd_gpu_miner::{hiveos, selfupdate};
+use csd_gpu_miner::nvml::GpuTelemetry;
 use csd_gpu_miner::stratum::StratumClient;
-use csd_gpu_miner::stratum::loop_stratum::run_stratum_with_gpu_watchdog;
+use csd_gpu_miner::stratum::loop_stratum::run_stratum_full;
+use csd_gpu_miner::thermal::{self, ThermalGate};
 
 #[cfg(feature = "opencl")]
 use csd_gpu_miner::backends::opencl::OpenclBackend;
@@ -183,6 +185,31 @@ pub struct Cli {
     /// exit immediately on a confirmed stall.
     #[arg(long, default_value_t = 3)]
     gpu_watchdog_max_recoveries: u32,
+
+    /// (OPTIONAL `nvml` build) Thermal safety: pause GPU launches once the GPU
+    /// core temperature rises ABOVE this (°C), and resume once it falls back to
+    /// `--temp-resume` (default `limit - 5`). Off unless set. Requires the `nvml`
+    /// feature AND an NVIDIA GPU with NVML; on any other build/host it is a no-op
+    /// (telemetry is unavailable, so the throttle never engages and the miner
+    /// runs exactly as without the flag). This is a SOFT cap layered on top of
+    /// the card's own hardware thermal protection.
+    #[arg(long)]
+    temp_limit: Option<f64>,
+
+    /// (OPTIONAL `nvml` build) Thermal safety: resume GPU launches once the GPU
+    /// core temperature falls AT/BELOW this (°C) after a `--temp-limit` pause.
+    /// Must be below `--temp-limit` (a non-hysteretic value is corrected down to
+    /// `limit - 5` with a warning). Ignored unless `--temp-limit` is set.
+    #[arg(long)]
+    temp_resume: Option<f64>,
+
+    /// (OPTIONAL `nvml` build) Best-effort GPU board power-limit (Watts) applied
+    /// via NVML at startup. Clamped to the card's allowed range; needs elevated
+    /// privileges (else it logs a notice and leaves the limit unchanged). No-op
+    /// on a non-nvml build / non-NVIDIA host. This sets the DRIVER's enforced
+    /// power cap; it is not a mining throttle.
+    #[arg(long)]
+    power_limit: Option<f64>,
 
     /// GPU include-list as a comma-separated list of device indices (e.g.
     /// `--gpu-id 0,2`). This single process still mines ONE device (`--device`);
@@ -418,6 +445,111 @@ fn build_gpu_watchdog_cfg(cli: &Cli, enabled: bool) -> csd_gpu_miner::gpu_watchd
         max_recoveries: cli.gpu_watchdog_max_recoveries,
         ..csd_gpu_miner::gpu_watchdog::GpuWatchdogCfg::default()
     }
+}
+
+/// Build the thermal-throttle config from CLI flags (`--temp-limit` /
+/// `--temp-resume`). `--temp-limit` absent ⇒ disabled (inert). Warns if an
+/// explicit `--temp-resume` had to be corrected down to keep hysteresis (the
+/// pure [`thermal::build_thermal_cfg`] does the correction). On the default
+/// (non-nvml) build the resulting cfg is still built, but the telemetry poller
+/// never has a real temperature to feed it, so it never engages.
+fn build_thermal_cfg(cli: &Cli) -> thermal::ThermalCfg {
+    let cfg = thermal::build_thermal_cfg(cli.temp_limit, cli.temp_resume);
+    if let (Some(limit), Some(resume)) = (cli.temp_limit, cli.temp_resume) {
+        if resume >= limit {
+            tracing::warn!(
+                "--temp-resume {resume} is not below --temp-limit {limit} (would flap); using resume={:.0}°C instead",
+                cfg.resume_c
+            );
+        }
+    }
+    cfg
+}
+
+/// Spawn the OPTIONAL GPU telemetry + thermal poller (the `nvml` build).
+///
+/// Brings up [`GpuTelemetry`] for `--device` (degrading to a disabled handle on
+/// any non-NVIDIA host / missing NVML / non-nvml build — it NEVER panics and the
+/// miner keeps mining), applies an optional `--power-limit`, then every second:
+///   1. reads a [`crate::nvml::TelemetrySample`] (temp/power),
+///   2. pushes it to the stats handle (if `--stats-port` is on) so `/1/summary`
+///      + HiveOS expose `gpu_temp_c`/`gpu_power_w`, and
+///   3. drives the shared [`ThermalGate`] via [`thermal::thermal_tick`] using the
+///      sample's temperature, so the mining loop pauses/resumes GPU launches.
+///
+/// Returns `None` (spawns nothing) when there is NOTHING to do: no thermal limit
+/// AND no stats server AND telemetry is disabled — so the default build with no
+/// telemetry flags carries zero extra threads. The poll thread exits when `stop`
+/// is set; the caller detaches the handle (it owns its `Arc`s).
+fn spawn_telemetry(
+    cli: &Cli,
+    thermal_cfg: thermal::ThermalCfg,
+    gate: Arc<ThermalGate>,
+    stats: Option<Arc<StatsHandle>>,
+    stop: &Arc<AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
+    // Bring NVML up for this device (disabled handle on non-NVIDIA / non-nvml).
+    let telem = GpuTelemetry::init(cli.device, cli.power_limit);
+    let want_thermal = thermal_cfg.enabled;
+    let want_stats = stats.is_some();
+
+    // Nothing to publish AND no throttle to drive AND no live telemetry ⇒ don't
+    // spawn a thread at all (the common default-build case).
+    if !want_thermal && !want_stats && !telem.is_enabled() {
+        return None;
+    }
+    if want_thermal && !telem.is_enabled() {
+        tracing::warn!(
+            "--temp-limit set but GPU telemetry is unavailable (no NVIDIA GPU / NVML, or this build lacks the `nvml` feature); the thermal throttle will NOT engage and the miner runs normally. Rebuild with `--features nvml` on an NVIDIA host to enable it."
+        );
+    }
+
+    let poll = std::time::Duration::from_secs(1);
+    let stop = Arc::clone(stop);
+    let handle = std::thread::Builder::new()
+        .name("gpu-telemetry".to_string())
+        .spawn(move || {
+            if thermal_cfg.enabled {
+                tracing::info!(
+                    "thermal: armed (limit={:.0}°C, resume={:.0}°C, poll={:?})",
+                    thermal_cfg.limit_c, thermal_cfg.resume_c, poll,
+                );
+            }
+            let slice = std::time::Duration::from_millis(200).min(poll);
+            let mut waited = poll; // evaluate once up front (a hot start pauses promptly)
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if waited >= poll {
+                    waited = std::time::Duration::ZERO;
+                    let sample = telem.sample();
+                    // Publish to the stats endpoint (no-op if no stats server).
+                    if let Some(s) = &stats {
+                        s.set_telemetry(sample);
+                    }
+                    // Drive the thermal gate from the temperature (no-op when the
+                    // throttle is disabled — thermal_tick returns Running).
+                    if thermal_cfg.enabled {
+                        let (state, changed) =
+                            thermal::thermal_tick(&gate, sample.temp_c, thermal_cfg);
+                        if changed {
+                            match state {
+                                thermal::ThermalState::Paused => tracing::warn!(
+                                    "thermal: PAUSING GPU launches — temp {:.0}°C above limit {:.0}°C (resume at/below {:.0}°C)",
+                                    sample.temp_c.unwrap_or(f64::NAN), thermal_cfg.limit_c, thermal_cfg.resume_c,
+                                ),
+                                thermal::ThermalState::Running => tracing::info!(
+                                    "thermal: RESUMING GPU launches — temp back at/below {:.0}°C",
+                                    thermal_cfg.resume_c,
+                                ),
+                            }
+                        }
+                    }
+                }
+                std::thread::sleep(slice);
+                waited += slice;
+            }
+        })
+        .ok();
+    handle
 }
 
 /// Resolve the effective GPU launch geometry for CUDA, in precedence order:
@@ -860,16 +992,36 @@ fn run_mining(
     // D2: optional xmrig-compatible /1/summary telemetry server. Off unless the
     // operator passes --stats-port. It reads live hashrate + health from the
     // shared StatsHandle (the mining loop pushes into it via record_hashrate);
-    // it never touches the share/submit/header path.
-    let _stats_server = if cli.stats_port.is_some() {
+    // it never touches the share/submit/header path. The handle is kept so the
+    // OPTIONAL GPU telemetry poller can push gpu_temp_c/gpu_power_w into it too.
+    let stats_handle: Option<Arc<StatsHandle>> = if cli.stats_port.is_some() {
         let handle = Arc::new(StatsHandle::new());
         client.attach_stats(handle.clone());
-        Some(spawn_stats(handle, &address, cli, &stop)?)
+        Some(handle)
     } else {
         None
     };
+    let _stats_server = match &stats_handle {
+        Some(handle) => Some(spawn_stats(handle.clone(), &address, cli, &stop)?),
+        None => None,
+    };
 
-    drive(&client, cli, stop)
+    // OPTIONAL (nvml build) GPU telemetry + thermal throttle. The gate is shared
+    // into the mining loop; the poller drives it from NVML temperature and also
+    // feeds gpu_temp_c/gpu_power_w to the stats endpoint. On the default build
+    // (or a non-NVIDIA host) telemetry is disabled: the gate is never paused, the
+    // poller may not even spawn, and the loop runs exactly as the fleet build.
+    let thermal_cfg = build_thermal_cfg(cli);
+    let thermal_gate = Arc::new(ThermalGate::new());
+    let _telemetry = spawn_telemetry(
+        cli,
+        thermal_cfg,
+        Arc::clone(&thermal_gate),
+        stats_handle.clone(),
+        &stop,
+    );
+
+    drive(&client, cli, stop, thermal_gate)
 }
 
 /// Select the backend (cuda → opencl → cpu, honoring `--backend`) and run the
@@ -880,6 +1032,7 @@ fn drive<W: csd_gpu_miner::stratum::loop_stratum::WorkSource + Sync>(
     work: &W,
     cli: &Cli,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thermal_gate: Arc<ThermalGate>,
 ) -> anyhow::Result<()> {
     match cli.backend {
         BackendChoice::Cpu => {
@@ -891,12 +1044,13 @@ fn drive<W: csd_gpu_miner::stratum::loop_stratum::WorkSource + Sync>(
                 cli.reserve
             );
             // CPU backend has no GPU to watch ⇒ watchdog disabled.
-            run_stratum_with_gpu_watchdog(
+            run_stratum_full(
                 &b,
                 work,
                 stop,
                 build_mining_config(cli, true),
                 build_gpu_watchdog_cfg(cli, false),
+                Arc::clone(&thermal_gate),
             )
         }
 
@@ -922,12 +1076,13 @@ fn drive<W: csd_gpu_miner::stratum::loop_stratum::WorkSource + Sync>(
                 b.blocks, b.threads_per_block, b.nonces_per_thread,
                 (b.blocks as u64) * (b.threads_per_block as u64) * (b.nonces_per_thread as u64),
             );
-            run_stratum_with_gpu_watchdog(
+            run_stratum_full(
                 &b,
                 work,
                 stop,
                 build_mining_config(cli, false),
                 build_gpu_watchdog_cfg(cli, true),
+                Arc::clone(&thermal_gate),
             )
         }
         #[cfg(not(feature = "opencl"))]
@@ -964,12 +1119,13 @@ fn drive<W: csd_gpu_miner::stratum::loop_stratum::WorkSource + Sync>(
                 b.blocks, b.threads_per_block, b.nonces_per_thread,
                 (b.blocks as u64) * (b.threads_per_block as u64) * (b.nonces_per_thread as u64),
             );
-            run_stratum_with_gpu_watchdog(
+            run_stratum_full(
                 &b,
                 work,
                 stop,
                 build_mining_config(cli, false),
                 build_gpu_watchdog_cfg(cli, true),
+                Arc::clone(&thermal_gate),
             )
         }
         #[cfg(not(feature = "cuda"))]
@@ -998,12 +1154,13 @@ fn drive<W: csd_gpu_miner::stratum::loop_stratum::WorkSource + Sync>(
                             b.blocks, b.threads_per_block, b.nonces_per_thread,
                             (b.blocks as u64) * (b.threads_per_block as u64) * (b.nonces_per_thread as u64),
                         );
-                        return run_stratum_with_gpu_watchdog(
+                        return run_stratum_full(
                             &b,
                             work,
                             stop,
                             build_mining_config(cli, false),
                             build_gpu_watchdog_cfg(cli, true),
+                            Arc::clone(&thermal_gate),
                         );
                     }
                     Ok(Err(e)) => {
@@ -1042,12 +1199,13 @@ fn drive<W: csd_gpu_miner::stratum::loop_stratum::WorkSource + Sync>(
                             b.blocks, b.threads_per_block, b.nonces_per_thread,
                             (b.blocks as u64) * (b.threads_per_block as u64) * (b.nonces_per_thread as u64),
                         );
-                        return run_stratum_with_gpu_watchdog(
+                        return run_stratum_full(
                             &b,
                             work,
                             stop,
                             build_mining_config(cli, false),
                             build_gpu_watchdog_cfg(cli, true),
+                            Arc::clone(&thermal_gate),
                         );
                     }
                     Err(e) => {
@@ -1071,12 +1229,13 @@ fn drive<W: csd_gpu_miner::stratum::loop_stratum::WorkSource + Sync>(
                 "auto: no GPU backend was usable — run `csd-gpu-miner devices` (or `--list-devices`) for the probe, or rebuild with `--features cuda` / `--features opencl` to compile GPU support in"
             );
             // Fell back to CPU ⇒ no GPU to watch ⇒ watchdog disabled.
-            run_stratum_with_gpu_watchdog(
+            run_stratum_full(
                 &b,
                 work,
                 stop,
                 build_mining_config(cli, true),
                 build_gpu_watchdog_cfg(cli, false),
+                Arc::clone(&thermal_gate),
             )
         }
     }

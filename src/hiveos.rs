@@ -29,6 +29,13 @@
 /// `ar` is `[shares_good, shares_rejected, invalid=0, shares_stale]` and
 /// `uptime` comes from `summary.uptime`.
 ///
+/// **GPU temperature (`temp[]`):** when the summary carries a csd
+/// `health.gpu_temp_c` (the OPTIONAL `nvml` build with NVML up), it is rounded
+/// to a whole degree and emitted as the single-element `temp[]` HiveOS shows per
+/// GPU. When it is absent (the default/fleet build, a non-NVIDIA host, or an
+/// unreadable sensor) `temp[]` stays the empty array exactly as before — zero
+/// behaviour change vs the lean build.
+///
 /// **Defensive by construction:** every field is plucked with a `0` default, so
 /// a missing/null/malformed summary (even an empty `{}`) yields a zero-but-valid
 /// HiveOS object — the rig still reports "alive, zero" rather than breaking the
@@ -60,10 +67,22 @@ pub fn hiveos_stats_from_summary(summary: &serde_json::Value) -> serde_json::Val
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
+    // GPU temperature (°C) from the optional csd `health.gpu_temp_c` extension.
+    // Present only on the `nvml` build with NVML up; absent ⇒ `temp[]` is empty
+    // (the pre-nvml behaviour). Rounded to a whole degree (HiveOS shows integers).
+    let temp = match summary
+        .get("health")
+        .and_then(|h| h.get("gpu_temp_c"))
+        .and_then(|v| v.as_f64())
+    {
+        Some(t) => serde_json::json!([t.round() as i64]),
+        None => serde_json::json!([]),
+    };
+
     serde_json::json!({
         "hs": [khs],
         "hs_units": "khs",
-        "temp": [],
+        "temp": temp,
         "fan": [],
         "uptime": uptime,
         // xmrig-style ar: [accepted, rejected, invalid, stale]. We have no
@@ -153,6 +172,43 @@ mod tests {
         assert_eq!(h["algo"], "sha256d");
         assert_eq!(h["temp"], serde_json::json!([]));
         assert_eq!(h["fan"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn hiveos_temp_populated_from_gpu_temp_c_when_present() {
+        // The OPTIONAL nvml build's summary carries health.gpu_temp_c → temp[<C>].
+        let summary = serde_json::json!({
+            "hashrate": { "total": [3_000_000_000.0_f64] },
+            "results": { "shares_good": 1 },
+            "uptime": 10,
+            "health": { "gpu_temp_c": 64.7, "gpu_power_w": 150.0 },
+        });
+        let h = hiveos_stats_from_summary(&summary);
+        // Rounded to a whole degree (HiveOS shows integers).
+        assert_eq!(h["temp"], serde_json::json!([65]));
+        // Power isn't a HiveOS h-stats field; it stays out of the object.
+        assert!(h.get("power").is_none());
+    }
+
+    #[test]
+    fn hiveos_temp_empty_when_gpu_temp_absent() {
+        // Default/fleet build (no health object) ⇒ temp[] stays empty, exactly
+        // as the pre-nvml behaviour.
+        let summary = serde_json::json!({
+            "hashrate": { "total": [3_000_000_000.0_f64] },
+            "results": {},
+            "uptime": 0,
+        });
+        let h = hiveos_stats_from_summary(&summary);
+        assert_eq!(h["temp"], serde_json::json!([]));
+        // A present-but-empty health object (no gpu_temp_c) is also empty temp.
+        let summary2 = serde_json::json!({
+            "hashrate": { "total": [0.0] },
+            "results": {},
+            "uptime": 0,
+            "health": {},
+        });
+        assert_eq!(hiveos_stats_from_summary(&summary2)["temp"], serde_json::json!([]));
     }
 
     #[test]
