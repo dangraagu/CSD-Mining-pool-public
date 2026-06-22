@@ -159,12 +159,28 @@ ADDR="$ADDR_HEX"
 # Persist the (normalised) address for next time.
 printf '%s\n' "$ADDR" > "$CFG"
 
-# --- 4. Mine ---------------------------------------------------------------
+# --- 4. Mine (hand off to the self-updating launcher) ----------------------
+# IMPORTANT: we do NOT exec the raw binary here. Stranding a rig on an old
+# version is the whole problem this fleet must avoid, so the one-click install
+# ends by handing off to mine-auto.sh — which keeps polling GitHub and swaps in
+# newer VERIFIED builds for as long as it runs. mine-auto.sh reuses the address
+# we just saved to $CFG (no re-prompt) and runs one miner per GPU.
 echo
-echo "Starting $VARIANT miner. Payout address: $ADDR"
-echo "(Change it later by deleting: $CFG)"
+echo "Starting $VARIANT miner via the self-updating launcher (mine-auto.sh)."
+echo "Payout address: $ADDR   (change it later by deleting: $CFG)"
+echo "It auto-checks GitHub for updates and verifies each download before swapping it in."
 echo "Tip: if no GPU is found, run  \"$BIN\" devices  (or --list-devices) to see"
 echo "     which cards this build detects, or reinstall with: ./install-csd-miner.sh cpu"
 echo "Press Ctrl+C to stop."
 echo
-exec "$BIN" --address "$ADDR"
+
+MINE_AUTO="$SCRIPT_DIR/mine-auto.sh"
+if [ -x "$MINE_AUTO" ] || [ -f "$MINE_AUTO" ]; then
+  # FAIL-SAFE: if the self-updating launcher can't start for any reason, fall
+  # back to running the binary we just installed+verified so the rig still mines.
+  exec bash "$MINE_AUTO" "$VARIANT" || exec "$BIN" --address "$ADDR"
+else
+  echo "[!] mine-auto.sh not found next to the installer; running the installed"
+  echo "    binary directly (no auto-update). Re-download mine-auto.sh for 24/7 rigs."
+  exec "$BIN" --address "$ADDR"
+fi

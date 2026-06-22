@@ -4,7 +4,34 @@
 # HiveOS runs this to start mining. It MUST `exec` the real binary so the
 # process argv is `csd-gpu-miner …` and NOT `h-run.sh` — HiveOS refuses to start
 # a custom miner whose argv contains h-run.sh. `exec` replaces this shell; we
-# never background with `&`.
+# never background the MINER with `&`.
+#
+# AUTO-UPDATE (fleet, no clawback — FAIL-SAFE IS RULE #1)
+# ────────────────────────────────────────────────────────────────────────────────
+# A bricked rig is catastrophic, so EVERY update path falls through to running
+# the EXISTING binary on ANY failure (no network, GitHub rate-limit, SHA
+# mismatch, partial download, disk full, missing verifier). The update gate is
+# the SAME proven three-check logic mine-auto.sh uses:
+#   1. numeric semver compare via the binary's own `check-update` (so 0.1.10 >
+#      0.1.9 — a string compare gets that wrong), string-`!=` fallback only when
+#      no usable binary exists yet,
+#   2. download to a TEMP path ("$CUSTOM_BIN.new") — NEVER onto the live binary,
+#   3. SHA-256 verify the temp against the release SHA256SUMS with a TRUSTED
+#      verifier (the already-installed $CUSTOM_BIN's `verify-file`, else OS
+#      sha256sum) BEFORE the atomic swap. A failed/again-unverifiable download is
+#      discarded and the running binary is kept.
+#
+# Because HiveOS forbids a foreground loop in h-run.sh (the exec-rename hazard),
+# auto-update is split into TWO layers:
+#   (a) a one-shot STARTUP check, run BEFORE the exec, that swaps in a newer
+#       verified binary so this launch starts current; and
+#   (b) a BACKGROUND poll sidecar, started with `&` BEFORE the exec (so it
+#       survives the exec as an init-owned orphan). It polls every CHECK_MIN
+#       minutes; on a newer+verified version it does the swap, then signals a
+#       restart by killing the miner so HiveOS relaunches THIS script and picks
+#       up the new binary on the next start. The sidecar self-exits if the miner
+#       process is gone (slot stopped), so it never spins on a dead slot.
+# Both layers verify before swapping; neither EVER leaves the rig unable to mine.
 #
 # SP2 — csd-relay-node canonical-anchor relay
 # ────────────────────────────────────────────────────────────────────────────────
@@ -53,6 +80,206 @@ mkdir -p "$(dirname "$LOG")"
 EXTRA_FLAGS=""
 EXTRA_FLAGS_FILE="$(dirname "$CONF")/extra-flags"
 [ -f "$EXTRA_FLAGS_FILE" ] && EXTRA_FLAGS="$(cat "$EXTRA_FLAGS_FILE")"
+
+# ── Auto-update constants + helpers (mirror of mine-auto.sh, fail-safe) ───────
+# The release publishes per-variant assets named csd-pool-miner-linux-<variant>
+# (nvidia|amd|cpu). The HiveOS binary is renamed to csd-gpu-miner ($CUSTOM_BIN)
+# to dodge the exec-rename hazard, so we download the right asset for the
+# flightsheet backend and atomically swap it ONTO $CUSTOM_BIN.
+REPO="dangraagu/CSD-Mining-pool-public"
+UPDATE_BIN="${CUSTOM_BIN:-$(dirname "$0")/csd-gpu-miner}"
+CHECK_MIN="${CHECK_MIN:-15}"
+MINER_PROC="csd-gpu-miner"   # argv name HiveOS sees; used to detect/kill the miner
+
+# Map the flightsheet --backend to the release asset variant. Default to cpu
+# (always published) when no/unknown backend is given, so the asset name is
+# never empty and the cpu build is the safe fallback.
+update_variant() {
+  case "$EXTRA_FLAGS" in
+    *"--backend cuda"*)   echo "nvidia" ;;
+    *"--backend opencl"*) echo "amd" ;;
+    *"--backend cpu"*)    echo "cpu" ;;
+    *)                    echo "cpu" ;;
+  esac
+}
+
+# Download $1 -> $2 atomically: fetch to a temp file, move into place only on
+# success, so a partial/failed download never leaves a 0-byte file that later
+# gets chmod+x'd and exec'd. Returns non-zero on failure.
+ua_download() {
+  url="$1"; out="$2"; tmp="$2.dl"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fL --retry 3 -o "$tmp" "$url" && mv "$tmp" "$out"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -O "$tmp" "$url" && mv "$tmp" "$out"
+  else
+    return 1
+  fi
+}
+
+# Latest published release tag, or empty string on any failure.
+ua_latest_tag() {
+  api="https://api.github.com/repos/$REPO/releases/latest"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL -H 'User-Agent: csd-miner' "$api" 2>/dev/null \
+      | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[^"]*"([^"]+)".*/\1/'
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO- --header='User-Agent: csd-miner' "$api" 2>/dev/null \
+      | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[^"]*"([^"]+)".*/\1/'
+  fi
+}
+
+# Decide whether $2 (latest) is newer than $1 (installed). Prefer the binary's
+# OWN `check-update` (one tested numeric semver compare). If no usable binary
+# exists yet, fall back to a plain string inequality. Returns 0 (update) / 1.
+ua_should_update() {
+  _installed="$1"; _latest="$2"
+  if [ -x "$UPDATE_BIN" ] && "$UPDATE_BIN" check-update --current "$_installed" --latest "$_latest" >/dev/null 2>&1; then
+    return 0
+  fi
+  # Subcommand present but exited non-zero == up-to-date/older: do NOT update.
+  if [ -x "$UPDATE_BIN" ] && "$UPDATE_BIN" check-update --help >/dev/null 2>&1; then
+    return 1
+  fi
+  # No usable binary yet (or it predates check-update): string fallback. Strip a
+  # leading 'v' from BOTH sides first, so a bare installed version ("0.1.10",
+  # read from --version) is not seen as different from a 'v'-prefixed release tag
+  # ("v0.1.10") — which would otherwise trigger a needless re-download every poll.
+  [ "${_installed#v}" != "${_latest#v}" ]
+}
+
+# Expected SHA-256 hex for asset $1 from the release SHA256SUMS (empty if no
+# checksums published or the asset isn't listed → caller treats empty as
+# "cannot verify"). Line format: "<hex>  <filename>" (sha256sum style).
+ua_expected_sha() {
+  asset="$1"; sums="$(dirname "$UPDATE_BIN")/SHA256SUMS.htmp"
+  if ua_download "https://github.com/$REPO/releases/latest/download/SHA256SUMS" "$sums" 2>/dev/null; then
+    awk -v a="$asset" '$2==a || $2=="*"a {print $1; exit}' "$sums"
+    rm -f "$sums"
+  fi
+}
+
+# Download the matching variant build, VERIFY it, and only then atomically swap
+# it onto $UPDATE_BIN (= $CUSTOM_BIN). NEVER writes an unverified binary onto the
+# live path. On a non-cpu 404, falls back to the cpu asset. Returns non-zero
+# (and leaves the running binary untouched) if no verified binary could be
+# staged — so the caller can always keep mining on the current binary.
+ua_download_verify_swap() {
+  variant="$(update_variant)"
+  asset="csd-pool-miner-linux-$variant"
+  staged="$UPDATE_BIN.new"
+  if ! ua_download "https://github.com/$REPO/releases/latest/download/$asset" "$staged"; then
+    if [ "$variant" != "cpu" ]; then
+      echo "[h-run] auto-update: '$variant' build unavailable (404/failed); falling back to cpu build." | tee -a "$LOG"
+      variant="cpu"; asset="csd-pool-miner-linux-cpu"
+      ua_download "https://github.com/$REPO/releases/latest/download/$asset" "$staged" || { rm -f "$staged"; return 1; }
+    else
+      rm -f "$staged"; return 1
+    fi
+  fi
+
+  want="$(ua_expected_sha "$asset")"
+  if [ -z "$want" ]; then
+    echo "[h-run] auto-update: no SHA256SUMS for this release (or '$asset' not listed) — skipping integrity verify (pre-P4 release)." | tee -a "$LOG"
+  else
+    # Verify with a TRUSTED tool ONLY: the already-installed $UPDATE_BIN's
+    # verify-file, else the OS sha256sum. NEVER let the just-downloaded file
+    # verify itself. With a digest but no trusted verifier → FAIL CLOSED.
+    if [ -x "$UPDATE_BIN" ] && "$UPDATE_BIN" verify-file --help >/dev/null 2>&1; then
+      if ! "$UPDATE_BIN" verify-file "$staged" "$want" >/dev/null 2>&1; then
+        echo "[h-run] auto-update: SHA-256 verify FAILED for $asset — discarding it, keeping the running binary." | tee -a "$LOG"
+        rm -f "$staged"; return 1
+      fi
+    elif command -v sha256sum >/dev/null 2>&1; then
+      got="$(sha256sum "$staged" | awk '{print $1}')"
+      if [ "$got" != "$want" ]; then
+        echo "[h-run] auto-update: SHA-256 verify FAILED for $asset (got $got, want $want) — discarding it." | tee -a "$LOG"
+        rm -f "$staged"; return 1
+      fi
+    else
+      echo "[h-run] auto-update: have a SHA256SUMS digest but no trusted verifier — refusing the update." | tee -a "$LOG"
+      rm -f "$staged"; return 1
+    fi
+  fi
+
+  chmod +x "$staged" 2>/dev/null || true
+  mv "$staged" "$UPDATE_BIN"   # atomic swap onto the live path, only after verify
+}
+
+# Current installed version string (for the semver compare). "none" if the
+# binary can't report it, which makes ua_should_update take the string path.
+ua_installed_version() {
+  if [ -x "$UPDATE_BIN" ]; then
+    v="$("$UPDATE_BIN" --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+    [ -n "$v" ] && { echo "$v"; return; }
+  fi
+  echo "none"
+}
+
+# (a) STARTUP update check — one-shot, BEFORE the exec. Best-effort and fully
+# fail-safe: any failure logs and returns, leaving the existing $CUSTOM_BIN in
+# place so the rig always starts mining on a known-good binary.
+hive_update_check_startup() {
+  latest="$(ua_latest_tag || true)"
+  [ -z "$latest" ] && { echo "[h-run] auto-update: no release tag (offline / rate-limited) — starting on the installed binary." | tee -a "$LOG"; return 0; }
+  installed="$(ua_installed_version)"
+  if ua_should_update "$installed" "$latest"; then
+    echo "[h-run] auto-update: $installed -> $latest (verify, then swap before launch)" | tee -a "$LOG"
+    if ua_download_verify_swap; then
+      echo "[h-run] auto-update: swapped in $latest; launching it." | tee -a "$LOG"
+    else
+      echo "[h-run] auto-update: update not applied (download/verify failed) — keeping current binary." | tee -a "$LOG"
+    fi
+  fi
+  return 0
+}
+
+# (b) BACKGROUND poll sidecar — started with `&` BEFORE exec, so it survives the
+# exec as an init-owned orphan. Polls every CHECK_MIN; on a newer+verified
+# version it swaps then signals a restart by killing the miner (HiveOS relaunches
+# this script, which picks up the new binary via the startup check). Self-exits
+# when the miner is gone (slot stopped) so it never spins on a dead slot.
+hive_update_sidecar() {
+  # Give the miner a moment to come up before the first liveness probe.
+  sleep "$((CHECK_MIN * 60))"
+  while true; do
+    # If the miner isn't running, the slot was stopped (not an update restart):
+    # exit so we don't poll forever after HiveOS tears the slot down.
+    if ! pgrep -f "$MINER_PROC" >/dev/null 2>&1; then
+      echo "[h-run] auto-update sidecar: miner no longer running — exiting sidecar." >> "$LOG" 2>&1
+      exit 0
+    fi
+    latest="$(ua_latest_tag || true)"
+    if [ -n "$latest" ]; then
+      installed="$(ua_installed_version)"
+      if ua_should_update "$installed" "$latest"; then
+        echo "[h-run] auto-update sidecar: $installed -> $latest (verify, then swap + restart)" >> "$LOG" 2>&1
+        if ua_download_verify_swap; then
+          echo "[h-run] auto-update sidecar: swapped in $latest — restarting miner so HiveOS relaunches on the new binary." >> "$LOG" 2>&1
+          # Stop the relay too so the relaunch starts it cleanly.
+          pkill -f csd-relay-node 2>/dev/null || true
+          pkill -f "$MINER_PROC" 2>/dev/null || true
+          exit 0
+        else
+          echo "[h-run] auto-update sidecar: update not applied (download/verify failed) — keeping current, will retry." >> "$LOG" 2>&1
+        fi
+      fi
+    fi
+    sleep "$((CHECK_MIN * 60))"
+  done
+}
+# ── end auto-update helpers ───────────────────────────────────────────────────
+
+# (a) Run the startup update check now (before relay + exec) so this launch
+# starts on the latest verified binary. Fully fail-safe — never blocks mining.
+hive_update_check_startup
+
+# (b) Start the background update poll sidecar. `&` + disown semantics: it keeps
+# running across the exec below (it becomes an init-owned orphan), polling for a
+# newer release and triggering a clean restart when one verifies. Output goes to
+# the miner log. It NEVER touches the live binary except via the verified swap.
+( hive_update_sidecar ) >> "$LOG" 2>&1 &
+echo "[h-run] auto-update sidecar started (PID=$!, poll every ${CHECK_MIN} min)." | tee -a "$LOG"
 
 # ── SP2: csd-relay-node — canonical-anchor relay ─────────────────────────────
 # Must launch BEFORE exec (exec replaces this shell; once exec runs we cannot

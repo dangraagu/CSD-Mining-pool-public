@@ -100,17 +100,32 @@ if not defined ADDR (
   exit /b 1
 )
 
-REM --- 5. Mine ---
+REM --- 5. Mine (hand off to the self-updating launcher) ---
+REM IMPORTANT: we do NOT run the raw binary here. Stranding a rig on an old
+REM version is exactly what this fleet must avoid, so the one-click install ends
+REM by handing off to mine-auto.bat - which keeps polling GitHub and swaps in
+REM newer VERIFIED builds for as long as its window stays open. mine-auto.bat
+REM reuses the address we just saved to %CFG% (no re-prompt) and runs one miner
+REM per GPU.
 echo(
-echo Starting %VARIANT% miner. Payout address: !ADDR!
-echo ^(Change it later by deleting: %CFG%^)
+echo Starting %VARIANT% miner via the self-updating launcher (mine-auto.bat).
+echo Payout address: !ADDR!   ^(change it later by deleting: %CFG%^)
+echo It auto-checks GitHub for updates and verifies each download before swapping it in.
 echo Tip: if no GPU is found, run  "%BIN%" devices  ^(or --list-devices^) to see
 echo      which cards this build detects, or reinstall with: install-csd-miner.bat cpu
 echo Press Ctrl+C to stop.
 echo(
-"%BIN%" --address !ADDR!
-
-echo(
-echo Miner stopped.
-pause
+if exist "%~dp0mine-auto.bat" (
+  call "%~dp0mine-auto.bat" %VARIANT%
+) else (
+  REM FAIL-SAFE: launcher missing -> run the installed+verified binary directly
+  REM so the rig still mines (just without auto-update). Re-download mine-auto.bat
+  REM for 24/7 rigs.
+  echo [!] mine-auto.bat not found next to the installer; running the installed
+  echo     binary directly ^(no auto-update^).
+  "%BIN%" --address !ADDR!
+  echo(
+  echo Miner stopped.
+  pause
+)
 endlocal
