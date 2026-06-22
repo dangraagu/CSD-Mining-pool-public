@@ -157,11 +157,12 @@ jobs:
       #   - hiveos-pkg/csd-pool-miner/   (inside the HiveOS tarball)
       #
       # OPERATOR: update RELAY_NODE_VERSION + RELAY_NODE_ASSET_URL before tagging.
-      # While these are set to FILL_ME_IN the step warns but does NOT block the
-      # miner release (continue-on-error: true). Flip that to false once the real
-      # binary URL is wired in.
+      # RELAY_NODE_VERSION + RELAY_NODE_SHA256 are now real (relay-v0.1.9), so this
+      # step HARD-BLOCKS the release: a relay download failure or SHA256 mismatch
+      # fails the job instead of shipping a miner with no bundled relay. Was
+      # continue-on-error: true while the constants were FILL_ME_IN (deploy-check OPS-1).
       - name: Fetch csd-relay-node binary (SP2)
-        continue-on-error: true
+        continue-on-error: false
         env:
           # ── SP2 relay-node source constants ────────────────────────────────────
           # Update ALL THREE of these when the csd2 repo cuts its first tagged release.

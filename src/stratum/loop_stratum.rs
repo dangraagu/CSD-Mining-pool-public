@@ -429,7 +429,15 @@ pub(crate) struct GpuHashrateSample {
 impl GpuHashrateSample {
     fn new() -> Self {
         GpuHashrateSample {
-            ghs_bits: AtomicU64::new(0.0f64.to_bits()),
+            // Seed the rate to INFINITY = "unknown, treat as healthy" (NOT 0.0).
+            // The share-FOUND arm of the loop never publish()es — only touch()es —
+            // so a healthy GPU finding a share on nearly every launch (pathologically
+            // low diff / first vardiff step before retarget) would, with a 0.0 seed,
+            // read as FLOORED while perfectly healthy and trip recover()/exit(17)
+            // across the fleet. A genuinely hung GPU finds NO share → takes the 10s
+            // no-share arm → publish()es its real ~0.0 rate → still detected. So the
+            // INFINITY seed removes only the FALSE positive (deploy-check C1).
+            ghs_bits: AtomicU64::new(f64::INFINITY.to_bits()),
             at_ms: AtomicU64::new(0),
         }
     }
@@ -1285,15 +1293,40 @@ mod tests {
     /// Once the script is exhausted it behaves like a real backend that hashes
     /// until told to stop (so the loop never busy-spins). Lets a test exercise
     /// the FOUND path + correctness gate with no GPU.
+    ///
+    /// `return_when_empty` selects what an exhausted-script call does:
+    ///   - `false` (default, `new`): BLOCK until `stop` — emulates a backend whose
+    ///     single launch spans the whole window (the loop dispatches it ~once).
+    ///   - `true` (`new_returning`): RETURN `None` immediately — emulates a REAL
+    ///     backend that finished a finite nonce sweep finding nothing and returned,
+    ///     so the loop re-dispatches it every iteration (the realistic
+    ///     returns-from-hash_range path the watchdog must treat as healthy).
     struct MockBackend {
         script: Mutex<VecDeque<Option<MiningResult>>>,
         calls: AtomicUsize,
+        /// How many times the GPU watchdog called `recover()` on this backend.
+        /// Stays 0 unless the watchdog read the GPU as floored — so a test can
+        /// assert a healthy/returning backend is NEVER mistaken for a stall (C1).
+        recover_calls: AtomicUsize,
+        return_when_empty: bool,
     }
     impl MockBackend {
         fn new(script: Vec<Option<MiningResult>>) -> Self {
             MockBackend {
                 script: Mutex::new(script.into()),
                 calls: AtomicUsize::new(0),
+                recover_calls: AtomicUsize::new(0),
+                return_when_empty: false,
+            }
+        }
+        /// A backend whose `hash_range` RETURNS (finite sweep, finds nothing)
+        /// instead of blocking — the realistic path the watchdog coverage needs.
+        fn new_returning() -> Self {
+            MockBackend {
+                script: Mutex::new(VecDeque::new()),
+                calls: AtomicUsize::new(0),
+                recover_calls: AtomicUsize::new(0),
+                return_when_empty: true,
             }
         }
     }
@@ -1313,19 +1346,31 @@ mod tests {
             if let Some(found) = self.script.lock().unwrap().pop_front().flatten() {
                 return Some(found);
             }
-            // No scripted find: emulate a real backend hashing until told to
-            // stop. NOTE: these tests run cpu_threads=0, so run_stratum passes
-            // the outer `stop` to the backend directly (C1 removed the poller);
-            // a real backend instead sweeps a finite range and returns.
+            // No scripted find. A *returning* backend mimics a real finite sweep:
+            // return None at once so the loop re-dispatches each iteration (and
+            // `touch()`es the GPU sample every launch). Otherwise emulate a
+            // backend whose launch spans the window by blocking until told to
+            // stop. NOTE: these tests run cpu_threads=0, so run_stratum passes the
+            // outer `stop` to the backend directly (C1 removed the poller).
+            if self.return_when_empty {
+                return None;
+            }
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(1));
             }
             None
         }
     }
-    impl Recoverable for MockBackend {} // default no-op recover() (the stall ladder
-                                        // is covered by the gpu_watchdog module's
-                                        // MockView tick tests)
+    impl Recoverable for MockBackend {
+        // Count recover() calls (observably identical to the default no-op:
+        // returns false = "not recovered"). Lets a test prove the watchdog did
+        // NOT treat a healthy/returning backend as a stall. The full stall ladder
+        // is covered by the gpu_watchdog module's MockView tick tests.
+        fn recover(&self) -> bool {
+            self.recover_calls.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+    }
 
     /// A socket-free [`WorkSource`]: serves one canned job + difficulty and
     /// records every submit the loop sends, so `run_stratum` can be driven
@@ -1335,6 +1380,11 @@ mod tests {
         difficulty: f64,
         worker: String,
         submits: Arc<Mutex<Vec<(String, String, String, String, String)>>>,
+        /// What `health()` reports. Defaults to `HealthSnapshot::default()`
+        /// (`job_age_s = None` ⇒ `jobs_flowing`/`conn_healthy` both FALSE, so the
+        /// GPU watchdog's actionable-stall gate never fires). `with_fresh_jobs()`
+        /// sets a fresh job age so a test CAN reach the floored→recover path.
+        health: HealthSnapshot,
     }
     impl MockWorkSource {
         fn new(job: StratumJob, difficulty: f64) -> Self {
@@ -1343,7 +1393,19 @@ mod tests {
                 difficulty,
                 worker: "csd1mockworker".to_string(),
                 submits: Arc::new(Mutex::new(Vec::new())),
+                health: HealthSnapshot::default(),
             }
+        }
+        /// Report a FRESH job age so `jobs_flowing()` + `conn_healthy()` are true —
+        /// i.e. "the pool is delivering work over a healthy link". This is what
+        /// lets the GPU-stall watchdog actually evaluate (and, on a real floor,
+        /// recover/exit). Without it the watchdog stands down on every tick.
+        fn with_fresh_jobs(mut self) -> Self {
+            self.health = HealthSnapshot {
+                job_age_s: Some(1), // 1s old ≪ GPU_WD_JOB_FRESH_SECS ⇒ flowing+healthy
+                ..HealthSnapshot::default()
+            };
+            self
         }
     }
     impl WorkSource for MockWorkSource {
@@ -1355,6 +1417,9 @@ mod tests {
         }
         fn worker_addr(&self) -> &str {
             &self.worker
+        }
+        fn health(&self) -> HealthSnapshot {
+            self.health.clone()
         }
         fn send_submit(
             &self,
@@ -1649,12 +1714,20 @@ mod tests {
     #[test]
     fn gpu_hashrate_sample_publishes_touches_and_reads() {
         let s = GpuHashrateSample::new();
-        // No launch yet.
-        assert_eq!(s.read(), (0.0, 0));
-        // A heartbeat updates only the timestamp (rate stays 0.0).
+        // No launch yet: pre-publish rate is INFINITY = "unknown, treat as healthy"
+        // (was 0.0 which falsely read as floored — deploy-check C1). at_ms stays 0.
+        let (rate0, at0) = s.read();
+        assert!(rate0.is_infinite(), "pre-publish rate must be INFINITY (unknown=healthy), got {rate0}");
+        assert_eq!(at0, 0);
+        // A heartbeat updates only the timestamp; the rate is still the unpublished
+        // INFINITY sentinel (touch never sets a rate).
         s.touch(5_000);
-        assert_eq!(s.read(), (0.0, 5_000));
-        // A publish updates both.
+        let (rate1, at1) = s.read();
+        assert!(rate1.is_infinite(), "touch must not publish a rate; still INFINITY, got {rate1}");
+        assert_eq!(at1, 5_000);
+        // A publish updates both — and from here read() MUST return the published
+        // value, so a genuinely floored *measured* rate is still caught (the load-
+        // bearing assertion: this is what detects a real hung-but-returning GPU).
         s.publish(2.5, 6_000);
         assert_eq!(s.read(), (2.5, 6_000));
         // A later heartbeat keeps the last published rate but advances the stamp.
@@ -1745,6 +1818,109 @@ mod tests {
         assert!(
             backend.calls.load(Ordering::Relaxed) > 0,
             "the loop must have dispatched the backend alongside the armed watchdog"
+        );
+        assert!(
+            work.submits.lock().unwrap().is_empty(),
+            "no share at diff 1024 in the brief window"
+        );
+    }
+
+    /// deploy-check C2 coverage: drive the REAL `run_stratum_with_gpu_watchdog`
+    /// with the watchdog ARMED and a RETURNING backend (finite sweep, finds
+    /// nothing, `hash_range` returns immediately) — the realistic path the other
+    /// happy-path test misses (that one BLOCKS in `hash_range`, so it only
+    /// exercises the `at_ms == 0` sentinel). Here the loop re-dispatches every
+    /// iteration and `touch()`es the GPU sample, so `at_ms != 0` and the sample is
+    /// fresh: `gpu_ghs()` reads the INFINITY-seeded rate (a returning, share-heavy
+    /// GPU that never hit the 10s publish window reads UNKNOWN = healthy, NOT
+    /// floored — exactly the C1 false-floor case). With jobs flowing + link
+    /// healthy, the watchdog must take NO recover / NO exit over several poll
+    /// cycles. `exit_on_escalate` is true in production, but here a wrong floor
+    /// would surface as a recover() (the CPU/no-op backend's recover is a no-op,
+    /// so it would loop Recover, never exit the runner) — we assert it does not by
+    /// proving a clean Ok shutdown after many polls. Fast: no 10s sleep.
+    ///
+    // TODO(deploy-check C2): the HEALTHY-MEASURED-RATE publish sub-path — where
+    // the loop's `None` arm calls `gpu_sample.publish(ghs_gpu, ..)` with a real
+    // >floor rate after the 10s `last_hashrate_log` interval — is NOT exercised
+    // here because that interval is hardcoded (`Duration::from_secs(10)`, no
+    // injection seam), so reaching it needs a >10s wall-clock run. The measured
+    // publish→read path is unit-covered by `loop_gpu_view_reports_stale_sample_as_floored`
+    // (fresh publish reads its rate through) + the gpu_watchdog pure tests
+    // (`healthy_gpu_is_ok` / `tick_healthy_resets_state_and_does_nothing`). If the
+    // 10s interval ever gains a config seam, fold a measured-rate assertion in here.
+    #[test]
+    fn run_with_gpu_watchdog_returning_backend_is_not_floored() {
+        // FRESH jobs so jobs_flowing() + conn_healthy() are TRUE — this is what
+        // ARMS the watchdog's actionable-stall gate. Without it the watchdog
+        // stands down every tick and the test would prove nothing (a default
+        // MockWorkSource reports job_age=None ⇒ never actionable).
+        let work = Arc::new(MockWorkSource::new(mock_job(), 1024.0).with_fresh_jobs());
+        // Returning backend: finishes its sweep finding nothing and RETURNS each
+        // launch (does not block) — drives the realistic re-dispatch + touch path.
+        let backend = Arc::new(MockBackend::new_returning());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let work_for_loop = Arc::clone(&work);
+        let backend_for_loop = Arc::clone(&backend);
+        let stop_for_loop = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let cfg = MiningConfig { cpu_threads: 0, cpu_share: 0.0 };
+            // Watchdog ON, tiny poll + dwell so MANY ticks happen in the brief
+            // window: if a returning backend were wrongly read as floored, the
+            // dwell-1 + fast poll would force a Recover within a few ms.
+            let gpu_wd = GpuWatchdogCfg {
+                enabled: true,
+                poll: Duration::from_millis(5),
+                dwell_samples: 1,
+                max_recoveries: 3,
+                recover_window: Duration::from_secs(3600),
+                ..GpuWatchdogCfg::default()
+            };
+            run_stratum_with_gpu_watchdog(
+                backend_for_loop.as_ref(),
+                work_for_loop.as_ref(),
+                stop_for_loop,
+                cfg,
+                gpu_wd,
+            )
+        });
+
+        // Wait for the backend to be dispatched (it returns fast, so calls climb
+        // quickly), then let the watchdog poll many times before stopping.
+        for _ in 0..300 {
+            if backend.calls.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // ~40 poll intervals at 5ms — far past dwell=1, so a false-floor would
+        // have fired a recover() by now.
+        std::thread::sleep(Duration::from_millis(200));
+        // The PRIMARY C1 guard: a returning/healthy backend must never be read as
+        // floored, so the watchdog must NOT have called recover() even once. (With
+        // the old 0.0 seed it WOULD: touch() stamps at_ms!=0, gpu_ghs() reads 0.0
+        // = floored, dwell=1 ⇒ Recover within a few ms — this assert catches that.)
+        // Sampled before stop so a late tick can't race the join.
+        let recovers = backend.recover_calls.load(Ordering::Relaxed);
+        stop.store(true, Ordering::Relaxed);
+        let result = handle.join().expect("loop thread did not panic");
+        assert_eq!(
+            recovers, 0,
+            "watchdog wrongly treated a returning (healthy) backend as a stalled \
+             GPU and called recover() {recovers}x — the C1 false-floor"
+        );
+        assert!(
+            result.is_ok(),
+            "run_stratum_with_gpu_watchdog returns Ok — a returning backend must \
+             NOT be read as a stalled GPU (no exit(17))"
+        );
+        // The returning backend was re-dispatched many times (not a single
+        // blocking launch) — proves we exercised the returns-from-hash_range path.
+        assert!(
+            backend.calls.load(Ordering::Relaxed) > 1,
+            "a returning backend is re-dispatched every iteration, got {} calls",
+            backend.calls.load(Ordering::Relaxed)
         );
         assert!(
             work.submits.lock().unwrap().is_empty(),
