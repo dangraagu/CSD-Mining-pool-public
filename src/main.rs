@@ -203,6 +203,18 @@ pub struct Cli {
     #[arg(long)]
     temp_resume: Option<f64>,
 
+    /// (OPTIONAL `nvml` build) Max-pause dead-man (seconds). If the thermal gate
+    /// stays CONTINUOUSLY paused this long, the miner briefly forces GPU launches
+    /// back on for one window so the hung-GPU watchdog can adjudicate — guarding
+    /// the case where a GPU hangs while NVML keeps reporting it hot (which would
+    /// otherwise keep the watchdog suppressed forever). Deliberately long (default
+    /// 600 = 10 min) so it NEVER disturbs legitimate sustained throttling: a merely
+    /// hot card just re-pauses on the next sample, while a genuinely hung card stays
+    /// floored and gets recovered/restarted. Ignored unless `--temp-limit` is set;
+    /// a no-op on any non-nvml build / non-NVIDIA host (the gate never pauses there).
+    #[arg(long, default_value_t = csd_gpu_miner::thermal::DEFAULT_MAX_PAUSE_SECS)]
+    temp_max_pause_secs: u64,
+
     /// (OPTIONAL `nvml` build) Best-effort GPU board power-limit (Watts) applied
     /// via NVML at startup. Clamped to the card's allowed range; needs elevated
     /// privileges (else it logs a notice and leaves the limit unchanged). No-op
@@ -454,7 +466,7 @@ fn build_gpu_watchdog_cfg(cli: &Cli, enabled: bool) -> csd_gpu_miner::gpu_watchd
 /// (non-nvml) build the resulting cfg is still built, but the telemetry poller
 /// never has a real temperature to feed it, so it never engages.
 fn build_thermal_cfg(cli: &Cli) -> thermal::ThermalCfg {
-    let cfg = thermal::build_thermal_cfg(cli.temp_limit, cli.temp_resume);
+    let cfg = thermal::build_thermal_cfg(cli.temp_limit, cli.temp_resume, Some(cli.temp_max_pause_secs));
     if let (Some(limit), Some(resume)) = (cli.temp_limit, cli.temp_resume) {
         if resume >= limit {
             tracing::warn!(
@@ -517,8 +529,15 @@ fn spawn_telemetry(
             }
             let slice = std::time::Duration::from_millis(200).min(poll);
             let mut waited = poll; // evaluate once up front (a hot start pauses promptly)
+            // Max-pause dead-man: bounds a CONTINUOUS thermal pause so a stuck-hot
+            // hung GPU still gets a watchdog check. Inert unless the gate pauses
+            // (so a no-op on the default/non-nvml build, where it never does).
+            let mut deadman = thermal::Deadman::new();
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 if waited >= poll {
+                    // Time actually elapsed since the previous evaluation (the loop
+                    // sleeps in `slice`s and fires the body once `waited >= poll`).
+                    let elapsed = waited;
                     waited = std::time::Duration::ZERO;
                     let sample = telem.sample();
                     // Publish to the stats endpoint (no-op if no stats server).
@@ -526,10 +545,18 @@ fn spawn_telemetry(
                         s.set_telemetry(sample);
                     }
                     // Drive the thermal gate from the temperature (no-op when the
-                    // throttle is disabled — thermal_tick returns Running).
+                    // throttle is disabled — the gate stays Running and the dead-man
+                    // only ever sees the "not paused ⇒ reset" branch).
                     if thermal_cfg.enabled {
-                        let (state, changed) =
-                            thermal::thermal_tick(&gate, sample.temp_c, thermal_cfg);
+                        let (state, changed, forced_open) = thermal::thermal_tick_with_deadman(
+                            &gate, &mut deadman, sample.temp_c, thermal_cfg, elapsed,
+                        );
+                        if forced_open {
+                            tracing::warn!(
+                                "thermal: gate paused >{}s — forcing a watchdog check in case the GPU is hung, not just hot (resuming launches for ~{}s; a healthy throttling card will simply re-pause)",
+                                thermal_cfg.max_pause_secs, thermal::FORCE_RESUME_WINDOW_SECS,
+                            );
+                        }
                         if changed {
                             match state {
                                 thermal::ThermalState::Paused => tracing::warn!(
