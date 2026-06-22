@@ -1,5 +1,6 @@
 //! Backend implementations.
 
+pub mod autotune;
 pub mod cpu;
 
 #[cfg(feature = "opencl")]

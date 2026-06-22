@@ -26,6 +26,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use cudarc::driver::{
@@ -34,6 +35,9 @@ use cudarc::driver::{
 use cudarc::nvrtc::Ptx;
 
 use crate::backend::{MiningBackend, MiningResult};
+use crate::backends::autotune::{
+    self, candidate_geometries, pick_best, CachedGeometry, GeometryMeasurement,
+};
 use crate::gpu_watchdog::Recoverable;
 use crate::sha256d_cpu::midstate_of_first_chunk_fast as midstate_of_first_chunk;
 
@@ -445,5 +449,172 @@ fn drain_pipe(pipe: &mut PipeRes) -> Option<MiningResult> {
     Some(MiningResult {
         nonce: nonce_host[0],
         hash,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Startup GPU auto-tune + reproducible benchmark.
+//
+// IMPORTANT: this is *client* engineering only — it never changes PoW/hash
+// logic. The benchmark drives the SAME `MiningBackend::hash_range` / SAME
+// embedded SHA-256d kernel; it only varies the launch GEOMETRY (how many
+// blocks/threads/nonces a launch sweeps) and TIMES the throughput. Every hash
+// computed during a bench is bit-for-bit the production hash.
+// ---------------------------------------------------------------------------
+
+/// A deterministic, non-trivial 84-byte header for benchmarking. Fixed content
+/// ⇒ a `--bench` run is reproducible (the geometry MH/s a card reports is
+/// stable, not data-dependent — sha256d cost is independent of the bytes). The
+/// version word is set to 1 like a real header; the rest is a fixed ramp.
+fn bench_header() -> [u8; 84] {
+    let mut h = [0u8; 84];
+    h[0..4].copy_from_slice(&1u32.to_le_bytes());
+    for (i, b) in h.iter_mut().enumerate().skip(4) {
+        *b = (i as u8).wrapping_mul(31).wrapping_add(7);
+    }
+    h
+}
+
+/// Benchmark ONE launch geometry on `device_index` for ~`budget`, returning
+/// measured throughput in MH/s.
+///
+/// Method: build a `CudaBackend` with this geometry, then repeatedly sweep the
+/// FULL `[0, u32::MAX)` nonce range with an ALL-ZERO target. An all-zero target
+/// is (essentially) never satisfied — `hash <= 0` is false for any non-zero
+/// digest — so `hash_range` does NOT stop early on a "found" share; it sweeps
+/// every nonce, giving a clean nonces-per-second figure. We accumulate fully-
+/// completed sweeps (each = 2^32 nonces) until the wall-clock budget elapses,
+/// then divide attempted nonces by elapsed seconds. At least one full sweep is
+/// always performed so even a tiny budget yields a real number. Returns `Err`
+/// if the backend can't be built for this geometry (caller records that
+/// geometry as failed and moves on).
+pub fn benchmark_geometry(
+    device_index: usize,
+    blocks: u32,
+    threads_per_block: u32,
+    nonces_per_thread: u32,
+    budget: Duration,
+) -> Result<f64> {
+    let backend = CudaBackend::new(device_index, blocks, threads_per_block, nonces_per_thread)?;
+    let target_never = [0u8; 32]; // all-zero ⇒ never "found" ⇒ full sweep
+    let header = bench_header();
+    let stop = AtomicBool::new(false);
+
+    let started = Instant::now();
+    let mut nonces_done: u128 = 0;
+    // Sweep the whole 32-bit nonce space at least once, then keep going until
+    // the time budget is spent. Each completed `hash_range` over [0, MAX)
+    // attempts the full 2^32 span (it returns None at the end since nothing is
+    // "found").
+    loop {
+        let _ = backend.hash_range(header, target_never, 0, u32::MAX, &stop);
+        nonces_done += u32::MAX as u128;
+        if started.elapsed() >= budget {
+            break;
+        }
+    }
+    let secs = started.elapsed().as_secs_f64();
+    if secs <= 0.0 {
+        return Ok(0.0);
+    }
+    // nonces/sec → MH/s.
+    Ok((nonces_done as f64) / secs / 1.0e6)
+}
+
+/// Result of an auto-tune sweep: the winning geometry plus every per-geometry
+/// measurement (so the caller can log the full table). Returned by
+/// [`auto_tune`].
+#[derive(Debug, Clone)]
+pub struct AutoTuneResult {
+    pub device_index: usize,
+    pub device_name: String,
+    pub best: GeometryMeasurement,
+    pub measurements: Vec<GeometryMeasurement>,
+    /// Where the winner was persisted (`None` if persistence was skipped/failed
+    /// — non-fatal; the geometry is still returned + used this run).
+    pub cache_path: Option<std::path::PathBuf>,
+}
+
+/// Run the startup auto-tune on `device_index`: benchmark every
+/// [`candidate_geometries`] entry for `per_geom` each, pick the fastest via the
+/// pure [`pick_best`], PERSIST the winner to the geometry cache (so later starts
+/// skip the bench), and return the full result. Logs each geometry's MH/s as it
+/// goes.
+///
+/// Failure handling: a geometry that errors during its bench is recorded with
+/// `mh_s = 0.0` (and thus ignored by `pick_best`) rather than aborting the whole
+/// sweep — one bad geometry never sinks the tune. If NO geometry produced a
+/// usable measurement, returns `Err` and the caller falls back to the default
+/// geometry. Persistence failure is logged but NOT fatal.
+pub fn auto_tune(device_index: usize, per_geom: Duration) -> Result<AutoTuneResult> {
+    // Resolve the device name once (used to scope the cache entry to this card).
+    let device_name = CudaContext::new(device_index)
+        .and_then(|ctx| ctx.name())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+
+    tracing::info!(
+        "auto-tune: benchmarking {} candidate geometries on device {device_index} ({device_name}), ~{:?} each",
+        candidate_geometries().len(),
+        per_geom,
+    );
+
+    let mut measurements: Vec<GeometryMeasurement> = Vec::new();
+    for (blocks, tpb, npt) in candidate_geometries() {
+        let mh = match benchmark_geometry(device_index, blocks, tpb, npt, per_geom) {
+            Ok(v) => {
+                tracing::info!(
+                    "auto-tune: geom {blocks}x{tpb}x{npt} = {:.1} MH/s",
+                    v
+                );
+                v
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "auto-tune: geom {blocks}x{tpb}x{npt} failed ({e}); recording 0 MH/s and skipping"
+                );
+                0.0
+            }
+        };
+        measurements.push(GeometryMeasurement::new(blocks, tpb, npt, mh));
+    }
+
+    let best = pick_best(&measurements)
+        .ok_or_else(|| anyhow!("auto-tune: no candidate geometry produced a usable measurement"))?;
+
+    tracing::info!(
+        "auto-tune: WINNER {}x{}x{} at {:.1} MH/s",
+        best.blocks,
+        best.threads_per_block,
+        best.nonces_per_thread,
+        best.mh_s,
+    );
+
+    // Persist the winner (best-effort). The geometry is already chosen + will be
+    // used this run regardless; the cache only saves the bench on the NEXT start.
+    let cached = CachedGeometry {
+        device_index,
+        device_name: device_name.clone(),
+        blocks: best.blocks,
+        threads_per_block: best.threads_per_block,
+        nonces_per_thread: best.nonces_per_thread,
+        mh_s: best.mh_s,
+    };
+    let cache_path = match autotune::save_cached(&cached) {
+        Ok(p) => {
+            tracing::info!("auto-tune: persisted winning geometry to {}", p.display());
+            Some(p)
+        }
+        Err(e) => {
+            tracing::warn!("auto-tune: could not persist geometry cache ({e}); will re-bench next start");
+            None
+        }
+    };
+
+    Ok(AutoTuneResult {
+        device_index,
+        device_name,
+        best,
+        measurements,
+        cache_path,
     })
 }

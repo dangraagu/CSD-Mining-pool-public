@@ -112,6 +112,23 @@ pub struct Cli {
     #[arg(long, default_value_t = 4096)]
     nonces_per_thread: u32,
 
+    /// Auto-tune the GPU launch geometry at startup (CUDA only): briefly
+    /// benchmark a small set of (blocks, threads-per-block, nonces-per-thread)
+    /// geometries, pick the fastest (MH/s), and use it. The winner is PERSISTED
+    /// to the config cache (`<config dir>/csd-pool-miner/autotune.toml`, scoped
+    /// to this card) so later starts reuse it WITHOUT re-benchmarking. Explicit
+    /// `--blocks/--threads-per-block/--nonces-per-thread` are ignored for the
+    /// GPU when this runs (it picks them). Adds the tune time to startup
+    /// (≈ candidates × `--auto-tune-secs`).
+    #[arg(long, default_value_t = false)]
+    auto_tune: bool,
+
+    /// Auto-tune: seconds to benchmark EACH candidate geometry (and the per-run
+    /// duration of the `bench` subcommand). Longer = steadier numbers, slower
+    /// startup. Default 5.
+    #[arg(long, default_value_t = 5)]
+    auto_tune_secs: u64,
+
     /// Dual mining: CPU worker threads to run alongside the GPU
     /// backend. 0 disables CPU mining (GPU-only).
     /// Range 0..num_cpus. Each worker uses SHA-NI via sha2::compress256.
@@ -186,6 +203,13 @@ pub struct Cli {
     /// Log directory (rotates previous log on startup).
     #[arg(long, default_value = "logs")]
     log_dir: PathBuf,
+
+    /// Internal (not a CLI flag): set in `main()` to true when the user passed
+    /// any of `--blocks` / `--threads-per-block` / `--nonces-per-thread`
+    /// explicitly. A persisted auto-tune geometry is only auto-reused when this
+    /// is false, so an explicit geometry override always wins over the cache.
+    #[arg(skip)]
+    geometry_set_explicitly: bool,
 
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -282,6 +306,22 @@ enum Cmd {
         #[arg(long, default_value_t = 3380)]
         stats_port: u16,
     },
+
+    /// Reproducible GPU benchmark (CUDA): time the SHA-256d kernel and print a
+    /// stable MH/s for the device, then exit (does NOT mine, needs no address).
+    /// With `--all-geometries` it benchmarks every auto-tune candidate and
+    /// prints the table + the winner; otherwise it benchmarks the single active
+    /// geometry (`--blocks/--threads-per-block/--nonces-per-thread`, or the
+    /// default). Each geometry runs for `--auto-tune-secs`. Useful for
+    /// comparing cards / verifying a tune against docs/BASELINES.md. The
+    /// benchmark drives the identical mining kernel, so its MH/s reflects real
+    /// hashing throughput; it changes no PoW/hash logic.
+    Bench {
+        /// Benchmark ALL auto-tune candidate geometries (print the full table +
+        /// the winner) instead of just the active/default one.
+        #[arg(long, default_value_t = false)]
+        all_geometries: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -342,6 +382,119 @@ fn build_gpu_watchdog_cfg(cli: &Cli, enabled: bool) -> csd_gpu_miner::gpu_watchd
         recover_window: std::time::Duration::from_secs(cli.gpu_watchdog_recover_secs),
         max_recoveries: cli.gpu_watchdog_max_recoveries,
         ..csd_gpu_miner::gpu_watchdog::GpuWatchdogCfg::default()
+    }
+}
+
+/// Resolve the effective GPU launch geometry for CUDA, in precedence order:
+///   1. `--auto-tune` ⇒ benchmark the candidate set NOW, use + persist the
+///      winner (ignores the CLI geometry flags for the GPU).
+///   2. else a PERSISTED geometry cached for THIS exact card (from a prior
+///      `--auto-tune`) ⇒ reuse it (no re-bench).
+///   3. else the CLI/config geometry (`--blocks/--threads-per-block/
+///      --nonces-per-thread`, defaulting to 560x256x4096).
+/// Returns `(blocks, threads_per_block, nonces_per_thread)`. Pure-ish: only
+/// reads the device name + the cache file; the bench (case 1) is the only heavy
+/// path. Logs which source won. Any auto-tune failure degrades to the CLI
+/// geometry (never fatal).
+#[cfg(feature = "cuda")]
+fn resolve_cuda_geometry(cli: &Cli) -> (u32, u32, u32) {
+    use csd_gpu_miner::backends::autotune;
+    use csd_gpu_miner::backends::cuda;
+
+    if cli.auto_tune {
+        match cuda::auto_tune(cli.device, std::time::Duration::from_secs(cli.auto_tune_secs)) {
+            Ok(r) => {
+                tracing::info!(
+                    "auto-tune: using {}x{}x{} ({:.1} MH/s) for device {}",
+                    r.best.blocks, r.best.threads_per_block, r.best.nonces_per_thread,
+                    r.best.mh_s, cli.device,
+                );
+                return (r.best.blocks, r.best.threads_per_block, r.best.nonces_per_thread);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "auto-tune failed ({e}); falling back to geometry {}x{}x{}",
+                    cli.blocks, cli.threads_per_block, cli.nonces_per_thread,
+                );
+                return (cli.blocks, cli.threads_per_block, cli.nonces_per_thread);
+            }
+        }
+    }
+
+    // No --auto-tune: reuse a previously-tuned geometry for THIS card if one was
+    // persisted (and the same GPU is still at this index), else the CLI default.
+    let dev_name = cudarc::driver::CudaContext::new(cli.device)
+        .and_then(|ctx| ctx.name())
+        .unwrap_or_default();
+    if let Some((b, t, n)) = autotune::load_cached_for_device(cli.device, &dev_name) {
+        // Only honour the cache when the user did NOT explicitly override the
+        // geometry on the CLI (explicit flags always win, matching merge_config).
+        if !cli.geometry_set_explicitly {
+            tracing::info!(
+                "auto-tune: reusing cached geometry {b}x{t}x{n} for device {} ({dev_name}) — pass --auto-tune to re-benchmark",
+                cli.device,
+            );
+            return (b, t, n);
+        }
+        tracing::info!(
+            "auto-tune: a cached geometry exists for device {} but explicit --blocks/--threads-per-block/--nonces-per-thread were given; using those",
+            cli.device,
+        );
+    }
+    (cli.blocks, cli.threads_per_block, cli.nonces_per_thread)
+}
+
+/// `bench` subcommand: print a stable MH/s for the GPU (or the per-geometry
+/// table + winner with `--all-geometries`), then exit. CUDA only; without the
+/// `cuda` feature it explains how to enable it. Does not mine.
+fn run_bench(cli: &Cli, all_geometries: bool) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        use csd_gpu_miner::backends::cuda;
+        let per = std::time::Duration::from_secs(cli.auto_tune_secs);
+        println!("=== csd-gpu-miner bench (device {}) ===", cli.device);
+        println!("per-geometry duration: {}s", cli.auto_tune_secs);
+        println!();
+        if all_geometries {
+            // Reuse the auto-tune sweep but DON'T persist for a plain bench: a
+            // benchmark should be side-effect-free. auto_tune persists; so here
+            // we run the candidate loop directly via benchmark_geometry.
+            use csd_gpu_miner::backends::autotune::{candidate_geometries, pick_best, GeometryMeasurement};
+            let mut ms: Vec<GeometryMeasurement> = Vec::new();
+            for (b, t, n) in candidate_geometries() {
+                match cuda::benchmark_geometry(cli.device, b, t, n, per) {
+                    Ok(mh) => {
+                        println!("  {b:>5} x {t:>4} x {n:>5}  =  {mh:>8.1} MH/s");
+                        ms.push(GeometryMeasurement::new(b, t, n, mh));
+                    }
+                    Err(e) => {
+                        println!("  {b:>5} x {t:>4} x {n:>5}  =  FAILED ({e})");
+                        ms.push(GeometryMeasurement::new(b, t, n, 0.0));
+                    }
+                }
+            }
+            println!();
+            match pick_best(&ms) {
+                Some(best) => println!(
+                    "WINNER: {}x{}x{} at {:.1} MH/s",
+                    best.blocks, best.threads_per_block, best.nonces_per_thread, best.mh_s
+                ),
+                None => {
+                    anyhow::bail!("bench: no geometry produced a usable measurement");
+                }
+            }
+        } else {
+            let (b, t, n) = (cli.blocks, cli.threads_per_block, cli.nonces_per_thread);
+            let mh = cuda::benchmark_geometry(cli.device, b, t, n, per)
+                .map_err(|e| anyhow::anyhow!("bench: {e}"))?;
+            println!("geometry {b}x{t}x{n}: {mh:.1} MH/s");
+        }
+        return Ok(());
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (cli, all_geometries);
+        bail!("bench requires the CUDA backend: rebuild with `cargo build --release --features cuda`");
     }
 }
 
@@ -432,6 +585,16 @@ fn main() -> Result<()> {
     }
     merge_config(&mut cli, &matches, file_cfg);
 
+    // Record whether the user explicitly set any GPU geometry flag on the CLI
+    // (used by the CUDA geometry resolver so an explicit override beats a
+    // persisted auto-tune geometry). Mirrors merge_config's precedence check.
+    {
+        use clap::parser::ValueSource;
+        let explicit = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
+        cli.geometry_set_explicitly =
+            explicit("blocks") || explicit("threads_per_block") || explicit("nonces_per_thread");
+    }
+
     if matches!(cli.cmd, Some(Cmd::Newwallet)) {
         // No network, no address needed: generate a key locally and exit.
         return keygen::run();
@@ -472,6 +635,10 @@ fn main() -> Result<()> {
                 std::process::exit(2);
             }
         }
+    }
+
+    if let Some(Cmd::Bench { all_geometries }) = cli.cmd {
+        return run_bench(&cli, all_geometries);
     }
 
     if let Some(Cmd::HiveosStats { stats_port }) = &cli.cmd {
@@ -689,15 +856,19 @@ fn drive<W: csd_gpu_miner::stratum::loop_stratum::WorkSource + Sync>(
 
         #[cfg(feature = "cuda")]
         BackendChoice::Cuda => {
+            // Resolve geometry: --auto-tune (bench+persist) > cached-for-card >
+            // CLI/default. Done before init so the chosen geometry is what we
+            // build the backend with.
+            let (g_blocks, g_tpb, g_npt) = resolve_cuda_geometry(cli);
             tracing::info!(
                 "backend=cuda (forced) blocks={} tpb={} npt={} - trying init...",
-                cli.blocks, cli.threads_per_block, cli.nonces_per_thread,
+                g_blocks, g_tpb, g_npt,
             );
             // cudarc can panic (not just return Err) on a low-level driver/context
             // error during init; catch it so we exit with a clear message instead
             // of an unwinding backtrace.
             let init = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                CudaBackend::new(cli.device, cli.blocks, cli.threads_per_block, cli.nonces_per_thread)
+                CudaBackend::new(cli.device, g_blocks, g_tpb, g_npt)
             }));
             let b = match init {
                 Ok(Ok(b)) => b,
@@ -730,15 +901,16 @@ fn drive<W: csd_gpu_miner::stratum::loop_stratum::WorkSource + Sync>(
 
             #[cfg(feature = "cuda")]
             {
-                tracing::info!(
-                    "auto: trying CUDA geom={}x{}x{}",
-                    cli.blocks, cli.threads_per_block, cli.nonces_per_thread
-                );
+                // Resolve geometry first (--auto-tune / cached / default). The
+                // bench itself opens the device, so a card that can't init will
+                // surface here; auto_tune degrades to the default on failure.
+                let (g_blocks, g_tpb, g_npt) = resolve_cuda_geometry(cli);
+                tracing::info!("auto: trying CUDA geom={}x{}x{}", g_blocks, g_tpb, g_npt);
                 // cudarc can panic (rather than return Err) on a low-level driver
                 // or context error during init. Catch the panic so `auto` can fall
                 // through to OpenCL instead of crashing.
                 let cuda_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    CudaBackend::new(cli.device, cli.blocks, cli.threads_per_block, cli.nonces_per_thread)
+                    CudaBackend::new(cli.device, g_blocks, g_tpb, g_npt)
                 }));
                 match cuda_result {
                     Ok(Ok(b)) => {
