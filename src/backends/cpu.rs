@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 
 use crate::backend::{MiningBackend, MiningResult};
+use crate::gpu_watchdog::Recoverable;
 use crate::sha256d_cpu::{finish_sha256d_from_midstate_fast, midstate_of_first_chunk_fast};
 
 pub struct CpuBackend {
@@ -109,3 +110,12 @@ impl MiningBackend for CpuBackend {
         *g
     }
 }
+
+/// The CPU backend can't meaningfully "recover" a wedge in-process (it has no
+/// driver state to rebuild — a thread pool that produced zero-with-work would
+/// need a full process restart). It uses the default no-op `recover()` (returns
+/// `false`), so a confirmed CPU stall escalates straight to a supervisor restart
+/// — the only lever that helps here. In practice the GPU watchdog runs only when
+/// a GPU backend is active, so this impl exists for trait-completeness/uniform
+/// dispatch, not because a CPU rig is expected to trip it.
+impl Recoverable for CpuBackend {}

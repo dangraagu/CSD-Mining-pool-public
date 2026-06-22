@@ -23,6 +23,7 @@ use opencl3::program::Program;
 use opencl3::types::{cl_uchar, cl_uint, CL_BLOCKING};
 
 use crate::backend::{MiningBackend, MiningResult};
+use crate::gpu_watchdog::Recoverable;
 use crate::sha256d_cpu::midstate_of_first_chunk_fast as midstate_of_first_chunk;
 
 const KERNEL_SRC: &str = include_str!("../kernels/sha256d.cl");
@@ -301,6 +302,14 @@ impl MiningBackend for OpenclBackend {
         }
     }
 }
+
+/// The OpenCL backend uses the default no-op `recover()` (returns `false`): an
+/// in-process rebuild of the OpenCL context/program/queues is out of scope for
+/// this watchdog (the CUDA fast-path is the one with the documented rebuild). On
+/// a confirmed OpenCL stall the watchdog therefore escalates straight to a
+/// supervisor restart — the safe, correct fallback when in-process recovery
+/// isn't available, never a wrong/partial heal.
+impl Recoverable for OpenclBackend {}
 
 /// Pick the &mut PipeRes for the requested side, plus its CommandQueue.
 fn pick_pipe<'a>(

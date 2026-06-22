@@ -34,6 +34,7 @@ use cudarc::driver::{
 use cudarc::nvrtc::Ptx;
 
 use crate::backend::{MiningBackend, MiningResult};
+use crate::gpu_watchdog::Recoverable;
 use crate::sha256d_cpu::midstate_of_first_chunk_fast as midstate_of_first_chunk;
 
 // CUDA kernel, pre-compiled to PTX *offline* (nvcc -ptx -arch=compute_75
@@ -158,6 +159,107 @@ impl CudaBackend {
 
     fn nonces_per_launch(&self) -> u64 {
         self.blocks as u64 * self.threads_per_block as u64 * self.nonces_per_thread as u64
+    }
+
+    /// Attempt in-process recovery from a wedged GPU (driver hiccup, TDR reset,
+    /// transient CUDA error) WITHOUT restarting the process. Called by the
+    /// GPU-stall watchdog (`gpu_watchdog`) when hashrate has flatlined while
+    /// fresh work is flowing over a healthy link.
+    ///
+    /// Strategy, cheapest-first: reload the module from the SAME context (a
+    /// re-JIT of the embedded PTX, which clears a faulted module), reload the
+    /// kernel function, and rebuild BOTH pipes (fresh CUDA streams + freshly
+    /// allocated device buffers). The CUDA context itself is kept — a fresh
+    /// `CudaContext::new` would race the in-flight `hash_range` that still holds
+    /// the OLD context's resources, and most transient wedges (a single TDR, a
+    /// stuck stream) clear with new streams/buffers on the existing context. We
+    /// do NOT touch PoW/hash logic: the rebuilt module loads the IDENTICAL PTX
+    /// and the same kernel, so every hash computed after recovery is bit-for-bit
+    /// what it was before.
+    ///
+    /// Returns `true` if the rebuild succeeded (the watchdog then waits its grace
+    /// window for hashrate to return), `false` if recovery itself failed (e.g.
+    /// the context is unusable / the device fell off the bus) — in which case the
+    /// watchdog escalates to a process exit for a supervisor restart. NEVER
+    /// panics: any driver error becomes a `false`.
+    pub fn recover(&self) -> bool {
+        // Serialize against the mining thread via the same pipes lock
+        // `hash_range` takes — but NON-BLOCKING (`try_lock`). Two failure modes,
+        // both ⇒ return `false` so the watchdog escalates to a process restart
+        // (the only thing that helps when we can't rebuild in-process):
+        //   - POISONED: a prior panic left the lock poisoned.
+        //   - WOULD-BLOCK: `hash_range` currently HOLDS the lock. The normal hot
+        //     path releases it between launches, so a held lock here means the
+        //     kernel is wedged INSIDE `hash_range` (blocked in `synchronize()`)
+        //     and will not release it. Blocking on `lock()` would deadlock the
+        //     watchdog; instead we bail and let it exit(EXIT_GPU_STALLED) — which
+        //     tears down the wedged process regardless of the held lock.
+        let mut pipes = match self.pipes.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                tracing::error!(
+                    "cuda recover: hash_range is holding the pipes lock (kernel wedged inside a launch); cannot rebuild in-process — escalating to process restart"
+                );
+                return false;
+            }
+            Err(std::sync::TryLockError::Poisoned(e)) => {
+                tracing::error!("cuda recover: pipes mutex poisoned ({e}); cannot recover in-process");
+                return false;
+            }
+        };
+
+        // Re-JIT the embedded PTX on the existing context (clears a faulted
+        // module) and reload the kernel function from the fresh module.
+        let ptx = Ptx::from_src(KERNEL_PTX);
+        let module = match self.ctx.load_module(ptx) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!("cuda recover: load_module failed: {e}");
+                return false;
+            }
+        };
+        let func = match module.load_function(KERNEL_NAME) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!("cuda recover: load_function {KERNEL_NAME} failed: {e}");
+                return false;
+            }
+        };
+
+        // Rebuild both pipes: new streams + freshly allocated device buffers.
+        let a = match build_pipe(&self.ctx) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("cuda recover: rebuild pipe A failed: {e}");
+                return false;
+            }
+        };
+        let b = match build_pipe(&self.ctx) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("cuda recover: rebuild pipe B failed: {e}");
+                return false;
+            }
+        };
+
+        // Swap in the rebuilt resources atomically under the lock. The old
+        // PipePair (streams/buffers) drops here, freeing the wedged handles.
+        //
+        // Lifetime of the new module: cudarc's `CudaFunction` holds its own
+        // `Arc<CudaModule>` (which in turn holds the `Arc<CudaContext>`), so the
+        // freshly loaded `func` we store keeps the new module loaded for as long
+        // as the pipes live — we do NOT need to write it back into the `&self`
+        // `module` field (which we couldn't through a shared borrow anyway). The
+        // local `module` binding here is therefore redundant after `func` is
+        // built; it drops at end of scope, decrementing only the extra reference
+        // we held. The backend's original `self.module` (the pre-recovery one)
+        // stays loaded but unused — a bounded, at-most-`max_recoveries`
+        // (default 3) idle module, acceptable for this rare path and far cheaper
+        // than a full process restart.
+        *pipes = PipePair { a, b, func };
+        let _ = &module; // documents: func retains the new module; this ref is extra
+        tracing::warn!("cuda recover: module re-JIT'd + both pipes rebuilt on existing context");
+        true
     }
 }
 
@@ -316,6 +418,14 @@ impl MiningBackend for CudaBackend {
 
             current_pipe ^= 1;
         }
+    }
+}
+
+impl Recoverable for CudaBackend {
+    /// Forward to the inherent [`CudaBackend::recover`] — rebuild module + pipes
+    /// in-process on a wedged GPU. See that method for the full strategy.
+    fn recover(&self) -> bool {
+        CudaBackend::recover(self)
     }
 }
 

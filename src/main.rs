@@ -20,7 +20,8 @@ use csd_gpu_miner::notify::{self, DiscordNotifier};
 use csd_gpu_miner::http;
 use csd_gpu_miner::stats_server::{self, StatsHandle};
 use csd_gpu_miner::{hiveos, selfupdate};
-use csd_gpu_miner::stratum::{run_stratum, StratumClient};
+use csd_gpu_miner::stratum::StratumClient;
+use csd_gpu_miner::stratum::loop_stratum::run_stratum_with_gpu_watchdog;
 
 #[cfg(feature = "opencl")]
 use csd_gpu_miner::backends::opencl::OpenclBackend;
@@ -133,6 +134,38 @@ pub struct Cli {
     /// address — the pool sums their shares.
     #[arg(long, default_value_t = 0)]
     device: usize,
+
+    /// Disable the hung-GPU / zero-hashrate watchdog. By default a GPU backend is
+    /// monitored: if its hashrate flatlines while fresh jobs flow over a healthy
+    /// link (a STALLED GPU, not idle/no-work), the miner first attempts an
+    /// in-process CUDA recovery and, failing that, exits with code 17 so a
+    /// supervisor restarts it. Pass this to turn that off entirely.
+    #[arg(long, default_value_t = false)]
+    no_gpu_watchdog: bool,
+
+    /// GPU watchdog: hashrate at/below this (GH/s) counts as "floored" (a dead
+    /// kernel). Default 0.001 GH/s = 1 MH/s — orders of magnitude under any
+    /// working card, so a slow-but-alive GPU never trips. Raise it only if you
+    /// know your card's healthy floor is higher.
+    #[arg(long, default_value_t = 0.001)]
+    gpu_floor: f64,
+
+    /// GPU watchdog: consecutive floored samples (while jobs flow + link healthy)
+    /// before acting — the "dwell". At the ~15s sample cadence the default 4 ⇒
+    /// ~60s of continuous zero-with-work before the first recovery attempt.
+    #[arg(long, default_value_t = 4)]
+    gpu_watchdog_dwell: u32,
+
+    /// GPU watchdog: after a recovery attempt, seconds to wait for hashrate to
+    /// return before escalating to a process exit. Default 60.
+    #[arg(long, default_value_t = 60)]
+    gpu_watchdog_recover_secs: u64,
+
+    /// GPU watchdog: maximum in-process recovery attempts before giving up and
+    /// exiting for a supervisor restart. Default 3. 0 ⇒ never attempt recovery,
+    /// exit immediately on a confirmed stall.
+    #[arg(long, default_value_t = 3)]
+    gpu_watchdog_max_recoveries: u32,
 
     /// GPU include-list as a comma-separated list of device indices (e.g.
     /// `--gpu-id 0,2`). This single process still mines ONE device (`--device`);
@@ -294,6 +327,21 @@ fn build_mining_config(cli: &Cli, backend_is_cpu: bool) -> MiningConfig {
     MiningConfig {
         cpu_threads,
         cpu_share,
+    }
+}
+
+/// Build the GPU stall-watchdog config from CLI flags. `enabled` is the master
+/// switch: `--no-gpu-watchdog` turns it off, and the CPU arm of `drive` also
+/// forces it off (a CPU "backend" has no GPU to watch). The recovery window is
+/// given in seconds on the CLI and converted to a `Duration` here.
+fn build_gpu_watchdog_cfg(cli: &Cli, enabled: bool) -> csd_gpu_miner::gpu_watchdog::GpuWatchdogCfg {
+    csd_gpu_miner::gpu_watchdog::GpuWatchdogCfg {
+        enabled: enabled && !cli.no_gpu_watchdog,
+        floor_ghs: cli.gpu_floor,
+        dwell_samples: cli.gpu_watchdog_dwell,
+        recover_window: std::time::Duration::from_secs(cli.gpu_watchdog_recover_secs),
+        max_recoveries: cli.gpu_watchdog_max_recoveries,
+        ..csd_gpu_miner::gpu_watchdog::GpuWatchdogCfg::default()
     }
 }
 
@@ -582,7 +630,7 @@ fn main() -> Result<()> {
 /// shared `run_stratum` loop against `work`. Generic over the [`WorkSource`] so
 /// the same selection logic drives the pool `StratumClient` (and the test mock);
 /// the backend arms are independent of the work-source argument.
-fn drive<W: csd_gpu_miner::stratum::loop_stratum::WorkSource>(
+fn drive<W: csd_gpu_miner::stratum::loop_stratum::WorkSource + Sync>(
     work: &W,
     cli: &Cli,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -596,7 +644,14 @@ fn drive<W: csd_gpu_miner::stratum::loop_stratum::WorkSource>(
                 b.threads,
                 cli.reserve
             );
-            run_stratum(&b, work, stop, build_mining_config(cli, true))
+            // CPU backend has no GPU to watch ⇒ watchdog disabled.
+            run_stratum_with_gpu_watchdog(
+                &b,
+                work,
+                stop,
+                build_mining_config(cli, true),
+                build_gpu_watchdog_cfg(cli, false),
+            )
         }
 
         #[cfg(feature = "opencl")]
@@ -621,7 +676,13 @@ fn drive<W: csd_gpu_miner::stratum::loop_stratum::WorkSource>(
                 b.blocks, b.threads_per_block, b.nonces_per_thread,
                 (b.blocks as u64) * (b.threads_per_block as u64) * (b.nonces_per_thread as u64),
             );
-            run_stratum(&b, work, stop, build_mining_config(cli, false))
+            run_stratum_with_gpu_watchdog(
+                &b,
+                work,
+                stop,
+                build_mining_config(cli, false),
+                build_gpu_watchdog_cfg(cli, true),
+            )
         }
         #[cfg(not(feature = "opencl"))]
         BackendChoice::Opencl => bail!("opencl backend not compiled in (rebuild with --features opencl)"),
@@ -653,7 +714,13 @@ fn drive<W: csd_gpu_miner::stratum::loop_stratum::WorkSource>(
                 b.blocks, b.threads_per_block, b.nonces_per_thread,
                 (b.blocks as u64) * (b.threads_per_block as u64) * (b.nonces_per_thread as u64),
             );
-            run_stratum(&b, work, stop, build_mining_config(cli, false))
+            run_stratum_with_gpu_watchdog(
+                &b,
+                work,
+                stop,
+                build_mining_config(cli, false),
+                build_gpu_watchdog_cfg(cli, true),
+            )
         }
         #[cfg(not(feature = "cuda"))]
         BackendChoice::Cuda => bail!("cuda backend not compiled in (rebuild with --features cuda)"),
@@ -680,7 +747,13 @@ fn drive<W: csd_gpu_miner::stratum::loop_stratum::WorkSource>(
                             b.blocks, b.threads_per_block, b.nonces_per_thread,
                             (b.blocks as u64) * (b.threads_per_block as u64) * (b.nonces_per_thread as u64),
                         );
-                        return run_stratum(&b, work, stop, build_mining_config(cli, false));
+                        return run_stratum_with_gpu_watchdog(
+                            &b,
+                            work,
+                            stop,
+                            build_mining_config(cli, false),
+                            build_gpu_watchdog_cfg(cli, true),
+                        );
                     }
                     Ok(Err(e)) => {
                         tracing::warn!("auto: CUDA init returned error: {}", e);
@@ -718,7 +791,13 @@ fn drive<W: csd_gpu_miner::stratum::loop_stratum::WorkSource>(
                             b.blocks, b.threads_per_block, b.nonces_per_thread,
                             (b.blocks as u64) * (b.threads_per_block as u64) * (b.nonces_per_thread as u64),
                         );
-                        return run_stratum(&b, work, stop, build_mining_config(cli, false));
+                        return run_stratum_with_gpu_watchdog(
+                            &b,
+                            work,
+                            stop,
+                            build_mining_config(cli, false),
+                            build_gpu_watchdog_cfg(cli, true),
+                        );
                     }
                     Err(e) => {
                         tracing::warn!("auto: OpenCL init failed: {}", e);
@@ -740,7 +819,14 @@ fn drive<W: csd_gpu_miner::stratum::loop_stratum::WorkSource>(
             tracing::warn!(
                 "auto: no GPU backend was usable — run `csd-gpu-miner devices` (or `--list-devices`) for the probe, or rebuild with `--features cuda` / `--features opencl` to compile GPU support in"
             );
-            run_stratum(&b, work, stop, build_mining_config(cli, true))
+            // Fell back to CPU ⇒ no GPU to watch ⇒ watchdog disabled.
+            run_stratum_with_gpu_watchdog(
+                &b,
+                work,
+                stop,
+                build_mining_config(cli, true),
+                build_gpu_watchdog_cfg(cli, false),
+            )
         }
     }
 }

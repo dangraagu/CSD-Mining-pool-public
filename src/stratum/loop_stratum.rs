@@ -28,6 +28,9 @@ use anyhow::Result;
 
 use crate::backend::{MiningBackend, MiningResult};
 use crate::coinbase::{coinbase_txid, header_84, merkle_root_from_branch};
+use crate::gpu_watchdog::{
+    gpu_watchdog_tick, GpuWatchdogCfg, GpuWatchdogState, GpuWatchdogView, Recoverable,
+};
 use crate::mining_config::{partition_nonce_range, MiningConfig};
 use crate::sha256d_cpu::{finish_sha256d_from_midstate_fast, midstate_of_first_chunk_fast};
 use crate::stratum::client::{HealthSnapshot, StratumClient, StratumJob};
@@ -311,6 +314,152 @@ fn format_health_line(h: &HealthSnapshot, difficulty: f64, hw_err: u64) -> Strin
     )
 }
 
+/// How recent the last *new* job must be for the GPU watchdog to consider work
+/// to be "flowing" (and the link healthy enough to blame the GPU for a zero
+/// hashrate). Generous — a stalled GPU stays floored for many samples, so we can
+/// afford to wait until jobs are clearly fresh before ever acting. Kept well
+/// under the reliability watchdog's 300s job-staleness so that, once jobs go
+/// truly stale, THAT watchdog reconnects and the GPU watchdog stands down (its
+/// `jobs_flowing` goes false) rather than both firing.
+const GPU_WD_JOB_FRESH_SECS: u64 = 120;
+
+/// Pure: from a [`HealthSnapshot`], are fresh jobs flowing? True iff a job has
+/// been seen and its age is within [`GPU_WD_JOB_FRESH_SECS`]. `None` job age
+/// (no job yet) ⇒ false: a miner waiting for its first job is idle, never a
+/// stalled GPU. Factored out so the idle-vs-stall gate is unit-tested directly.
+fn jobs_flowing_from_health(h: &HealthSnapshot) -> bool {
+    matches!(h.job_age_s, Some(age) if age <= GPU_WD_JOB_FRESH_SECS)
+}
+
+/// Pure: from a [`HealthSnapshot`], is the Stratum link healthy enough to hold
+/// the GPU responsible for a zero hashrate? We use "a job has arrived recently"
+/// as the liveness proxy: a live pool socket pushes work, so a fresh job age
+/// means the link is delivering (a half-open/mid-reconnect socket goes job-stale
+/// and trips the reliability watchdog instead). Conservative on purpose —
+/// `conn_healthy` and `jobs_flowing` both gate the stall decision, so a dead
+/// link makes BOTH false and the GPU watchdog stands down.
+fn conn_healthy_from_health(h: &HealthSnapshot) -> bool {
+    jobs_flowing_from_health(h)
+}
+
+/// A live [`GpuWatchdogView`] over the running loop: it reads the GPU-only
+/// hashrate the loop publishes into a shared atomic, derives jobs/link health
+/// from the work source's [`HealthSnapshot`], forwards recovery to the backend's
+/// [`Recoverable::recover`], and escalates by exiting the process with
+/// [`crate::gpu_watchdog::EXIT_GPU_STALLED`].
+///
+/// Borrows `backend` + `client` for the loop's lifetime; it is constructed and
+/// driven entirely inside the `thread::scope` in [`run_stratum`], so the borrows
+/// never need to be `'static`.
+struct LoopGpuView<'a, B: Recoverable, W: WorkSource> {
+    backend: &'a B,
+    client: &'a W,
+    /// Shared GPU-hashrate publication the loop updates at its 10s hashrate site:
+    /// `(gpu_ghs_bits, sample_at_ms)`. The hashrate is f64 bits; `sample_at_ms`
+    /// is the wall-ms the loop last completed a launch and published a sample.
+    /// Read lock-free by the watchdog.
+    gpu_sample: Arc<GpuHashrateSample>,
+    /// If the loop hasn't published a fresh GPU sample within this many ms, the
+    /// view reports 0.0 GH/s — this is the "the kernel is WEDGED and `hash_range`
+    /// never returned, so the loop can't even publish" case (distinct from a
+    /// kernel that returns instantly with zero work, which publishes ~0.0
+    /// directly). Set by `run_stratum` to a few poll intervals.
+    sample_stale_after_ms: u64,
+    /// Whether escalation really exits the process. Always true in production;
+    /// the loop's own tests don't construct this type (they use the mock view in
+    /// the gpu_watchdog module), but this keeps the door open and documents that
+    /// `escalate_exit` is a hard process kill.
+    exit_on_escalate: bool,
+}
+
+impl<'a, B: Recoverable + Sync, W: WorkSource + Sync> GpuWatchdogView for LoopGpuView<'a, B, W> {
+    fn gpu_ghs(&self) -> f64 {
+        let (ghs, at_ms) = self.gpu_sample.read();
+        // Before the FIRST published sample (`at_ms == 0`) report a healthy
+        // sentinel so a just-started miner — which hasn't completed a launch yet
+        // — is never read as floored (the dwell + jobs_flowing gates also guard
+        // this, but reporting non-floored here is the clearest "no data yet ⇒ not
+        // a stall" stance).
+        if at_ms == 0 {
+            return f64::INFINITY;
+        }
+        let now = now_unix_ms();
+        if now.saturating_sub(at_ms) > self.sample_stale_after_ms {
+            // The loop hasn't completed a launch in too long ⇒ the GPU is wedged
+            // INSIDE hash_range (it never returned to publish). Report floored so
+            // the watchdog can act — this is exactly the hung-kernel case.
+            return 0.0;
+        }
+        ghs
+    }
+    fn jobs_flowing(&self) -> bool {
+        jobs_flowing_from_health(&self.client.health())
+    }
+    fn conn_healthy(&self) -> bool {
+        conn_healthy_from_health(&self.client.health())
+    }
+    fn recover(&self) -> bool {
+        self.backend.recover()
+    }
+    fn escalate_exit(&self) {
+        if self.exit_on_escalate {
+            // Hard exit so a supervisor (systemd / HiveOS / launcher .bat)
+            // restarts the process clean. Distinct code documents the cause.
+            std::process::exit(crate::gpu_watchdog::EXIT_GPU_STALLED);
+        }
+    }
+}
+
+/// Shared, lock-free publication of the GPU's liveness for the stall watchdog —
+/// written by the mining loop, read by the GPU watchdog. Two facets:
+///   - `ghs_bits`: the latest GPU-only hashrate (GH/s), refreshed at the loop's
+///     10s windowed-rate site. This catches a kernel that RETURNS but did ~zero
+///     work (it publishes ~0.0 directly).
+///   - `at_ms`: a heartbeat stamped on EVERY completed launch (`touch`). This
+///     catches a kernel WEDGED inside `hash_range` (it never returns to touch, so
+///     the stamp goes stale and the view reports floored).
+/// Two atomics rather than a `Mutex` so neither side ever blocks the other (the
+/// hot mining loop must never wait on the watchdog).
+#[derive(Debug)]
+pub(crate) struct GpuHashrateSample {
+    ghs_bits: AtomicU64,
+    at_ms: AtomicU64,
+}
+
+impl GpuHashrateSample {
+    fn new() -> Self {
+        GpuHashrateSample {
+            ghs_bits: AtomicU64::new(0.0f64.to_bits()),
+            at_ms: AtomicU64::new(0),
+        }
+    }
+    /// Heartbeat: record that the loop just completed a launch at `now_ms`
+    /// (whether or not it found a share). Keeps `at_ms` fresh so a fast-spinning
+    /// loop is never mistaken for a wedged kernel; a truly hung kernel stops
+    /// touching and the stamp ages out.
+    fn touch(&self, now_ms: u64) {
+        self.at_ms.store(now_ms, Ordering::Relaxed);
+    }
+    /// Publish the latest GPU-only windowed hashrate (GH/s); also heartbeats.
+    fn publish(&self, ghs: f64, now_ms: u64) {
+        self.ghs_bits.store(ghs.to_bits(), Ordering::Relaxed);
+        self.at_ms.store(now_ms, Ordering::Relaxed);
+    }
+    /// Read `(ghs, last_heartbeat_ms)`; `at_ms == 0` ⇒ no launch completed yet.
+    fn read(&self) -> (f64, u64) {
+        (
+            f64::from_bits(self.ghs_bits.load(Ordering::Relaxed)),
+            self.at_ms.load(Ordering::Relaxed),
+        )
+    }
+}
+
+// NB: `LoopGpuView` is `Send + Sync` automatically when `B: Sync` and `W: Sync`
+// (its only fields are shared refs + an `Arc<AtomicU64>` + a bool). The scoped
+// watchdog thread in `run_stratum` is created where both bounds already hold, so
+// no manual `unsafe impl` is needed — the borrow checker proves the refs outlive
+// the scope and the auto-traits prove thread-safety.
+
 /// Pure FNV-1a mix of a process id + an entropy word into a starting `xn2`, so
 /// two rigs mining the SAME address (one process per GPU, or across machines)
 /// begin at different coinbase regions instead of both sweeping `xn2=0..` and
@@ -322,6 +471,15 @@ fn mix_xn2_seed(pid: u32, entropy: u32) -> u32 {
         h = h.wrapping_mul(0x0100_0193);
     }
     h
+}
+
+/// Wall-clock ms since the Unix epoch (0 if the clock predates it — never
+/// panics). Used to stamp/age the GPU hashrate sample for the stall watchdog.
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Seed `xn2` from this process's id + sub-second startup entropy. Wire-safe:
@@ -341,11 +499,45 @@ fn seed_xn2() -> u32 {
 /// Work is pulled from its background-updated `latest_job()` / difficulty; found
 /// shares are submitted via `client.send_submit`. The CPU+GPU split honours the
 /// `MiningConfig` knobs `cpu_threads` and `cpu_share`.
-pub fn run_stratum<B: MiningBackend, W: WorkSource>(
+///
+/// Thin shim that runs with the GPU watchdog **disabled** — preserves every
+/// existing caller/test signature unchanged (modulo the `Sync` bounds, which all
+/// real backends/work sources and the test mocks already satisfy). Production
+/// wires the watchdog via [`run_stratum_with_gpu_watchdog`].
+pub fn run_stratum<B: MiningBackend + Recoverable + Sync, W: WorkSource + Sync>(
     backend: &B,
     client: &W,
     stop: Arc<AtomicBool>,
     cfg: MiningConfig,
+) -> Result<()> {
+    run_stratum_with_gpu_watchdog(
+        backend,
+        client,
+        stop,
+        cfg,
+        GpuWatchdogCfg {
+            enabled: false,
+            ..GpuWatchdogCfg::default()
+        },
+    )
+}
+
+/// Run the pooled Stratum mining loop with an optional **GPU stall watchdog**.
+///
+/// Identical to [`run_stratum`] but additionally samples the GPU-only hashrate
+/// every `gpu_wd_cfg.poll`; if it stays floored while fresh jobs flow over a
+/// healthy link, it attempts an in-process [`Recoverable::recover`] and, failing
+/// that, exits the process with [`crate::gpu_watchdog::EXIT_GPU_STALLED`] for a
+/// supervisor restart. The watchdog runs as a **scoped** thread so it can borrow
+/// `backend`/`client` without a `'static` bound; it joins automatically when the
+/// loop returns. With `gpu_wd_cfg.enabled == false` the watchdog thread exits
+/// immediately and behaviour is byte-identical to the pre-watchdog loop.
+pub fn run_stratum_with_gpu_watchdog<B: MiningBackend + Recoverable + Sync, W: WorkSource + Sync>(
+    backend: &B,
+    client: &W,
+    stop: Arc<AtomicBool>,
+    cfg: MiningConfig,
+    gpu_wd_cfg: GpuWatchdogCfg,
 ) -> Result<()> {
     // Re-derive fresh work this often even if no new notify arrived, so a
     // long-lived job picks up difficulty changes and ntime drift promptly.
@@ -394,7 +586,65 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
         .watchdog_view()
         .map(|view| spawn_watchdog(view, WatchdogCfg::default(), Arc::clone(&stop)));
 
-    while !stop.load(Ordering::Relaxed) {
+    // GPU-only hashrate sample the loop publishes for the GPU stall watchdog
+    // (lock-free). Updated at the existing 10s hashrate-log site below — GPU
+    // contribution ONLY (the CPU pool's MH/s are excluded so a hung GPU with a
+    // busy CPU pool still reads as floored). The companion timestamp lets the
+    // watchdog detect a kernel wedged INSIDE `hash_range` (no fresh sample).
+    let gpu_sample = Arc::new(GpuHashrateSample::new());
+
+    // Treat the published sample as floored if it is older than 3 poll intervals
+    // — long enough that a normal between-launch gap never looks wedged, short
+    // enough that a kernel stuck in `synchronize()` is caught within a few polls.
+    let sample_stale_after_ms = (gpu_wd_cfg.poll.as_millis() as u64).saturating_mul(3);
+
+    // Drive the mining loop and the GPU stall watchdog inside one `thread::scope`
+    // so the watchdog thread can borrow `backend`/`client` (calling
+    // `backend.recover()` and `client.health()`) without a `'static` bound. The
+    // scope joins the watchdog automatically when the loop returns. When the GPU
+    // watchdog is disabled (`gpu_wd_cfg.enabled == false`, e.g. the CPU backend,
+    // `--no-gpu-watchdog`, or every existing test via `run_stratum`) its thread
+    // exits at once and this is byte-identical to the pre-watchdog loop.
+    std::thread::scope(|scope| {
+        let gpu_view = LoopGpuView {
+            backend,
+            client,
+            gpu_sample: Arc::clone(&gpu_sample),
+            sample_stale_after_ms,
+            exit_on_escalate: true,
+        };
+        let gpu_wd_stop = Arc::clone(&stop);
+        scope.spawn(move || {
+            if !gpu_wd_cfg.enabled {
+                return;
+            }
+            tracing::info!(
+                "gpu-watchdog: armed (floor={:.4} GH/s, dwell={} samples, poll={:?}, recover_window={:?}, max_recoveries={}, exit_code={})",
+                gpu_wd_cfg.floor_ghs,
+                gpu_wd_cfg.dwell_samples,
+                gpu_wd_cfg.poll,
+                gpu_wd_cfg.recover_window,
+                gpu_wd_cfg.max_recoveries,
+                crate::gpu_watchdog::EXIT_GPU_STALLED,
+            );
+            let mut state = GpuWatchdogState::default();
+            let slice = Duration::from_millis(200).min(gpu_wd_cfg.poll);
+            let mut waited = Duration::ZERO;
+            while !gpu_wd_stop.load(Ordering::Relaxed) {
+                if waited >= gpu_wd_cfg.poll {
+                    waited = Duration::ZERO;
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    gpu_watchdog_tick(&gpu_view, gpu_wd_cfg, &mut state, now_ms);
+                }
+                std::thread::sleep(slice);
+                waited += slice;
+            }
+        });
+
+    'mining: while !stop.load(Ordering::Relaxed) {
         // Emit a health heartbeat at a fixed cadence — even while idle/waiting
         // for the first job — so "connected but 0 h/s / stale" is never silent.
         if last_heartbeat.elapsed() >= Duration::from_secs(30) {
@@ -443,7 +693,7 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
         // each launch from the rolled xn2, races the backends, submits on find.
         loop {
             if stop.load(Ordering::Relaxed) {
-                return Ok(());
+                break 'mining; // shutdown: leave the mining loop (scope joins the watchdog)
             }
             if last_refresh.elapsed() > refresh_every {
                 break; // re-poll latest_job (may be the same; may be newer)
@@ -583,6 +833,15 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
             gpu_nonces_since_log = gpu_nonces_since_log.saturating_add(gpu_swept);
             cpu_nonces_since_log = cpu_nonces_since_log.saturating_add(cpu_swept_n);
 
+            // GPU watchdog heartbeat: this launch completed (hash_range returned),
+            // so the kernel is NOT wedged. Stamp it so the watchdog's
+            // stale-sample check sees the loop is alive; a hung kernel that never
+            // returns from hash_range stops reaching here and the stamp ages out.
+            // (Only meaningful when a GPU range was actually dispatched.)
+            if gpu_range.1 > gpu_range.0 {
+                gpu_sample.touch(now_unix_ms());
+            }
+
             enum WinSource {
                 Gpu(MiningResult),
                 Cpu(CpuFind),
@@ -669,6 +928,10 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
                         // D2: feed the optional stats endpoint (no-op unless the
                         // operator ran --stats-port). Never touches the share path.
                         client.record_hashrate(combined_ghs);
+                        // GPU watchdog: publish the GPU-ONLY windowed rate (CPU
+                        // excluded on purpose). A hung-but-returning kernel
+                        // publishes ~0.0 here ⇒ the watchdog floors it.
+                        gpu_sample.publish(ghs_gpu, now_unix_ms());
                         tracing::info!(
                             "stratum hashrate gpu={:.2} GH/s cpu={:.2} MH/s combined={:.2} GH/s (job={}, diff={:.2})",
                             ghs_gpu, mhs_cpu, combined_ghs, work.job_id, client.current_difficulty(),
@@ -681,7 +944,14 @@ pub fn run_stratum<B: MiningBackend, W: WorkSource>(
                 }
             }
         }
-    }
+    } // 'mining while
+
+        // The mining loop has exited (shutdown). Signal the GPU watchdog thread
+        // to stop too; the scope joins it on the way out. (Redundant with the
+        // outer `stop` the watchdog already shares, but explicit.)
+        stop.store(true, Ordering::Relaxed);
+    }); // thread::scope — joins the GPU watchdog thread here
+
     Ok(())
 }
 
@@ -805,6 +1075,7 @@ mod tests {
             None
         }
     }
+    impl Recoverable for NullGpu {} // default no-op recover()
 
     fn fixture_notify() -> NotifyParams {
         let prev_be: String = (0u8..32).map(|i| format!("{:02x}", i)).collect();
@@ -1052,6 +1323,9 @@ mod tests {
             None
         }
     }
+    impl Recoverable for MockBackend {} // default no-op recover() (the stall ladder
+                                        // is covered by the gpu_watchdog module's
+                                        // MockView tick tests)
 
     /// A socket-free [`WorkSource`]: serves one canned job + difficulty and
     /// records every submit the loop sends, so `run_stratum` can be driven
@@ -1338,5 +1612,170 @@ mod tests {
             work.submits.lock().unwrap().is_empty(),
             "the correctness gate must reject a backend find whose hash is wrong"
         );
+    }
+
+    // --- GPU stall watchdog wiring (pure helpers + the live integration) ---
+
+    #[test]
+    fn jobs_flowing_and_conn_healthy_track_job_age() {
+        // No job yet ⇒ neither flowing nor healthy (a miner waiting for its first
+        // job is idle, never a stalled GPU).
+        let none = HealthSnapshot { job_age_s: None, ..Default::default() };
+        assert!(!jobs_flowing_from_health(&none));
+        assert!(!conn_healthy_from_health(&none));
+        // Fresh job (within the freshness window) ⇒ both true.
+        let fresh = HealthSnapshot {
+            job_age_s: Some(GPU_WD_JOB_FRESH_SECS - 1),
+            ..Default::default()
+        };
+        assert!(jobs_flowing_from_health(&fresh));
+        assert!(conn_healthy_from_health(&fresh));
+        // Exactly at the window edge ⇒ still fresh (`<=`).
+        let edge = HealthSnapshot {
+            job_age_s: Some(GPU_WD_JOB_FRESH_SECS),
+            ..Default::default()
+        };
+        assert!(jobs_flowing_from_health(&edge));
+        // One second past the window ⇒ stale ⇒ the GPU watchdog stands down (the
+        // reliability watchdog owns a truly stale-job link).
+        let stale = HealthSnapshot {
+            job_age_s: Some(GPU_WD_JOB_FRESH_SECS + 1),
+            ..Default::default()
+        };
+        assert!(!jobs_flowing_from_health(&stale));
+        assert!(!conn_healthy_from_health(&stale));
+    }
+
+    #[test]
+    fn gpu_hashrate_sample_publishes_touches_and_reads() {
+        let s = GpuHashrateSample::new();
+        // No launch yet.
+        assert_eq!(s.read(), (0.0, 0));
+        // A heartbeat updates only the timestamp (rate stays 0.0).
+        s.touch(5_000);
+        assert_eq!(s.read(), (0.0, 5_000));
+        // A publish updates both.
+        s.publish(2.5, 6_000);
+        assert_eq!(s.read(), (2.5, 6_000));
+        // A later heartbeat keeps the last published rate but advances the stamp.
+        s.touch(7_000);
+        assert_eq!(s.read(), (2.5, 7_000));
+    }
+
+    /// The live view reports the GPU as floored (0.0) when the loop's last
+    /// heartbeat is older than `sample_stale_after_ms` — the kernel-wedged-inside-
+    /// hash_range case — and reports a healthy sentinel before the first sample.
+    #[test]
+    fn loop_gpu_view_reports_stale_sample_as_floored() {
+        // A standalone view over a hand-driven sample + a trivial work source /
+        // backend. We only exercise `gpu_ghs()`'s freshness logic here.
+        struct Noop;
+        impl Recoverable for Noop {}
+        let work = MockWorkSource::new(mock_job(), 1.0);
+        let backend = Noop;
+        let sample = Arc::new(GpuHashrateSample::new());
+        let view = LoopGpuView {
+            backend: &backend,
+            client: &work,
+            gpu_sample: Arc::clone(&sample),
+            sample_stale_after_ms: 1_000,
+            exit_on_escalate: false, // never kill the test runner
+        };
+        // Before any sample: healthy sentinel (not floored).
+        assert!(view.gpu_ghs().is_infinite(), "no sample yet ⇒ not floored");
+        // A fresh publish reads through as-is.
+        sample.publish(3.0, now_unix_ms());
+        let g = view.gpu_ghs();
+        assert!((g - 3.0).abs() < 1e-9, "fresh sample reads its rate, got {g}");
+        // An ancient heartbeat (2s ago > 1s stale window) ⇒ reported floored 0.0,
+        // regardless of the published rate, so the watchdog can catch a wedged
+        // kernel that stopped completing launches.
+        sample.publish(3.0, now_unix_ms().saturating_sub(2_000));
+        assert_eq!(view.gpu_ghs(), 0.0, "stale heartbeat ⇒ floored");
+    }
+
+    /// Drive the REAL `run_stratum_with_gpu_watchdog` with the watchdog ENABLED
+    /// but a backend that hashes fine (never stalls): it must map the job,
+    /// dispatch the backend, run the watchdog thread alongside, and shut down
+    /// cleanly on `stop` — never recovering, never exiting. This is the
+    /// end-to-end proof that arming the watchdog doesn't disturb the happy path
+    /// (the stall→recover→exit ladder itself is unit-tested in the gpu_watchdog
+    /// module against its MockView).
+    #[test]
+    fn run_with_gpu_watchdog_enabled_happy_path_shuts_down_clean() {
+        let work = Arc::new(MockWorkSource::new(mock_job(), 1024.0));
+        let backend = Arc::new(MockBackend::new(vec![])); // never finds, blocks on stop
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let work_for_loop = Arc::clone(&work);
+        let backend_for_loop = Arc::clone(&backend);
+        let stop_for_loop = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let cfg = MiningConfig { cpu_threads: 0, cpu_share: 0.0 };
+            // Watchdog ON, but a generous floor of 0 + fast poll: since the mock
+            // GPU blocks in hash_range (no sample ever published, `at_ms == 0`),
+            // the view reports the INFINITY sentinel ⇒ never floored ⇒ no action.
+            let gpu_wd = GpuWatchdogCfg {
+                enabled: true,
+                poll: Duration::from_millis(5),
+                dwell_samples: 1,
+                ..GpuWatchdogCfg::default()
+            };
+            run_stratum_with_gpu_watchdog(
+                backend_for_loop.as_ref(),
+                work_for_loop.as_ref(),
+                stop_for_loop,
+                cfg,
+                gpu_wd,
+            )
+        });
+
+        // Wait for the backend to be dispatched, let the watchdog tick a few
+        // times, then stop.
+        for _ in 0..300 {
+            if backend.calls.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(60)); // let the watchdog poll
+        stop.store(true, Ordering::Relaxed);
+        let result = handle.join().expect("loop thread did not panic");
+        assert!(result.is_ok(), "run_stratum_with_gpu_watchdog returns Ok on clean shutdown");
+        assert!(
+            backend.calls.load(Ordering::Relaxed) > 0,
+            "the loop must have dispatched the backend alongside the armed watchdog"
+        );
+        assert!(
+            work.submits.lock().unwrap().is_empty(),
+            "no share at diff 1024 in the brief window"
+        );
+    }
+
+    /// With the watchdog DISABLED (the `run_stratum` shim's path), behaviour is
+    /// byte-identical to the pre-watchdog loop: dispatch + clean shutdown, the
+    /// watchdog thread exits immediately.
+    #[test]
+    fn run_stratum_shim_disables_gpu_watchdog() {
+        let work = Arc::new(MockWorkSource::new(mock_job(), 1024.0));
+        let backend = Arc::new(MockBackend::new(vec![]));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let work_for_loop = Arc::clone(&work);
+        let backend_for_loop = Arc::clone(&backend);
+        let stop_for_loop = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let cfg = MiningConfig { cpu_threads: 0, cpu_share: 0.0 };
+            run_stratum(backend_for_loop.as_ref(), work_for_loop.as_ref(), stop_for_loop, cfg)
+        });
+        for _ in 0..300 {
+            if backend.calls.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert!(handle.join().expect("no panic").is_ok());
+        assert!(backend.calls.load(Ordering::Relaxed) > 0);
     }
 }
