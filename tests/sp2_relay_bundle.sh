@@ -325,6 +325,85 @@ assert_contains "mine-auto.bat: CSD_CANONICAL_TIP_URL set" \
 assert_contains "mine-auto.bat: CSD_CANON_REORG_AHEAD set" \
   "$REPO_ROOT/mine-auto.bat" 'CSD_CANON_REORG_AHEAD'
 
+# ── 20. `node` subcommand precedes relay flags (REGRESSION: fix/relay-launch-node-subcmd) ─
+# The relay binary (csd-node) is subcommand-based: --rpc/--peer-seeds/--push-peers-file
+# belong under the `node` subcommand. Without `node` as the first arg, the binary exits 2
+# ("unexpected argument '--rpc'") and the relay NEVER STARTS fleet-wide. These assertions
+# lock in: (a) `node` appears as its own arg BEFORE --rpc and --peer-seeds in every launcher,
+# (b) the required --push-peers-file flag is present, (c) all 6 real seed multiaddrs are
+# present, (d) the broken "binary immediately followed by --rpc" shape is absent.
+echo
+echo "-- node subcommand precedes relay flags + push-peers-file + 6 seeds --"
+
+# assert_before NAME FILE EARLIER_PATTERN LATER_PATTERN — both must exist and EARLIER must
+# be on a strictly lower line number than LATER (first match of each).
+assert_before() {
+  local name="$1" file="$2" earlier="$3" later="$4"
+  local el ll
+  el=$(grep -nE "$earlier" "$file" 2>/dev/null | head -1 | cut -d: -f1)
+  ll=$(grep -nE "$later"   "$file" 2>/dev/null | head -1 | cut -d: -f1)
+  if [ -n "$el" ] && [ -n "$ll" ] && [ "$el" -lt "$ll" ]; then
+    ok "$name (node@$el before flag@$ll)"
+  else
+    fail "$name" "expected '$earlier' (line ${el:-MISSING}) before '$later' (line ${ll:-MISSING})"
+  fi
+}
+
+# h-run.sh: the relay launch block is anchored by `nice -n 19 ionice -c 3`; `node` must
+# appear after the relay binary and before --rpc/--peer-seeds. We scope to the relay launch
+# region by searching from the nice/ionice anchor onward.
+for f in "hiveos/h-run.sh:    node \\\\:h-run.sh" "mine-auto.sh:      node \\\\:mine-auto.sh"; do
+  path="${f%%:*}"; rest="${f#*:}"; nodepat="${rest%%:*}"; label="${rest##*:}"
+  # `node \` standalone line present in the relay launch
+  assert_contains "$label: standalone 'node' arg line in relay launch" \
+    "$REPO_ROOT/$path" '^[[:space:]]+node \\$'
+  # node line precedes the relay --rpc and --peer-seeds
+  assert_before "$label: node precedes --rpc" "$REPO_ROOT/$path" '^[[:space:]]+node \\$' '^[[:space:]]+--rpc 127'
+  assert_before "$label: node precedes --peer-seeds" "$REPO_ROOT/$path" '^[[:space:]]+node \\$' '^[[:space:]]+--peer-seeds /ip4'
+  # required --push-peers-file flag present in launch
+  assert_contains "$label: --push-peers-file flag in relay launch" \
+    "$REPO_ROOT/$path" '^[[:space:]]+--push-peers-file '
+  # the broken shape (relay binary line immediately followed by --rpc, no node) must be ABSENT.
+  # grep is line-based, so use -A1 on the "$RELAY_BIN" \ line and confirm the NEXT line is not --rpc.
+  if grep -A1 '"\$RELAY_BIN" \\$' "$REPO_ROOT/$path" 2>/dev/null | grep -qE '^[[:space:]]+--rpc'; then
+    fail "$label: NO broken '\$RELAY_BIN then --rpc' (missing node)" \
+      "the relay binary line is immediately followed by --rpc — 'node' subcommand is missing"
+  else
+    ok "$label: relay binary line not immediately followed by --rpc (node present)"
+  fi
+done
+
+# mine-auto.bat: relay launch anchored by `start ... /LOW /B ... !RELAY_BIN!`; `node ^`
+# must precede --rpc / --peer-seeds.
+assert_contains "mine-auto.bat: standalone 'node' arg line in relay launch" \
+  "$REPO_ROOT/mine-auto.bat" '^[[:space:]]+node \^'
+assert_before "mine-auto.bat: node precedes --rpc" \
+  "$REPO_ROOT/mine-auto.bat" '^[[:space:]]+node \^' '^[[:space:]]+--rpc 127'
+assert_before "mine-auto.bat: node precedes --peer-seeds" \
+  "$REPO_ROOT/mine-auto.bat" '^[[:space:]]+node \^' '^[[:space:]]+--peer-seeds /ip4'
+assert_contains "mine-auto.bat: --push-peers-file flag in relay launch" \
+  "$REPO_ROOT/mine-auto.bat" '^[[:space:]]+--push-peers-file '
+# bat: the binary launch line must NOT be immediately followed by --rpc (i.e. node missing).
+if grep -A1 'RELAY_BIN!" \^' "$REPO_ROOT/mine-auto.bat" 2>/dev/null | grep -qE '^[[:space:]]+--rpc'; then
+  fail "mine-auto.bat: NO broken '!RELAY_BIN! ^ then --rpc' (missing node)" \
+    "the relay binary launch line is immediately followed by --rpc — 'node' subcommand is missing"
+else
+  ok "mine-auto.bat: relay binary launch line not immediately followed by --rpc (node present)"
+fi
+
+# All 6 real seed multiaddrs must be present in every launcher (the 3 NEW ones below were
+# previously missing). We check the 3 newly-added PeerIds specifically.
+echo
+echo "-- all 6 seed multiaddrs present (3 were previously missing) --"
+for newseed in \
+  '12D3KooWLydGAnXtXH4L37gVZWohAZNvKdFgHwVN4nhUzgrvX8cW' \
+  '12D3KooWHKcjL8M5snr3GniC8xRtGJGbGhPSdGiqtZNRz6UFj1t3' \
+  '12D3KooWFsHa5ifqK45Fjd8cYnDkVDN8R8MfjfiETNpEqnbGAEez' ; do
+  assert_contains "h-run.sh: seed $newseed present"     "$REPO_ROOT/hiveos/h-run.sh"  "$newseed"
+  assert_contains "mine-auto.sh: seed $newseed present" "$REPO_ROOT/mine-auto.sh"     "$newseed"
+  assert_contains "mine-auto.bat: seed $newseed present" "$REPO_ROOT/mine-auto.bat"   "$newseed"
+done
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo
 echo "========================================"

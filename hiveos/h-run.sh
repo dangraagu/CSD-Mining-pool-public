@@ -354,18 +354,20 @@ echo "[h-run] auto-update sidecar started (PID=$!, marker=$SIDE_MARKER, poll eve
 #   CSD_CANONICAL_TIP_URL env                 canonical oracle
 #   CSD_CANON_REORG_AHEAD env                 SP1.1 auth-reorg depth (= 7)
 #
-# *** OPERATOR ACTION REQUIRED ***
-# Replace the --peer-seeds value below with real operator seed multiaddrs.
-# The placeholder seeds below are from the anchor.service peer-seeds list.
-# TODO(operator): confirm wallet-new subcommand name (`csd-relay-node wallet new --out <path>`)
-# against `csd-relay-node --help`; update if it differs.
+# Seeds + wallet-new subcommand confirmed against the release relay binary
+# (csd-node `node` subcommand): `--peer-seeds` accepts the operator's libp2p
+# multiaddrs and `wallet new --out <path>` is correct.
 #
 RELAY_BIN="$(dirname "$0")/csd-relay-node"
 RELAY_DATADIR="/var/lib/csd-relay"
 RELAY_WALLET="$RELAY_DATADIR/wallet.json"
 RELAY_BLACKLIST="$RELAY_DATADIR/blacklist.txt"
 RELAY_LOG="/var/log/miner/csd-pool-miner/csd-relay-node.log"
+# Required by the `node` subcommand (binary rejects its absence). The relay is a
+# follower and never mines, so an empty fanout list is correct.
+RELAY_PUSH_PEERS="$RELAY_DATADIR/push-peers.txt"
 mkdir -p "$RELAY_DATADIR" "$(dirname "$RELAY_LOG")"
+[ -f "$RELAY_PUSH_PEERS" ] || : > "$RELAY_PUSH_PEERS"
 
 if [ -x "$RELAY_BIN" ]; then
   # Orphan cleanup: kill any leftover relay from a previous HiveOS slot restart
@@ -376,7 +378,6 @@ if [ -x "$RELAY_BIN" ]; then
   # placeholder on first run.
   if [ ! -f "$RELAY_WALLET" ]; then
     echo "[h-run] SP2: relay wallet absent — generating placeholder wallet..." | tee -a "$LOG"
-    # TODO(operator): confirm exact subcommand against `csd-relay-node --help`.
     if "$RELAY_BIN" wallet new --out "$RELAY_WALLET" >> "$RELAY_LOG" 2>&1; then
       echo "[h-run] SP2: relay wallet created at $RELAY_WALLET" | tee -a "$LOG"
     else
@@ -391,10 +392,12 @@ if [ -x "$RELAY_BIN" ]; then
   CSD_CANON_REORG_AHEAD="7" \
   nice -n 19 ionice -c 3 \
     "$RELAY_BIN" \
+    node \
     --rpc 127.0.0.1:18645 \
     --datadir "$RELAY_DATADIR" \
     --wallet "$RELAY_WALLET" \
-    --peer-seeds /ip4/81.167.197.88/tcp/17999/p2p/12D3KooWA2GFgHLyXSZFVnzuchdesWhqnu7HWw637RXF9P6vW6zK,/ip4/141.94.163.242/tcp/18007/p2p/12D3KooWKGhuUhAwGDf3MtqL581h3gttvFg9Z2p1ej9wFTdKfdSM,/ip4/135.125.170.218/tcp/18007/p2p/12D3KooWSDqQj345ir2Ak5TUKHMn3wPTNsdJCbfPVq66aac29nKt \
+    --push-peers-file "$RELAY_PUSH_PEERS" \
+    --peer-seeds /ip4/81.167.197.88/tcp/17999/p2p/12D3KooWA2GFgHLyXSZFVnzuchdesWhqnu7HWw637RXF9P6vW6zK,/ip4/141.94.163.242/tcp/18007/p2p/12D3KooWKGhuUhAwGDf3MtqL581h3gttvFg9Z2p1ej9wFTdKfdSM,/ip4/135.125.170.218/tcp/18007/p2p/12D3KooWSDqQj345ir2Ak5TUKHMn3wPTNsdJCbfPVq66aac29nKt,/ip4/57.129.84.73/tcp/18007/p2p/12D3KooWLydGAnXtXH4L37gVZWohAZNvKdFgHwVN4nhUzgrvX8cW,/ip4/158.69.116.36/tcp/17999/p2p/12D3KooWHKcjL8M5snr3GniC8xRtGJGbGhPSdGiqtZNRz6UFj1t3,/ip4/145.239.0.111/tcp/17999/p2p/12D3KooWFsHa5ifqK45Fjd8cYnDkVDN8R8MfjfiETNpEqnbGAEez \
     --p2p-listen /ip4/0.0.0.0/tcp/18644 \
     >> "$RELAY_LOG" 2>&1 &
   echo "[h-run] SP2: csd-relay-node PID=$! (log: $RELAY_LOG)" | tee -a "$LOG"

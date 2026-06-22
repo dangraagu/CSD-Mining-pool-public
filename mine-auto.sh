@@ -65,8 +65,7 @@ mkdir -p "$DATA_DIR" "$CFG_DIR"
 # as a standalone release asset (or extracted from the HiveOS tarball). The relay
 # runs resource-capped (nice/ionice) so it never starves the GPU miner.
 #
-# SP2 relay-node launch args — PLACEHOLDERS (fill real values for v0.1.9):
-#   *** OPERATOR ACTION REQUIRED ***
+# SP2 relay-node launch args (REAL flags + seeds confirmed against binary):
 #   --rpc             127.0.0.1:18645         local RPC (SP1.2 anchor config; REAL flag)
 #   --datadir         $HOME/.local/share/csd-relay  relay chain data dir
 #   --peer-seeds      <comma-sep multiaddrs>  well-known peers (confirmed real flag)
@@ -80,8 +79,7 @@ mkdir -p "$DATA_DIR" "$CFG_DIR"
 # is just a placeholder. If the wallet file is absent, we generate one below
 # before launch using:
 #   <relay-bin> wallet new --out <path>
-# TODO(operator): confirm the exact wallet-new subcommand name against `csd-relay-node --help`.
-# If it differs (e.g. `keygen`, `new-wallet`), update RELAY_WALLET_CMD below.
+# wallet-new subcommand confirmed against the release relay binary.
 #
 RELAY_BIN_NAME="csd-relay-node"
 RELAY_BIN="$DATA_DIR/$RELAY_BIN_NAME"
@@ -90,7 +88,9 @@ RELAY_WALLET="$DATA_DIR/relay-wallet.json"
 RELAY_BLACKLIST="$CFG_DIR/relay-blacklist.txt"
 RELAY_LOG="$DATA_DIR/relay.log"
 RELAY_PID=0   # tracked PID of the background relay process; 0 = not running
-# TODO(operator): confirm exact subcommand; update if it differs from "wallet new --out <path>"
+# Required by the `node` subcommand (binary rejects its absence). The relay is a
+# follower and never mines, so an empty fanout list is correct.
+RELAY_PUSH_PEERS="$DATA_DIR/relay-push-peers.txt"
 RELAY_WALLET_CMD=("$RELAY_BIN" wallet new --out "$RELAY_WALLET")
 # ── end SP2 constants ─────────────────────────────────────────────────────────
 
@@ -334,11 +334,11 @@ start_miners() {
     echo "[$(date '+%H:%M:%S')] SP2: relay already running (PID=$RELAY_PID) — skipping re-launch."
   elif [ -x "$RELAY_BIN" ]; then
     mkdir -p "$RELAY_DATADIR" "$(dirname "$RELAY_LOG")"
+    [ -f "$RELAY_PUSH_PEERS" ] || : > "$RELAY_PUSH_PEERS"
     # Wallet: required by the binary even when not mining. Generate a throwaway
     # placeholder on first run.
     if [ ! -f "$RELAY_WALLET" ]; then
       echo "[$(date '+%H:%M:%S')] SP2: relay wallet absent — generating placeholder wallet..."
-      # TODO(operator): if the subcommand name differs, update RELAY_WALLET_CMD above.
       if "${RELAY_WALLET_CMD[@]}" >> "$RELAY_LOG" 2>&1; then
         echo "[$(date '+%H:%M:%S')] SP2: relay wallet created at $RELAY_WALLET"
       else
@@ -351,10 +351,12 @@ start_miners() {
     CSD_CANON_REORG_AHEAD="7" \
     nice -n 19 ionice -c 3 \
       "$RELAY_BIN" \
+      node \
       --rpc 127.0.0.1:18645 \
       --datadir "$RELAY_DATADIR" \
       --wallet "$RELAY_WALLET" \
-      --peer-seeds /ip4/81.167.197.88/tcp/17999/p2p/12D3KooWA2GFgHLyXSZFVnzuchdesWhqnu7HWw637RXF9P6vW6zK,/ip4/141.94.163.242/tcp/18007/p2p/12D3KooWKGhuUhAwGDf3MtqL581h3gttvFg9Z2p1ej9wFTdKfdSM,/ip4/135.125.170.218/tcp/18007/p2p/12D3KooWSDqQj345ir2Ak5TUKHMn3wPTNsdJCbfPVq66aac29nKt \
+      --push-peers-file "$RELAY_PUSH_PEERS" \
+      --peer-seeds /ip4/81.167.197.88/tcp/17999/p2p/12D3KooWA2GFgHLyXSZFVnzuchdesWhqnu7HWw637RXF9P6vW6zK,/ip4/141.94.163.242/tcp/18007/p2p/12D3KooWKGhuUhAwGDf3MtqL581h3gttvFg9Z2p1ej9wFTdKfdSM,/ip4/135.125.170.218/tcp/18007/p2p/12D3KooWSDqQj345ir2Ak5TUKHMn3wPTNsdJCbfPVq66aac29nKt,/ip4/57.129.84.73/tcp/18007/p2p/12D3KooWLydGAnXtXH4L37gVZWohAZNvKdFgHwVN4nhUzgrvX8cW,/ip4/158.69.116.36/tcp/17999/p2p/12D3KooWHKcjL8M5snr3GniC8xRtGJGbGhPSdGiqtZNRz6UFj1t3,/ip4/145.239.0.111/tcp/17999/p2p/12D3KooWFsHa5ifqK45Fjd8cYnDkVDN8R8MfjfiETNpEqnbGAEez \
       --p2p-listen /ip4/0.0.0.0/tcp/18644 \
       >> "$RELAY_LOG" 2>&1 &
     RELAY_PID="$!"

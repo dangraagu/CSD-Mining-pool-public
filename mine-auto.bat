@@ -78,7 +78,7 @@ REM WALLET: relay requires --wallet (binary hard-rejects absent/zero wallet).
 REM The relay never mines (no bridge polls it). If the wallet file is absent,
 REM the operator must generate one manually:
 REM   csd-relay-node.exe wallet new --out %RELAY_WALLET%
-REM TODO(operator): confirm exact subcommand against `csd-relay-node.exe --help`.
+REM wallet-new subcommand confirmed against the release relay binary.
 REM
 set "RELAY_EXE=csd-relay-node.exe"
 set "RELAY_BIN=%DIR%\%RELAY_EXE%"
@@ -86,6 +86,9 @@ set "RELAY_DATADIR=%LOCALAPPDATA%\csd-relay"
 set "RELAY_WALLET=%RELAY_DATADIR%\wallet.json"
 set "RELAY_BLACKLIST=%DIR%\relay-blacklist.txt"
 set "RELAY_LOG=%DIR%\relay.log"
+REM Required by the `node` subcommand (binary rejects its absence). The relay is a
+REM follower and never mines, so an empty fanout list is correct.
+set "RELAY_PUSH_PEERS=%RELAY_DATADIR%\push-peers.txt"
 REM ── end SP2 constants ────────────────────────────────────────────────────────
 
 echo(
@@ -314,7 +317,8 @@ if exist "!RELAY_BIN!" (
   ) else (
     echo [%time%] SP2: launching csd-relay-node /LOW /B
     if not exist "!RELAY_DATADIR!" mkdir "!RELAY_DATADIR!"
-    REM TODO(operator): if relay wallet absent, generate first:
+    if not exist "!RELAY_PUSH_PEERS!" type nul > "!RELAY_PUSH_PEERS!"
+    REM Relay wallet, if absent, is generated with:
     REM   csd-relay-node.exe wallet new --out "!RELAY_WALLET!"
     if not exist "!RELAY_WALLET!" (
       echo [%time%] SP2: WARNING - relay wallet not found at !RELAY_WALLET!. Relay may fail to start.
@@ -325,10 +329,12 @@ if exist "!RELAY_BIN!" (
     set "CSD_CANONICAL_TIP_URL=https://explorer.computesubstrate.org"
     set "CSD_CANON_REORG_AHEAD=7"
     start "CSD relay-node (SP2)" /LOW /B "!RELAY_BIN!" ^
+      node ^
       --rpc 127.0.0.1:18645 ^
       --datadir "!RELAY_DATADIR!" ^
       --wallet "!RELAY_WALLET!" ^
-      --peer-seeds /ip4/81.167.197.88/tcp/17999/p2p/12D3KooWA2GFgHLyXSZFVnzuchdesWhqnu7HWw637RXF9P6vW6zK,/ip4/141.94.163.242/tcp/18007/p2p/12D3KooWKGhuUhAwGDf3MtqL581h3gttvFg9Z2p1ej9wFTdKfdSM,/ip4/135.125.170.218/tcp/18007/p2p/12D3KooWSDqQj345ir2Ak5TUKHMn3wPTNsdJCbfPVq66aac29nKt ^
+      --push-peers-file "!RELAY_PUSH_PEERS!" ^
+      --peer-seeds /ip4/81.167.197.88/tcp/17999/p2p/12D3KooWA2GFgHLyXSZFVnzuchdesWhqnu7HWw637RXF9P6vW6zK,/ip4/141.94.163.242/tcp/18007/p2p/12D3KooWKGhuUhAwGDf3MtqL581h3gttvFg9Z2p1ej9wFTdKfdSM,/ip4/135.125.170.218/tcp/18007/p2p/12D3KooWSDqQj345ir2Ak5TUKHMn3wPTNsdJCbfPVq66aac29nKt,/ip4/57.129.84.73/tcp/18007/p2p/12D3KooWLydGAnXtXH4L37gVZWohAZNvKdFgHwVN4nhUzgrvX8cW,/ip4/158.69.116.36/tcp/17999/p2p/12D3KooWHKcjL8M5snr3GniC8xRtGJGbGhPSdGiqtZNRz6UFj1t3,/ip4/145.239.0.111/tcp/17999/p2p/12D3KooWFsHa5ifqK45Fjd8cYnDkVDN8R8MfjfiETNpEqnbGAEez ^
       --p2p-listen /ip4/0.0.0.0/tcp/18644 ^
       >> "!RELAY_LOG!" 2>&1
     echo [%time%] SP2: csd-relay-node started ^(log: !RELAY_LOG!^)
