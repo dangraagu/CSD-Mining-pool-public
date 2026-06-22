@@ -10,7 +10,7 @@ Every release ships a ready-made HiveOS **Custom-miner package**, so setup is ju
 
    | Field | Value |
    |---|---|
-   | Installation URL | `https://github.com/dangraagu/CSD-Mining-pool-public/releases/download/v0.1.8/csd-pool-miner-0.1.8.tar.gz` |
+   | Installation URL | `https://github.com/dangraagu/CSD-Mining-pool-public/releases/latest/download/csd-pool-miner.tar.gz` |
    | Miner name | `csd-pool-miner` |
    | Hash algorithm | *anything — not used* |
    | Wallet and worker template | `%WAL%` |
@@ -31,4 +31,8 @@ Every release ships a ready-made HiveOS **Custom-miner package**, so setup is ju
 
 - **The Pool URL field does nothing.** The pool endpoint is compiled into the binary and can't be changed — just set the wallet and apply.
 - **Do not put `--pool` in Extra config arguments** — the miner will reject it and won't start.
-- **Updating:** HiveOS does not auto-update custom miners. To move to a newer version, change the *Installation URL* to that release's `csd-pool-miner-<version>.tar.gz` and re-apply the Flight Sheet.
+- **Updating is now automatic — you do not need to touch the Flight Sheet again.** `h-run.sh` self-updates the miner on this rig:
+  - **At every start** it checks the latest GitHub release and, if a newer version is published, downloads the matching build, **verifies its SHA-256 against the release `SHA256SUMS`**, and atomically swaps it in *before* launching — so a rig that has been off comes back up current.
+  - **While running** a background poll checks roughly every 15 minutes (`CHECK_MIN`); when a newer version verifies, it swaps the binary and bounces the miner so HiveOS relaunches on the new build.
+  - **Fail-safe:** any update failure (no network, GitHub rate-limit, SHA mismatch, partial download, disk full) is logged and the rig keeps mining on the **existing** binary — an update problem never strands or bricks a rig. Update activity is written to the miner log under `/var/log/miner/csd-pool-miner/`.
+  - The **Installation URL above is the non-staling `releases/latest/download/` form**, so re-running the install (or adding a new rig) always pulls the current release. You only ever need to re-apply the Flight Sheet to *reinstall the glue* (e.g. after a HiveOS image wipe), not to update the miner.

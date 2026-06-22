@@ -151,11 +151,27 @@ stats endpoint, so the kH/s is always correct).
 
 ## Auto-update (24/7 rigs)
 
-`mine-auto.sh` (Linux) / `mine-auto.bat` (Windows) run every card and keep the
-binary current: they check the latest release with a proper semver compare,
+Every launcher keeps the binary current on its own — you never have to babysit a
+version. They check the latest release with a proper **numeric semver compare**,
 **verify the download's SHA-256 against the release `SHA256SUMS` before swapping
-it in** (atomic, and they keep the running binary if verification fails), and
-restart the miner if it ever exits.
+it in** (atomic — and they keep the running binary if verification fails), then
+restart the miner on the new build:
+
+- **`mine-auto.sh` / `mine-auto.bat`** — every card + auto-update + crash-restart
+  (recommended for 24/7 rigs).
+- **`mine-all-gpus.sh` / `mine-all-gpus.bat`** — every card; a background poll now
+  applies verified updates and restarts the per-GPU miners.
+- **The one-click installers** (`install-csd-miner.sh` / `.bat`) hand off to
+  `mine-auto` after setup, so the one-click path polls for updates too.
+- **HiveOS** now self-updates as well: `h-run.sh` checks at startup *and* on a
+  background ~15-min poll, verifies, swaps, and bounces the miner so HiveOS
+  relaunches on the new binary — no Flight Sheet change needed. See
+  [docs/HIVEOS.md](docs/HIVEOS.md).
+
+**Fail-safe is the rule everywhere:** any update failure (no network, GitHub
+rate-limit, SHA mismatch, partial download, disk full) is logged and the rig
+keeps mining on the binary it already has — an update problem can never strand or
+brick a rig.
 
 ## Reliability (watchdog + auto-reconnect)
 

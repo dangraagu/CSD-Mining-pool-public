@@ -11,6 +11,7 @@ name: release
 #   csd-pool-miner-nvidia.exe / csd-pool-miner-linux-nvidia  (CUDA; best-effort)
 #   csd-pool-miner-amd.exe    / csd-pool-miner-linux-amd     (OpenCL; best-effort)
 #   csd-pool-miner-<ver>.tar.gz                              (HiveOS custom miner; also incl. csd-relay-node)
+#   csd-pool-miner.tar.gz                                    (stable-named alias of the above for releases/latest/download)
 #   csd-relay-node                                           (SP2: canonical-anchor relay, fetched from csd2 release)
 #   SHA256SUMS                                               (digests of all the above)
 #
@@ -252,6 +253,13 @@ jobs:
           fi
           tar -czf "dist/${PKG}-${VER}.tar.gz" -C hiveos-pkg "$PKG"
           echo "packed dist/${PKG}-${VER}.tar.gz"
+          # Also publish a STABLE-NAMED copy so the HiveOS Installation URL can be
+          # the non-staling  releases/latest/download/csd-pool-miner.tar.gz  form
+          # (docs/HIVEOS.md) instead of a pinned vX.Y.Z tarball that goes stale
+          # every release. Byte-identical to the versioned tarball; SHA256SUMS
+          # (generated in the release job over every dist/ file) covers both.
+          cp "dist/${PKG}-${VER}.tar.gz" "dist/${PKG}.tar.gz"
+          echo "packed dist/${PKG}.tar.gz (stable-named alias for releases/latest)"
 
       - name: List built artifacts
         run: ls -la dist
