@@ -80,17 +80,17 @@ jobs:
         shell: pwsh
         run: New-Item -ItemType Directory -Force dist | Out-Null
 
-      - name: Build CPU (always works, no GPU deps)
+      - name: Build CPU (always works, no GPU deps; +winsvc Windows-Service glue, no GPU/network dep)
         shell: pwsh
         run: |
-          cargo build --release
+          cargo build --release --features winsvc
           Copy-Item target/release/csd-gpu-miner.exe dist/csd-pool-miner-cpu.exe
 
-      - name: Build NVIDIA (cuda)
+      - name: Build NVIDIA (cuda + nvml telemetry + winsvc)
         continue-on-error: true
         shell: pwsh
         run: |
-          cargo build --release --features cuda
+          cargo build --release --features cuda,nvml,winsvc
           Copy-Item target/release/csd-gpu-miner.exe dist/csd-pool-miner-nvidia.exe
 
       - name: Install OpenCL via vcpkg (for the AMD build)
@@ -100,11 +100,11 @@ jobs:
           & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install opencl:x64-windows
           "LIB=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\lib;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Build AMD (opencl)
+      - name: Build AMD (opencl + winsvc)
         continue-on-error: true
         shell: pwsh
         run: |
-          cargo build --release --features opencl
+          cargo build --release --features opencl,winsvc
           Copy-Item target/release/csd-gpu-miner.exe dist/csd-pool-miner-amd.exe
 
       - name: List built artifacts
@@ -137,10 +137,10 @@ jobs:
       # NVIDIA: the CUDA backend embeds a pre-built PTX and JITs it via the driver,
       # so this build needs NO CUDA Toolkit on the runner (cudarc dlopens the driver
       # at runtime; the PTX is committed). continue-on-error keeps CPU shipping.
-      - name: Build NVIDIA (cuda)
+      - name: Build NVIDIA (cuda + nvml telemetry)
         continue-on-error: true
         run: |
-          cargo build --release --features cuda
+          cargo build --release --features cuda,nvml
           cp target/release/csd-gpu-miner dist/csd-pool-miner-linux-nvidia
 
       - name: Install OpenCL loader + headers (for the AMD build)
