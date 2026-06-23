@@ -20,6 +20,12 @@ set -euo pipefail
 
 REPO="dangraagu/CSD-Mining-pool-public"
 
+# Release/raw base URLs. Overridable ONLY for hermetic tests (point them at a
+# local file:// fake-release dir); unset in normal use, so production always hits
+# GitHub. They control BOTH the binary fetch and the SHA256SUMS fetch.
+BASE_URL="${CSD_BASE_URL:-https://github.com/$REPO/releases/latest/download}"
+RAW_BASE="${CSD_RAW_BASE_URL:-https://raw.githubusercontent.com/$REPO/main}"
+
 # XDG dirs: binary lives under data, address under config.
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/csd-pool-miner"
 CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/csd-pool-miner"
@@ -47,6 +53,20 @@ download() {
     echo "[X] Neither 'curl' nor 'wget' is installed. Install one and re-run." >&2
     echo "    Ubuntu/Debian:  sudo apt-get install -y curl" >&2
     return 1
+  fi
+}
+
+# Fetch the release SHA256SUMS and echo the expected hex digest for $1 (the asset
+# basename). Empty output => no SHA256SUMS published OR the asset isn't listed;
+# the caller treats empty as "cannot verify" and FAILS CLOSED. Mirrors the same
+# helper in the steady-state launcher mine-auto.sh. Line format is
+# `<hex>  <filename>` (sha256sum style; the filename may be "*"-prefixed).
+expected_sha() {
+  local asset="$1" sums
+  sums="$DATA_DIR/SHA256SUMS.tmp"
+  if download "$BASE_URL/SHA256SUMS" "$sums" 2>/dev/null; then
+    awk -v a="$asset" '$2==a || $2=="*"a {print $1; exit}' "$sums"
+    rm -f "$sums"
   fi
 }
 
@@ -90,27 +110,79 @@ esac
 
 BIN_NAME="csd-pool-miner-linux-$VARIANT"
 BIN="$DATA_DIR/$BIN_NAME"
-URL="https://github.com/$REPO/releases/latest/download/$BIN_NAME"
+URL="$BASE_URL/$BIN_NAME"
 
-# --- 2. Download the matching miner ----------------------------------------
+# --- 2. Download the matching miner + SHA-256 VERIFY it (fail-closed) -------
+# We do NOT trust the bootstrap download blindly. Mirroring the steady-state
+# launcher (mine-auto.sh download_verify_swap): fetch to a TEMP, look the variant's
+# digest up in the release SHA256SUMS, verify with the OS sha256sum, and only
+# chmod+x + move it onto the live path on a MATCH. A missing SHA256SUMS, our asset
+# not being listed in it, no sha256sum/shasum available, or a hash MISMATCH all
+# DISCARD the temp and abort — we never chmod+x / move / run an unverified binary.
 echo
 echo "Downloading $BIN_NAME ..."
-if ! download "$URL" "$BIN"; then
+STAGED="$BIN.download"
+rm -f "$STAGED"
+if ! download "$URL" "$STAGED"; then
   echo
   echo "[X] Download failed. Either no release is published yet, the"
   echo "    '$VARIANT' build isn't in the latest release, or no network."
   echo "    Releases: https://github.com/$REPO/releases/latest"
   echo "    Tip: try another build, e.g.  ./install-csd-miner.sh cpu"
   echo
+  rm -f "$STAGED"
   exit 1
 fi
-chmod +x "$BIN"
+
+echo "Verifying $BIN_NAME against the release SHA256SUMS ..."
+WANT="$(expected_sha "$BIN_NAME")"
+if [ -z "$WANT" ]; then
+  echo
+  echo "[X] Refusing to run an UNVERIFIED miner: no SHA256SUMS published (or" >&2
+  echo "    '$BIN_NAME' is not listed in it). Every live release publishes" >&2
+  echo "    SHA256SUMS, so this is anomalous. Aborting and NOT running the" >&2
+  echo "    download. Releases: https://github.com/$REPO/releases/latest" >&2
+  echo
+  rm -f "$STAGED"
+  exit 1
+fi
+# Verify with the OS hasher (sha256sum, or shasum -a 256). NO running miner exists
+# yet at bootstrap, so the OS hasher is the trusted verifier. If none is available,
+# FAIL CLOSED rather than run an unverified binary.
+GOT=""
+if command -v sha256sum >/dev/null 2>&1; then
+  GOT="$(sha256sum "$STAGED" | awk '{print $1}')"
+elif command -v shasum >/dev/null 2>&1; then
+  GOT="$(shasum -a 256 "$STAGED" | awk '{print $1}')"
+else
+  echo
+  echo "[X] Have a SHA256SUMS digest but no sha256sum/shasum to verify with." >&2
+  echo "    Refusing to run an unverified miner. Install coreutils and re-run:" >&2
+  echo "      Ubuntu/Debian:  sudo apt-get install -y coreutils" >&2
+  echo
+  rm -f "$STAGED"
+  exit 1
+fi
+if [ "$GOT" != "$WANT" ]; then
+  echo
+  echo "[X] SHA-256 verify FAILED for $BIN_NAME — the download does not match the" >&2
+  echo "    release SHA256SUMS. Discarding it and aborting (NOT running it)." >&2
+  echo "      got:  $GOT" >&2
+  echo "      want: $WANT" >&2
+  echo
+  rm -f "$STAGED"
+  exit 1
+fi
+echo "  OK — SHA-256 matches ($WANT)."
+# Verified: make it executable, then atomically move it onto the live path.
+chmod +x "$STAGED"
+mv "$STAGED" "$BIN"
 
 # --- 2b. Also fetch the multi-GPU + auto-update launchers next to this file -
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "Fetching the multi-GPU / auto-update launchers ..."
 for f in mine-all-gpus.sh mine-auto.sh; do
-  if download "https://raw.githubusercontent.com/$REPO/main/$f" "$SCRIPT_DIR/$f" 2>/dev/null; then
+  if download "$RAW_BASE/$f" "$SCRIPT_DIR/$f" 2>/dev/null; then
     chmod +x "$SCRIPT_DIR/$f" 2>/dev/null || true
   fi
 done
@@ -158,6 +230,14 @@ ADDR="$ADDR_HEX"
 
 # Persist the (normalised) address for next time.
 printf '%s\n' "$ADDR" > "$CFG"
+
+# Test hook: stop right before the mine-auto.sh hand-off so a hermetic test can
+# assert on the installed $BIN without launching the mining loop. ZERO effect on a
+# normal run (the var is unset there).
+if [ "${CSD_INSTALL_NO_EXEC:-0}" = "1" ]; then
+  echo "[test] CSD_INSTALL_NO_EXEC=1 — stopping before mine-auto.sh hand-off."
+  exit 0
+fi
 
 # --- 4. Mine (hand off to the self-updating launcher) ----------------------
 # IMPORTANT: we do NOT exec the raw binary here. Stranding a rig on an old
