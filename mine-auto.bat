@@ -58,9 +58,19 @@ if not exist "%DIR%" mkdir "%DIR%"
 REM ── Launcher self-update (v0.1.11): this .bat can refresh ITSELF so a launcher-
 REM    side fix reaches the rig, not just the miner binary. SELF_NAME is the
 REM    release-asset basename + the SHA256SUMS key; SELF_NEW is the verified
-REM    staging copy written mid-run by :update_launcher_self.
+REM    staging copy written mid-run by :update_launcher_self. SELF_SHA persists the
+REM    wanted SHA-256 alongside SELF_NEW so the startup trampoline can RE-VERIFY the
+REM    staged bytes before promoting them onto the live launcher (no-brick: a
+REM    truncated/corrupt SELF_NEW is rejected, NOT promoted). Both SELF_NEW and
+REM    SELF_SHA sit BESIDE %~f0 (same volume) so staging is an atomic rename, never
+REM    a cross-volume copy that can leave a half-written file.
 set "SELF_NAME=mine-auto.bat"
 set "SELF_NEW=%~f0.new"
+set "SELF_SHA=%~f0.new.sha"
+REM Bound the trampoline helper's promote-move retries so a persistently-failing
+REM swap (locked file, AV, disk full) can never re-fire forever: after this many
+REM attempts the helper parks SELF_NEW as .fail and mines on the OLD launcher.
+set "SELF_MAX_PROMOTE=5"
 
 REM ── SP2: csd-relay-node paths ────────────────────────────────────────────────
 REM The relay binary is downloaded as a standalone release asset alongside the
@@ -149,33 +159,96 @@ REM WRITE A SEPARATE HELPER .cmd (simple, robust quoting — no fragile inline
 REM nesting), launch it detached, and exit. The helper:
 REM   1. waits for THIS process (passed PID) to fully exit,
 REM   2. backs up the current launcher to %~f0.bak,
-REM   3. atomically moves the staged file onto %~f0,
-REM   4. relaunches the updated launcher with the original args, then deletes itself.
+REM   3. moves the staged file onto %~f0 with a BOUNDED retry loop,
+REM   4. relaunches the launcher with the original args, then deletes itself.
 REM Because we exit FIRST, our file is replaced only after we are gone — this can
-REM never corrupt an in-flight run. Any helper failure leaves the staged file for
-REM a later retry and the OLD launcher keeps working (fail-closed, degraded at
-REM worst — never a rig that cannot mine). Guard: staged file must be non-empty.
+REM never corrupt an in-flight run.
+REM
+REM NO-BRICK RE-VERIFY (the brick this fixes): a previous cut promoted %SELF_NEW%
+REM with ONLY a "size != 0" guard. But %SELF_NEW% was staged via a CROSS-VOLUME
+REM copy (it lived under %LOCALAPPDATA% while %~f0 is wherever the user clicked —
+REM often a different drive), so an interrupted copy could leave a TRUNCATED but
+REM NON-zero file that passed the size guard and got promoted onto the live
+REM launcher → a severed .bat that dies with `. was unexpected at this time` and
+REM cannot mine or self-heal. TWO fixes: (1) :update_launcher_self now stages
+REM BESIDE %~f0 (same volume = atomic rename, never a partial file), and (2) here
+REM we RE-VERIFY %SELF_NEW%'s SHA-256 against the digest persisted at stage time
+REM (%SELF_SHA%) BEFORE handing it to the promote helper. Any mismatch / missing
+REM digest / hash failure → DISCARD the staged file (+ its .sha) and fall through
+REM to a normal startup on the GOOD live launcher (FAIL-CLOSED — never a brick).
 if exist "%SELF_NEW%" (
   for %%S in ("%SELF_NEW%") do set "SELF_NEW_SZ=%%~zS"
   if "!SELF_NEW_SZ!"=="0" (
     REM Zero-byte staged file is anomalous: discard it, keep the running launcher.
     del /f /q "%SELF_NEW%" >nul 2>&1
+    del /f /q "%SELF_SHA%" >nul 2>&1
   ) else (
-    echo [%time%] launcher self-update: a verified new launcher is staged - applying via safe pre-spawn handoff, then relaunching.
-    set "SELF_HELPER=%DIR%\csd-launcher-promote.cmd"
-    REM Build the helper line-by-line with SIMPLE quoting (no fragile inline
-    REM nesting). It waits a few seconds (so our `exit /b 0` below lands first and
-    REM our open handle on %~f0 is released), backs up, atomically swaps, relaunches
-    REM with the original args, then deletes itself.
-    > "!SELF_HELPER!" echo @echo off
-    >>"!SELF_HELPER!" echo ping -n 4 127.0.0.1 ^>nul
-    >>"!SELF_HELPER!" echo copy /Y "%~f0" "%~f0.bak" ^>nul 2^>^&1
-    >>"!SELF_HELPER!" echo move /Y "%SELF_NEW%" "%~f0" ^>nul
-    >>"!SELF_HELPER!" echo start "" cmd /c ""%~f0" %*"
-    >>"!SELF_HELPER!" echo del /f /q "%%~f0" ^>nul 2^>^&1
-    REM Launch the helper detached and exit immediately so our file is free.
-    start "" /b cmd /c ""!SELF_HELPER!""
-    exit /b 0
+    REM Re-verify the staged bytes against the digest persisted at stage time.
+    set "SELF_NEW_WANT="
+    if exist "%SELF_SHA%" set /p SELF_NEW_WANT=<"%SELF_SHA%"
+    set "SELF_NEW_GOT="
+    if defined SELF_NEW_WANT (
+      for /f "usebackq delims=" %%h in (`powershell -NoProfile -Command "try { (Get-FileHash -Algorithm SHA256 -LiteralPath '%SELF_NEW%').Hash.ToLower() } catch { '' }"`) do set "SELF_NEW_GOT=%%h"
+    )
+    if not defined SELF_NEW_WANT (
+      echo [%time%] launcher self-update: staged launcher has NO persisted digest - discarding it, keeping the running launcher ^(fail-closed^).
+      del /f /q "%SELF_NEW%" >nul 2>&1
+      del /f /q "%SELF_SHA%" >nul 2>&1
+    ) else if not defined SELF_NEW_GOT (
+      echo [%time%] launcher self-update: cannot re-hash the staged launcher ^(Get-FileHash failed^) - discarding it, keeping the running launcher ^(fail-closed^).
+      del /f /q "%SELF_NEW%" >nul 2>&1
+      del /f /q "%SELF_SHA%" >nul 2>&1
+    ) else if /i not "!SELF_NEW_GOT!"=="!SELF_NEW_WANT!" (
+      echo [%time%] [X] launcher self-update: staged launcher SHA-256 MISMATCH ^(got !SELF_NEW_GOT! want !SELF_NEW_WANT!^) - TRUNCATED/corrupt, discarding it. Keeping the running launcher ^(fail-closed, no brick^).
+      del /f /q "%SELF_NEW%" >nul 2>&1
+      del /f /q "%SELF_SHA%" >nul 2>&1
+    ) else (
+      echo [%time%] launcher self-update: a verified new launcher is staged ^(SHA-256 re-checked^) - applying via safe pre-spawn handoff, then relaunching.
+      set "SELF_HELPER=%DIR%\csd-launcher-promote.cmd"
+      set "SELF_CRUMB=%DIR%\csd-launcher-promote.log"
+      REM Build the helper line-by-line with SIMPLE quoting. We deliberately use a
+      REM GOTO-based bounded retry (NOT a for/!flag! loop): a generated .cmd would
+      REM need escaped delayed-expansion bangs, which are brittle and silently
+      REM collapsed (an empirically-confirmed footgun) — exactly the kind of escape
+      REM bug that bricks. The label form needs NO delayed expansion: %%TRIES%% is
+      REM written literally and re-read fresh on each :promote_retry pass. The helper
+      REM waits a few seconds (so our `exit /b 0` below lands first and our handle on
+      REM %~f0 is released), backs up, then promotes with up to SELF_MAX_PROMOTE
+      REM move attempts. On a persistently-failing move it parks the staged file as
+      REM .fail and relaunches the OLD launcher (so the rig keeps mining and the
+      REM promote can never re-fire forever). It checks the relaunch and leaves a
+      REM breadcrumb on failure instead of blindly exiting with no process.
+      REM NOTE: a single-% token (e.g. %~f0, %*) is expanded HERE by the parent and
+      REM baked into the helper as the launcher path / original args; a double-%
+      REM token (%%~f0, %%TRIES%%, %%date%%) stays literal so it is evaluated by the
+      REM HELPER at run time. %%~f0 therefore = the helper's own path (self-delete).
+      > "!SELF_HELPER!" echo @echo off
+      >>"!SELF_HELPER!" echo ping -n 4 127.0.0.1 ^>nul
+      >>"!SELF_HELPER!" echo copy /Y "%~f0" "%~f0.bak" ^>nul 2^>^&1
+      >>"!SELF_HELPER!" echo set "TRIES=0"
+      >>"!SELF_HELPER!" echo :promote_retry
+      >>"!SELF_HELPER!" echo set /a TRIES+=1
+      >>"!SELF_HELPER!" echo move /Y "%SELF_NEW%" "%~f0" ^>nul 2^>^&1
+      >>"!SELF_HELPER!" echo if not errorlevel 1 goto promote_ok
+      >>"!SELF_HELPER!" echo if %%TRIES%% GEQ %SELF_MAX_PROMOTE% goto promote_fail
+      >>"!SELF_HELPER!" echo ping -n 3 127.0.0.1 ^>nul
+      >>"!SELF_HELPER!" echo goto promote_retry
+      >>"!SELF_HELPER!" echo :promote_ok
+      >>"!SELF_HELPER!" echo del /f /q "%SELF_SHA%" ^>nul 2^>^&1
+      >>"!SELF_HELPER!" echo start "" cmd /c ""%~f0" %*"
+      >>"!SELF_HELPER!" echo if errorlevel 1 ^(^> "%SELF_CRUMB%" echo [promote] relaunch of UPDATED launcher failed at %%date%% %%time%% - rerun mine-auto.bat manually.^)
+      >>"!SELF_HELPER!" echo goto promote_done
+      >>"!SELF_HELPER!" echo :promote_fail
+      >>"!SELF_HELPER!" echo move /Y "%SELF_NEW%" "%SELF_NEW%.fail" ^>nul 2^>^&1
+      >>"!SELF_HELPER!" echo del /f /q "%SELF_SHA%" ^>nul 2^>^&1
+      >>"!SELF_HELPER!" echo ^> "%SELF_CRUMB%" echo [promote] promote-move FAILED after %SELF_MAX_PROMOTE% attempts at %%date%% %%time%% - staged file parked as .fail; mining on the OLD launcher.
+      >>"!SELF_HELPER!" echo start "" cmd /c ""%~f0" %*"
+      >>"!SELF_HELPER!" echo :promote_done
+      >>"!SELF_HELPER!" echo del /f /q "%%~f0" ^>nul 2^>^&1
+      REM Launch the helper detached and exit immediately so our file is free.
+      start "" /b cmd /c ""!SELF_HELPER!""
+      exit /b 0
+    )
   )
 )
 
@@ -364,7 +437,15 @@ REM    are untouched. Mirrors mine-auto.sh update_launcher_self.
 REM 1. Download the candidate launcher to a temp (NEVER onto %~f0 / %SELF_NEW%
 REM    directly until verified). Use a scratch name, promote to %SELF_NEW% only
 REM    after verify so a half-download is never seen as "staged" by the trampoline.
-set "SELF_DL=%DIR%\%SELF_NAME%.dl"
+REM    CRITICAL (the brick fix): stage BESIDE %~f0 — i.e. on the SAME volume as the
+REM    live launcher — NOT under %DIR% (=%LOCALAPPDATA%). The installer puts this
+REM    .bat wherever the user clicked, often a DIFFERENT drive than %LOCALAPPDATA%;
+REM    a %DIR%->%SELF_NEW% move then crosses volumes and degrades to a non-atomic
+REM    copy+delete, so an interrupted copy can leave a TRUNCATED-but-non-zero
+REM    %SELF_NEW% that the old trampoline promoted onto the live launcher = brick.
+REM    A per-run %RANDOM% suffix avoids colliding with a concurrent run's scratch.
+REM    Mirrors mine-auto.sh (which stages $SELF_PATH.new.$$ next to itself).
+set "SELF_DL=%~f0.dl.%RANDOM%"
 if exist "!SELF_DL!" del /f /q "!SELF_DL!" >nul 2>&1
 curl -L -f -o "!SELF_DL!" "https://github.com/%REPO%/releases/latest/download/%SELF_NAME%"
 if not !errorlevel!==0 (
@@ -427,14 +508,23 @@ if /i "!SELF_CUR!"=="!SELF_WANT!" (
   goto :eof
 )
 
-REM 5. Promote the VERIFIED temp to the staged slot %SELF_NEW% (atomic move). The
-REM    startup trampoline applies it on the NEXT run, before anything is spawned.
+REM 5. Promote the VERIFIED temp to the staged slot %SELF_NEW%. Because %SELF_DL%
+REM    and %SELF_NEW% now BOTH sit beside %~f0 (same volume), this is a true atomic
+REM    rename, NOT a cross-volume copy — %SELF_NEW% is therefore either absent or
+REM    byte-complete, never truncated. We FIRST persist the wanted digest to
+REM    %SELF_SHA% so the startup trampoline can RE-VERIFY %SELF_NEW% before promoting
+REM    it (defence in depth: even if some future bug truncates the staged file, the
+REM    trampoline's SHA re-check rejects it and keeps the good live launcher). The
+REM    trampoline applies it on the NEXT run, before anything is spawned.
+del /f /q "%SELF_SHA%" >nul 2>&1
+> "%SELF_SHA%" echo !SELF_WANT!
 move /Y "!SELF_DL!" "%SELF_NEW%" >nul
 if !errorlevel!==0 (
-  echo [%time%] launcher self-update: staged verified %SELF_NAME% - it will be applied on the next launcher start ^(no-brick^).
+  echo [%time%] launcher self-update: staged verified %SELF_NAME% ^(+digest^) - it will be re-verified and applied on the next launcher start ^(no-brick^).
 ) else (
   echo [%time%] launcher self-update: could not stage new launcher; keeping current.
   if exist "!SELF_DL!" del /f /q "!SELF_DL!" >nul 2>&1
+  del /f /q "%SELF_SHA%" >nul 2>&1
 )
 goto :eof
 

@@ -246,6 +246,17 @@ ua_download_verify_swap() {
     elif command -v sha256sum >/dev/null 2>&1; then
       cur="$(sha256sum "$UPDATE_BIN" | awk '{print $1}')"
       if [ "$cur" = "$want" ]; then rm -f "$staged"; return 2; fi
+    else
+      # NO-FLAP fail-safe: the binary EXISTS but we have NO usable verifier for the
+      # same-binary check (no verify-file, no sha256sum), so we cannot prove the
+      # staged bytes differ from the on-disk binary. Swapping anyway would let the
+      # sidecar treat it as a real update (rc=0 → kill+restart) and, on a
+      # launcher-only bump (identical bytes), re-fire EVERY poll = fleet-wide flap.
+      # So discard the staged copy and report rc=2 ("verified, no change") — the
+      # safe no-op. A genuinely newer binary is still caught by the version gate
+      # (ua_should_update) on the next startup check; we only forgo the swap when we
+      # cannot tell, which is the fail-safe direction for a no-clawback fleet.
+      rm -f "$staged"; return 2
     fi
   fi
 
@@ -298,6 +309,11 @@ hive_update_sidecar() {
   # (set when ua_download_verify_swap reports "no change", rc=2). While latest
   # equals this, we skip the whole download attempt — so a launcher-only bump
   # (binary unchanged, --version stale) does NOT re-download every poll.
+  # CAVEAT: this keys on the VERSION string, so re-cutting the SAME version with
+  # NEW bytes is NOT picked up by an already-running sidecar (it stays pinned to
+  # confirmed_current_for and skips the fetch). To ship changed bytes to a live
+  # fleet, BUMP THE VERSION (don't republish an existing tag) — a higher version
+  # makes latest != confirmed_current_for and the sidecar fetches + verifies again.
   confirmed_current_for=""
   while true; do
     # If the miner isn't running, the slot was stopped (not an update restart):
