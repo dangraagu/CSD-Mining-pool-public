@@ -9,10 +9,14 @@
 # `--remap-path-prefix=FROM=TO` rewrites any compiled-in path beginning with
 # FROM so it begins with TO instead. Each mapping MUST be a single argv token
 # (the `FROM=TO` pair contains an `=`), so each is one array element here — do
-# NOT split it across two. We cover both the native Windows path and the
-# Unix-style (MSYS/Git-Bash) spelling of the same home directory.
+# NOT split it across two. We cover the native Windows path, the Unix-style
+# (MSYS/Git-Bash) spelling, AND the WSL mount spelling (/mnt/c) of the same home
+# directory — so a Linux release build run straight from the /mnt/c mount is
+# scrubbed too (otherwise the username leaks as /mnt/c/Users/bahs_admin/... in
+# the binary's panic metadata, defeating the scrub).
 [build]
 rustflags = [
     "--remap-path-prefix=C:\\Users\\bahs_admin=/build",
     "--remap-path-prefix=/c/Users/bahs_admin=/build",
+    "--remap-path-prefix=/mnt/c/Users/bahs_admin=/build",
 ]
