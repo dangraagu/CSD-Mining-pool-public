@@ -163,17 +163,22 @@ if "!BOOTSTRAP_OK!"=="0" (
   exit /b 1
 )
 
-REM --- 3b. Also fetch the multi-GPU + auto-update launchers next to this file ---
+REM --- 3b. Also fetch the multi-GPU + auto-update launchers, AND the OPTIONAL
+REM     Windows-service .bat files, next to this file (same RAW_BASE pattern). The
+REM     service .bat files are downloaded but NOT run - they are purely opt-in. ---
 echo Fetching the multi-GPU / auto-update launchers ...
 where curl >nul 2>&1
 if !errorlevel!==0 (
   curl -L -f -s -o "%~dp0mine-all-gpus.bat" "%RAW_BASE%/mine-all-gpus.bat"
   curl -L -f -s -o "%~dp0mine-auto.bat" "%RAW_BASE%/mine-auto.bat"
+  curl -L -f -s -o "%~dp0install-as-service.bat" "%RAW_BASE%/install-as-service.bat"
+  curl -L -f -s -o "%~dp0uninstall-service.bat" "%RAW_BASE%/uninstall-service.bat"
 ) else (
-  powershell -NoProfile -Command "try { Invoke-WebRequest -Uri '%RAW_BASE%/mine-all-gpus.bat' -OutFile '%~dp0mine-all-gpus.bat' -UseBasicParsing; Invoke-WebRequest -Uri '%RAW_BASE%/mine-auto.bat' -OutFile '%~dp0mine-auto.bat' -UseBasicParsing } catch {}"
+  powershell -NoProfile -Command "try { Invoke-WebRequest -Uri '%RAW_BASE%/mine-all-gpus.bat' -OutFile '%~dp0mine-all-gpus.bat' -UseBasicParsing; Invoke-WebRequest -Uri '%RAW_BASE%/mine-auto.bat' -OutFile '%~dp0mine-auto.bat' -UseBasicParsing; Invoke-WebRequest -Uri '%RAW_BASE%/install-as-service.bat' -OutFile '%~dp0install-as-service.bat' -UseBasicParsing; Invoke-WebRequest -Uri '%RAW_BASE%/uninstall-service.bat' -OutFile '%~dp0uninstall-service.bat' -UseBasicParsing } catch {}"
 )
 echo   - mine-all-gpus.bat  = mine on ALL GPUs at once
 echo   - mine-auto.bat      = all GPUs + auto-update (recommended for 24/7)
+echo   - OPTIONAL: double-click install-as-service.bat (will prompt for admin) to run the miner as an auto-start/restart Windows service (optional). Remove it later with uninstall-service.bat.
 
 REM --- 4. addr20 payout address: prompt once, remember thereafter ---
 set "ADDR="
