@@ -273,6 +273,20 @@ jobs:
           printf '%s\n' "$VER" > dist/latest-version.txt
           echo "wrote dist/latest-version.txt ($VER)"
 
+      # Publish the self-updating launchers as release assets. Existing rigs refresh
+      # them via mine-auto.sh:update_launcher_self, which downloads
+      # releases/latest/download/mine-auto.{sh,bat} and SHA-verifies it against the
+      # release SHA256SUMS (FAIL-CLOSED if the asset or its checksum is absent).
+      # Staging them here — in the SAME linux job whose dist/ the single release job
+      # flattens and checksums — is what makes SHA256SUMS cover them WITHOUT a second
+      # publisher racing the digests file. Without this step the launcher
+      # self-update is a permanent no-op (the asset 404s / has no checksum entry).
+      - name: Stage self-updating launchers (mine-auto.sh / mine-auto.bat)
+        run: |
+          set -euo pipefail
+          cp mine-auto.sh mine-auto.bat dist/
+          echo "staged launchers:"; ls -1 dist/mine-auto.sh dist/mine-auto.bat
+
       - name: List built artifacts
         run: ls -la dist
 
