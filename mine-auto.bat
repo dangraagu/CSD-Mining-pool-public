@@ -55,6 +55,13 @@ if not defined LIVE_SEC set "LIVE_SEC=30"
 if not defined MAX_RESTARTS set "MAX_RESTARTS=5"
 if not exist "%DIR%" mkdir "%DIR%"
 
+REM ── Launcher self-update (v0.1.11): this .bat can refresh ITSELF so a launcher-
+REM    side fix reaches the rig, not just the miner binary. SELF_NAME is the
+REM    release-asset basename + the SHA256SUMS key; SELF_NEW is the verified
+REM    staging copy written mid-run by :update_launcher_self.
+set "SELF_NAME=mine-auto.bat"
+set "SELF_NEW=%~f0.new"
+
 REM ── SP2: csd-relay-node paths ────────────────────────────────────────────────
 REM The relay binary is downloaded as a standalone release asset alongside the
 REM miner. On Windows it is started with  start /LOW /B  (lowest priority,
@@ -132,6 +139,45 @@ set "RESTARTS=0"
 set "BACKOFF=0"
 set "HOOK_FIRED=0"
 set "ELAPSED=0"
+
+REM ── NO-BRICK launcher promote (startup trampoline) ───────────────────────────
+REM If a PRIOR run staged a verified new launcher at %SELF_NEW%, promote it now —
+REM BEFORE any miner/relay is spawned, so nothing can be bricked. We must NOT move
+REM over our own running file in-process (cmd.exe reads the .bat by byte offset; a
+REM mid-run replace DERAILS the running loop — verified empirically). Instead we
+REM WRITE A SEPARATE HELPER .cmd (simple, robust quoting — no fragile inline
+REM nesting), launch it detached, and exit. The helper:
+REM   1. waits for THIS process (passed PID) to fully exit,
+REM   2. backs up the current launcher to %~f0.bak,
+REM   3. atomically moves the staged file onto %~f0,
+REM   4. relaunches the updated launcher with the original args, then deletes itself.
+REM Because we exit FIRST, our file is replaced only after we are gone — this can
+REM never corrupt an in-flight run. Any helper failure leaves the staged file for
+REM a later retry and the OLD launcher keeps working (fail-closed, degraded at
+REM worst — never a rig that cannot mine). Guard: staged file must be non-empty.
+if exist "%SELF_NEW%" (
+  for %%S in ("%SELF_NEW%") do set "SELF_NEW_SZ=%%~zS"
+  if "!SELF_NEW_SZ!"=="0" (
+    REM Zero-byte staged file is anomalous: discard it, keep the running launcher.
+    del /f /q "%SELF_NEW%" >nul 2>&1
+  ) else (
+    echo [%time%] launcher self-update: a verified new launcher is staged - applying via safe pre-spawn handoff, then relaunching.
+    set "SELF_HELPER=%DIR%\csd-launcher-promote.cmd"
+    REM Build the helper line-by-line with SIMPLE quoting (no fragile inline
+    REM nesting). It waits a few seconds (so our `exit /b 0` below lands first and
+    REM our open handle on %~f0 is released), backs up, atomically swaps, relaunches
+    REM with the original args, then deletes itself.
+    > "!SELF_HELPER!" echo @echo off
+    >>"!SELF_HELPER!" echo ping -n 4 127.0.0.1 ^>nul
+    >>"!SELF_HELPER!" echo copy /Y "%~f0" "%~f0.bak" ^>nul 2^>^&1
+    >>"!SELF_HELPER!" echo move /Y "%SELF_NEW%" "%~f0" ^>nul
+    >>"!SELF_HELPER!" echo start "" cmd /c ""%~f0" %*"
+    >>"!SELF_HELPER!" echo del /f /q "%%~f0" ^>nul 2^>^&1
+    REM Launch the helper detached and exit immediately so our file is free.
+    start "" /b cmd /c ""!SELF_HELPER!""
+    exit /b 0
+  )
+)
 
 REM Run an update check immediately so we start on the latest published build.
 call :update_check
@@ -300,6 +346,96 @@ set "BACKOFF=0"
 set "HOOK_FIRED=0"
 call :start_miners
 echo [%time%] now mining !INSTALLED! (build: %VARIANT%).
+REM Best-effort: also refresh THIS launcher (stage a verified copy for the next
+REM start). Runs AFTER mining is back up so it can never delay the restart; it is
+REM fail-closed + no-brick (stages only — the actual promote happens via the safe
+REM startup trampoline on the next run, never mid-loop).
+call :update_launcher_self
+goto :eof
+
+REM ── Launcher self-update: download THIS launcher, VERIFY it with a TRUSTED
+REM    verifier, and STAGE it at %SELF_NEW% for the no-brick startup trampoline to
+REM    promote on the next run. We never replace %~f0 here mid-loop (that derails
+REM    the running cmd). FAIL-CLOSED at every step: a download failure, a missing/
+REM    unlisted SHA256SUMS entry, a hash mismatch, or no usable verifier all leave
+REM    NO staged file (and delete any partial), so the running + on-disk launcher
+REM    are untouched. Mirrors mine-auto.sh update_launcher_self.
+:update_launcher_self
+REM 1. Download the candidate launcher to a temp (NEVER onto %~f0 / %SELF_NEW%
+REM    directly until verified). Use a scratch name, promote to %SELF_NEW% only
+REM    after verify so a half-download is never seen as "staged" by the trampoline.
+set "SELF_DL=%DIR%\%SELF_NAME%.dl"
+if exist "!SELF_DL!" del /f /q "!SELF_DL!" >nul 2>&1
+curl -L -f -o "!SELF_DL!" "https://github.com/%REPO%/releases/latest/download/%SELF_NAME%"
+if not !errorlevel!==0 (
+  echo [%time%] launcher self-update: download failed; keeping current launcher.
+  if exist "!SELF_DL!" del /f /q "!SELF_DL!" >nul 2>&1
+  goto :eof
+)
+
+REM 2. Expected SHA-256 from the SAME release SHA256SUMS, keyed by %SELF_NAME%
+REM    (LF-safe PowerShell selector, mirroring the binary path; empty => fail-closed).
+set "SELF_WANT="
+set "SELF_SUMS=%DIR%\SHA256SUMS.lself"
+if exist "!SELF_SUMS!" del /f /q "!SELF_SUMS!" >nul 2>&1
+curl -L -f -s -o "!SELF_SUMS!" "https://github.com/%REPO%/releases/latest/download/SHA256SUMS"
+if exist "!SELF_SUMS!" (
+  for /f "usebackq delims=" %%a in (`powershell -NoProfile -Command "$a='%SELF_NAME%'; $h=''; foreach($ln in (Get-Content -LiteralPath '!SELF_SUMS!')){ $p=@($ln -split '\s+' ^| Where-Object { $_ -ne '' }); if($p.Count -ge 2 -and ($p[1] -eq $a -or $p[1] -eq ('*'+$a)) -and $p[0] -match '^[0-9A-Fa-f]{64}$'){ $h=$p[0]; break } }; $h"`) do set "SELF_WANT=%%a"
+  del /f /q "!SELF_SUMS!" >nul 2>&1
+)
+if not defined SELF_WANT (
+  echo [%time%] launcher self-update: no SHA256SUMS entry for %SELF_NAME% - refusing ^(keeping current launcher^).
+  del /f /q "!SELF_DL!" >nul 2>&1
+  goto :eof
+)
+
+REM 3. Verify the temp with a TRUSTED verifier (never let the download verify
+REM    itself). Prefer the freshly-swapped %BIN% verify-file; else PowerShell
+REM    Get-FileHash (OS verifier). FAIL-CLOSED on mismatch or no verifier.
+set "SELF_VERIFIED=0"
+if exist "%BIN%" (
+  "%BIN%" verify-file --help >nul 2>&1
+  if !errorlevel!==0 (
+    "%BIN%" verify-file "!SELF_DL!" "!SELF_WANT!" >nul 2>&1
+    if !errorlevel!==0 ( set "SELF_VERIFIED=1" ) else (
+      echo [%time%] launcher self-update: SHA-256 verify FAILED for %SELF_NAME% - discarding, keeping current launcher.
+      del /f /q "!SELF_DL!" >nul 2>&1
+      goto :eof
+    )
+  )
+)
+if "!SELF_VERIFIED!"=="0" (
+  set "SELF_GOT="
+  for /f "usebackq delims=" %%h in (`powershell -NoProfile -Command "try { (Get-FileHash -Algorithm SHA256 -LiteralPath '!SELF_DL!').Hash.ToLower() } catch { '' }"`) do set "SELF_GOT=%%h"
+  if not defined SELF_GOT (
+    echo [%time%] launcher self-update: have a digest but no usable verifier - refusing.
+    del /f /q "!SELF_DL!" >nul 2>&1
+    goto :eof
+  )
+  if /i not "!SELF_GOT!"=="!SELF_WANT!" (
+    echo [%time%] launcher self-update: SHA-256 verify FAILED for %SELF_NAME% ^(got !SELF_GOT! want !SELF_WANT!^) - discarding.
+    del /f /q "!SELF_DL!" >nul 2>&1
+    goto :eof
+  )
+)
+
+REM 4. Skip if the on-disk launcher already matches (no needless staging/churn).
+set "SELF_CUR="
+for /f "usebackq delims=" %%h in (`powershell -NoProfile -Command "try { (Get-FileHash -Algorithm SHA256 -LiteralPath '%~f0').Hash.ToLower() } catch { '' }"`) do set "SELF_CUR=%%h"
+if /i "!SELF_CUR!"=="!SELF_WANT!" (
+  del /f /q "!SELF_DL!" >nul 2>&1
+  goto :eof
+)
+
+REM 5. Promote the VERIFIED temp to the staged slot %SELF_NEW% (atomic move). The
+REM    startup trampoline applies it on the NEXT run, before anything is spawned.
+move /Y "!SELF_DL!" "%SELF_NEW%" >nul
+if !errorlevel!==0 (
+  echo [%time%] launcher self-update: staged verified %SELF_NAME% - it will be applied on the next launcher start ^(no-brick^).
+) else (
+  echo [%time%] launcher self-update: could not stage new launcher; keeping current.
+  if exist "!SELF_DL!" del /f /q "!SELF_DL!" >nul 2>&1
+)
 goto :eof
 
 :start_miners

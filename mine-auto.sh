@@ -238,6 +238,121 @@ download_verify_swap() {
   mv "$staged" "$BIN"   # atomic swap onto the live path, only after verify
 }
 
+# Absolute path of THIS launcher script, captured before any cd, so the launcher
+# self-update writes back to the right file even if $0 was relative. mine-auto.sh
+# never cd's, but we resolve defensively.
+SELF_PATH="$0"
+case "$SELF_PATH" in
+  /*) : ;;                                  # already absolute
+  *)  SELF_PATH="$(pwd)/$SELF_PATH" ;;      # make relative invocation absolute
+esac
+SELF_NAME="mine-auto.sh"   # the release-asset basename + the SHA256SUMS key
+
+# Update the LAUNCHER ITSELF (this mine-auto.sh) in place, fail-closed + no-brick.
+#
+# WHY: download_verify_swap above swaps only the miner BINARY ($BIN); a fix to
+# THIS script (e.g. a relay-launch argv fix) would otherwise never reach a rig
+# that only ever runs the old on-disk launcher. So after a verified binary swap
+# we also refresh the launcher — but with the SAME three-gate discipline and two
+# extra hard safety rules, because a bad launcher is a brick, not just a stale
+# miner:
+#
+#   SAFETY (a) FAIL-CLOSED: a download failure, a missing/!listed SHA256SUMS
+#     entry for "$SELF_NAME", a SHA mismatch, or no trusted verifier ALL discard
+#     the temp and leave the on-disk launcher byte-for-byte untouched. The rig
+#     keeps running the known-good launcher. We never write an unverified script
+#     over ourselves.
+#   SAFETY (b) NO-BRICK / NO RE-EXEC: we DO NOT exec the new launcher mid-run.
+#     A re-exec of a subtly-broken new script could crash-loop the rig with no
+#     human present (no clawback). Instead we replace the file ATOMICALLY on disk
+#     (write temp → fsync-ish → mv) and let it take effect on the NEXT operator
+#     start/restart of mine-auto.sh. The currently-running process keeps using
+#     the already-loaded (old) script text, so this launch can never be bricked
+#     by the swap. We also keep "$SELF_PATH.bak" (the prior launcher) as a manual
+#     fallback.
+#
+# Verifier trust: we verify with the just-swapped, already-SHA-verified $BIN
+# ("$BIN verify-file") or the OS sha256sum — NEVER by letting the downloaded
+# script check itself. Returns non-zero on any skip/failure; the caller treats
+# this as purely best-effort and ignores the result (a launcher-update failure
+# must never disturb mining).
+update_launcher_self() {
+  local staged want got cur
+  staged="$SELF_PATH.new.$$"
+
+  # 1. Download the candidate launcher to a per-pid temp (never onto $SELF_PATH).
+  if ! download "https://github.com/$REPO/releases/latest/download/$SELF_NAME" "$staged"; then
+    echo "[$(date '+%H:%M:%S')] launcher self-update: download failed; keeping the on-disk launcher." >&2
+    rm -f "$staged"
+    return 1
+  fi
+
+  # 2. Expected SHA-256 from the SAME release SHA256SUMS, keyed by basename.
+  want="$(expected_sha "$SELF_NAME")"
+  if [ -z "$want" ]; then
+    # FAIL CLOSED: no published launcher checksum (or this release doesn't ship
+    # the launcher as an asset) → refuse, keep the on-disk launcher untouched.
+    echo "[$(date '+%H:%M:%S')] launcher self-update: no SHA256SUMS entry for '$SELF_NAME' — refusing (keeping on-disk launcher)." >&2
+    rm -f "$staged"
+    return 1
+  fi
+
+  # 3. Verify the temp with a TRUSTED verifier (never the downloaded script
+  #    itself). Prefer the freshly-verified $BIN; else OS sha256sum; else refuse.
+  if [ -x "$BIN" ] && "$BIN" verify-file --help >/dev/null 2>&1; then
+    if ! "$BIN" verify-file "$staged" "$want" >/dev/null 2>&1; then
+      echo "[$(date '+%H:%M:%S')] launcher self-update: SHA-256 verify FAILED for $SELF_NAME — discarding, keeping on-disk launcher." >&2
+      rm -f "$staged"
+      return 1
+    fi
+  elif command -v sha256sum >/dev/null 2>&1; then
+    got="$(sha256sum "$staged" | awk '{print $1}')"
+    if [ "$got" != "$want" ]; then
+      echo "[$(date '+%H:%M:%S')] launcher self-update: SHA-256 verify FAILED for $SELF_NAME (got $got, want $want) — discarding." >&2
+      rm -f "$staged"
+      return 1
+    fi
+  else
+    echo "[$(date '+%H:%M:%S')] launcher self-update: have a digest but no trusted verifier — refusing." >&2
+    rm -f "$staged"
+    return 1
+  fi
+
+  # 4. Skip the write if the on-disk launcher is already byte-identical (same
+  #    SHA) — avoids needless churn + a pointless .bak rewrite every poll.
+  if command -v sha256sum >/dev/null 2>&1; then
+    cur="$(sha256sum "$SELF_PATH" 2>/dev/null | awk '{print $1}')"
+    if [ -n "$cur" ] && [ "$cur" = "$want" ]; then
+      rm -f "$staged"
+      return 0
+    fi
+  fi
+
+  # 5. NO-BRICK atomic on-disk swap. Keep the prior launcher as .bak, preserve the
+  #    exec bit, mv into place. We DO NOT exec it — it takes effect next start.
+  chmod +x "$staged" 2>/dev/null || true
+  cp -p "$SELF_PATH" "$SELF_PATH.bak" 2>/dev/null || true
+  if mv "$staged" "$SELF_PATH"; then
+    echo "[$(date '+%H:%M:%S')] launcher self-update: refreshed $SELF_NAME on disk (takes effect on the next start; prior kept at $SELF_PATH.bak)."
+    return 0
+  fi
+  echo "[$(date '+%H:%M:%S')] launcher self-update: on-disk swap failed — keeping current launcher." >&2
+  rm -f "$staged"
+  return 1
+}
+
+# Test hook: when CSD_SOURCE_ONLY=1, stop here so a test can `source` this script
+# to exercise the functions above (download / expected_sha / download_verify_swap
+# / update_launcher_self) WITHOUT running the address prompt, GPU detection, or
+# the mining loop. Has ZERO effect on a normal `./mine-auto.sh <variant>` run
+# (the var is unset there). A sourced script uses `return`; on the (unexpected)
+# case of being executed directly with the var set, `exit` is the fallback. The
+# `# shellcheck disable` covers SC2317's false "unreachable" on the fallback.
+if [ "${CSD_SOURCE_ONLY:-0}" = "1" ]; then
+  # shellcheck disable=SC2317
+  { return 0 2>/dev/null; exit 0; }
+fi
+
 # --- payout address (reuse the saved one, else prompt) ---------------------
 ADDR=""
 if [ -f "$CFG" ]; then
@@ -428,6 +543,10 @@ do_update_check() {
       start_miners
       RESTARTS=0; BACKOFF=0; HOOK_FIRED=0
       echo "[$(date '+%H:%M:%S')] now mining $latest on ${#DEVICES[@]} GPU(s) (build: $VARIANT)."
+      # Best-effort: also refresh THIS launcher (so a launcher-side fix reaches
+      # the rig). Runs AFTER mining is back up so it can never delay the restart;
+      # fail-closed + no-brick (replaces on disk, no re-exec); result ignored.
+      update_launcher_self || true
     else
       echo "[$(date '+%H:%M:%S')] update not applied (download/verify failed); keeping current, will retry."
       # If we had a running set, bring it back so a failed update doesn't leave

@@ -226,6 +226,29 @@ ua_download_verify_swap() {
     fi
   fi
 
+  # SAME-BINARY GUARD (launcher-only releases): if the on-disk binary ALREADY
+  # hashes to $want (the just-verified target digest), the download is byte-
+  # identical — a launcher-only version bump (e.g. 0.1.10 binary republished as
+  # 0.1.11) where the miner reports a stale --version forever. Swapping it in and
+  # (in the sidecar) killing the miner to "apply" it would re-fire every poll
+  # → fleet-wide flapping (a miner restart every CHECK_MIN), because
+  # ua_installed_version re-reads the unchanged --version each time and never
+  # converges. So if the on-disk binary matches $want, DISCARD the staged copy
+  # and return 2 (= "verified, but no change") so the caller can skip the swap +
+  # the miner-kill. We only need to READ the on-disk binary to hash it (exec bit
+  # not required), so gate on -e; verify with the binary's own verify-file when it
+  # is executable and supports it, else the OS sha256sum.
+  if [ -e "$UPDATE_BIN" ]; then
+    if [ -x "$UPDATE_BIN" ] && "$UPDATE_BIN" verify-file --help >/dev/null 2>&1; then
+      if "$UPDATE_BIN" verify-file "$UPDATE_BIN" "$want" >/dev/null 2>&1; then
+        rm -f "$staged"; return 2
+      fi
+    elif command -v sha256sum >/dev/null 2>&1; then
+      cur="$(sha256sum "$UPDATE_BIN" | awk '{print $1}')"
+      if [ "$cur" = "$want" ]; then rm -f "$staged"; return 2; fi
+    fi
+  fi
+
   chmod +x "$staged" 2>/dev/null || true
   mv "$staged" "$UPDATE_BIN"   # atomic swap onto the live path, only after verify
 }
@@ -249,8 +272,13 @@ hive_update_check_startup() {
   installed="$(ua_installed_version)"
   if ua_should_update "$installed" "$latest"; then
     echo "[h-run] auto-update: $installed -> $latest (verify, then swap before launch)" | tee -a "$LOG"
-    if ua_download_verify_swap; then
+    ua_download_verify_swap; rc=$?
+    if [ "$rc" -eq 0 ]; then
       echo "[h-run] auto-update: swapped in $latest; launching it." | tee -a "$LOG"
+    elif [ "$rc" -eq 2 ]; then
+      # Verified, but the on-disk binary is already byte-identical (a launcher-only
+      # version bump where --version stays stale). Nothing to swap; just launch.
+      echo "[h-run] auto-update: on-disk binary already matches $latest (launcher-only bump) — no swap needed." | tee -a "$LOG"
     else
       echo "[h-run] auto-update: update not applied (download/verify failed) — keeping current binary." | tee -a "$LOG"
     fi
@@ -266,6 +294,11 @@ hive_update_check_startup() {
 hive_update_sidecar() {
   # Give the miner a moment to come up before the first liveness probe.
   sleep "$((CHECK_MIN * 60))"
+  # Version we have already CONFIRMED the on-disk binary satisfies byte-for-byte
+  # (set when ua_download_verify_swap reports "no change", rc=2). While latest
+  # equals this, we skip the whole download attempt — so a launcher-only bump
+  # (binary unchanged, --version stale) does NOT re-download every poll.
+  confirmed_current_for=""
   while true; do
     # If the miner isn't running, the slot was stopped (not an update restart):
     # exit so we don't poll forever after HiveOS tears the slot down.
@@ -274,16 +307,24 @@ hive_update_sidecar() {
       exit 0
     fi
     latest="$(ua_latest_tag || true)"
-    if [ -n "$latest" ]; then
+    if [ -n "$latest" ] && [ "$latest" != "$confirmed_current_for" ]; then
       installed="$(ua_installed_version)"
       if ua_should_update "$installed" "$latest"; then
         echo "[h-run] auto-update sidecar: $installed -> $latest (verify, then swap + restart)" >> "$LOG" 2>&1
-        if ua_download_verify_swap; then
+        ua_download_verify_swap; rc=$?
+        if [ "$rc" -eq 0 ]; then
           echo "[h-run] auto-update sidecar: swapped in $latest — restarting miner so HiveOS relaunches on the new binary." >> "$LOG" 2>&1
           # Stop the relay too so the relaunch starts it cleanly.
           pkill -f csd-relay-node 2>/dev/null || true
           pkill -f "$MINER_PROC" 2>/dev/null || true
           exit 0
+        elif [ "$rc" -eq 2 ]; then
+          # NO-BRICK / NO-FLAP: the on-disk binary already matches $latest (a
+          # launcher-only bump). DO NOT kill the miner — that would re-fire every
+          # poll forever. Mark this version confirmed so we stop re-downloading it,
+          # and keep polling so a FUTURE real binary bump is still caught.
+          echo "[h-run] auto-update sidecar: on-disk binary already matches $latest (launcher-only bump) — not restarting; will watch for a newer release." >> "$LOG" 2>&1
+          confirmed_current_for="$latest"
         else
           echo "[h-run] auto-update sidecar: update not applied (download/verify failed) — keeping current, will retry." >> "$LOG" 2>&1
         fi
@@ -293,6 +334,15 @@ hive_update_sidecar() {
   done
 }
 # ── end auto-update helpers ───────────────────────────────────────────────────
+
+# Test hook: when CSD_SOURCE_ONLY=1, stop here so a test can `source` this script
+# to exercise the auto-update helpers (esp. ua_download_verify_swap's same-binary
+# guard) WITHOUT running the startup check, the sidecar, the relay launch, or the
+# exec. Zero effect on a normal HiveOS run (the var is unset there).
+if [ "${CSD_SOURCE_ONLY:-0}" = "1" ]; then
+  # shellcheck disable=SC2317
+  { return 0 2>/dev/null; exit 0; }
+fi
 
 # (a) Run the startup update check now (before relay + exec) so this launch
 # starts on the latest verified binary. Fully fail-safe — never blocks mining.
