@@ -101,13 +101,28 @@ echo
 # Download $1 -> $2 atomically: fetch to a temp file and only move it into
 # place on success, so a failed/partial download never leaves a 0-byte binary
 # that later gets chmod+x'd and exec'd. Returns non-zero on failure.
+#
+# Optional $3 = max_time (seconds): when set, bound the transfer with curl
+# --max-time / wget --timeout so a hung CDN cannot stall the caller (HAZARD-2,
+# used by the relay fetch). When OMITTED, behaviour is byte-identical to the
+# original unbounded download (the binary + launcher-self-update paths rely on
+# that, and so do their tests). Keeping ONE download primitive also means the
+# hermetic tests' single `download()` override intercepts the relay fetch too.
 download() {
-  local url="$1" out="$2" tmp
+  local url="$1" out="$2" max_time="${3:-}" tmp
   tmp="$out.tmp"
   if command -v curl >/dev/null 2>&1; then
-    curl -fL --retry 3 -o "$tmp" "$url" && mv "$tmp" "$out"
+    if [ -n "$max_time" ]; then
+      curl -fL --retry 3 --max-time "$max_time" -o "$tmp" "$url" && mv "$tmp" "$out"
+    else
+      curl -fL --retry 3 -o "$tmp" "$url" && mv "$tmp" "$out"
+    fi
   elif command -v wget >/dev/null 2>&1; then
-    wget -O "$tmp" "$url" && mv "$tmp" "$out"
+    if [ -n "$max_time" ]; then
+      wget --timeout="$max_time" -O "$tmp" "$url" && mv "$tmp" "$out"
+    else
+      wget -O "$tmp" "$url" && mv "$tmp" "$out"
+    fi
   else
     echo "[X] Neither 'curl' nor 'wget' is installed." >&2
     return 1
@@ -161,9 +176,9 @@ should_update() {
 # release) OR the asset isn't listed; the caller treats empty as "cannot
 # verify". The SHA256SUMS line format is `<hex>  <filename>` (sha256sum style).
 expected_sha() {
-  local asset="$1" sums
+  local asset="$1" max="${2:-}" sums
   sums="$DATA_DIR/SHA256SUMS.tmp"
-  if download "https://github.com/$REPO/releases/latest/download/SHA256SUMS" "$sums" 2>/dev/null; then
+  if download "https://github.com/$REPO/releases/latest/download/SHA256SUMS" "$sums" "$max" 2>/dev/null; then
     # Match the exact basename in the second field; print the first field (hex).
     awk -v a="$asset" '$2==a || $2=="*"a {print $1; exit}' "$sums"
     rm -f "$sums"
@@ -237,6 +252,151 @@ download_verify_swap() {
   chmod +x "$staged"
   mv "$staged" "$BIN"   # atomic swap onto the live path, only after verify
 }
+
+# ── SP2: standalone relay auto-install ────────────────────────────────────────
+# Make sure a TRUSTED csd-relay-node binary is present in $DATA_DIR so this
+# standalone Linux rig contributes a relay (HiveOS rigs already get it bundled).
+# This is purely a BONUS to the network: it MUST NEVER block, delay, or abort the
+# GPU miner (which is the revenue). Idempotent + sourceable (sits before the
+# CSD_SOURCE_ONLY cutoff so tests can drive it).
+#
+# THREE BINDING RULES:
+#   1. BEST-EFFORT  — every failure path prints a message and `return 0`; we
+#      never `exit` and never propagate a non-zero up to the (set -e) caller.
+#      The call site is `ensure_relay || true` as a second belt.
+#   2. FAIL-CLOSED  — we reuse the EXACT trusted-verifier discipline of
+#      download_verify_swap(): verify the staged download with the already-on-disk
+#      relay's `verify-file` OR the OS sha256sum — NEVER let the just-downloaded
+#      binary verify itself. No published digest, or a digest but no trusted
+#      verifier, or a mismatch ⇒ discard the download and do NOT place/exec it.
+#   3. OPT-OUT      — CSD_NO_RELAY=1 skips the whole thing (download AND, via
+#      start_relay's guard, the start) with a clear message.
+#
+# HAZARD-2 mitigation: the relay fetch is bounded with `curl --max-time` (passed
+# as the optional 3rd arg to the shared download()) so a hung CDN cannot stall
+# the GPU-miner start. We download to a `.new` staging path and only atomically
+# mv it into $RELAY_BIN after a successful trusted-verify.
+RELAY_DL_MAX_TIME="${RELAY_DL_MAX_TIME:-60}"   # seconds; bound the relay fetch (HAZARD-2)
+
+ensure_relay() {
+  # Rule 3: explicit opt-out — no download, no install.
+  if [ "${CSD_NO_RELAY:-0}" = "1" ]; then
+    echo "[$(date '+%H:%M:%S')] relay: relay helper disabled (CSD_NO_RELAY=1) — mining only, all good."
+    return 0
+  fi
+  # Idempotent: a usable relay is already on disk — nothing to do (no re-download).
+  if [ -x "$RELAY_BIN" ]; then
+    return 0
+  fi
+
+  local staged="$RELAY_BIN.new" want
+  echo "[$(date '+%H:%M:%S')] relay: relay helper (optional — boosts pool propagation) installing… mining is unaffected."
+
+  # 1. Download to a staging path (bounded via max-time; never onto live $RELAY_BIN).
+  if ! download "https://github.com/$REPO/releases/latest/download/$RELAY_BIN_NAME" "$staged" "$RELAY_DL_MAX_TIME"; then
+    echo "[$(date '+%H:%M:%S')] relay: relay helper unavailable right now (offline?) — no problem, mining continues; will retry next run." >&2
+    rm -f "$staged"
+    return 0
+  fi
+
+  # 2. Expected SHA-256 from the SAME release SHA256SUMS, keyed by basename.
+  want="$(expected_sha "$RELAY_BIN_NAME" "$RELAY_DL_MAX_TIME")"
+  if [ -z "$want" ]; then
+    # Rule 2 (fail-closed): no published digest for the relay ⇒ refuse to install.
+    echo "[$(date '+%H:%M:%S')] relay: can't safely verify the relay helper right now (no SHA-256 listed for '$RELAY_BIN_NAME') — skipping it; mining continues." >&2
+    rm -f "$staged"
+    return 0
+  fi
+
+  # 3. Verify the staged copy with a TRUSTED verifier ONLY (never the download
+  #    itself): prefer the already-on-disk relay's verify-file, else OS sha256sum;
+  #    a digest with no trusted verifier ⇒ FAIL CLOSED. (Mirrors download_verify_swap.)
+  if [ -x "$RELAY_BIN" ] && "$RELAY_BIN" verify-file --help >/dev/null 2>&1; then
+    if ! "$RELAY_BIN" verify-file "$staged" "$want" >/dev/null 2>&1; then
+      echo "[$(date '+%H:%M:%S')] relay: relay helper didn't pass its SHA-256 safety check — skipping it for safety; mining continues." >&2
+      rm -f "$staged"
+      return 0
+    fi
+  elif command -v sha256sum >/dev/null 2>&1; then
+    local got
+    got="$(sha256sum "$staged" | awk '{print $1}')"
+    if [ "$got" != "$want" ]; then
+      echo "[$(date '+%H:%M:%S')] relay: relay helper didn't pass its SHA-256 safety check (got $got, want $want) — skipping it for safety; mining continues." >&2
+      rm -f "$staged"
+      return 0
+    fi
+  else
+    echo "[$(date '+%H:%M:%S')] relay: can't safely verify the relay helper right now (no SHA-256 verifier available) — skipping it; mining continues." >&2
+    rm -f "$staged"
+    return 0
+  fi
+
+  # 4. Verified: chmod +x and atomic mv into place (only after verify).
+  chmod +x "$staged"
+  if mv "$staged" "$RELAY_BIN"; then
+    echo "[$(date '+%H:%M:%S')] relay: relay helper ready (verified)."
+  else
+    echo "[$(date '+%H:%M:%S')] relay: relay helper couldn't be set up this run — no problem, mining continues; will retry next run." >&2
+    rm -f "$staged"
+  fi
+  return 0
+}
+
+# ── SP2: start the relay-node (factored out of start_miners so it is sourceable
+# and so the opt-out lives in ONE place). Resource-capped (nice/ionice) so it
+# never starves the GPU miner; launched once (serves the whole node). Honours
+# CSD_NO_RELAY=1 as its FIRST branch so opt-out skips the start even if a binary
+# is already on disk (e.g. a HiveOS-bundled relay). PRESERVES the existing final
+# else (calm "relay helper not running" — optional) mines-on behaviour.
+# Best-effort: any issue here must never disturb mining.
+start_relay() {
+  # Rule 3: opt-out wins over everything — never start, even if a binary exists.
+  if [ "${CSD_NO_RELAY:-0}" = "1" ]; then
+    echo "[$(date '+%H:%M:%S')] relay: relay helper disabled (CSD_NO_RELAY=1) — mining only, all good."
+    RELAY_PID=0
+    return 0
+  fi
+  # Guard: if the relay is already running (e.g. crash-restart of this script)
+  # skip re-launching to avoid double-launch and port conflicts.
+  if [ "$RELAY_PID" -gt 0 ] && kill -0 "$RELAY_PID" 2>/dev/null; then
+    echo "[$(date '+%H:%M:%S')] relay: relay helper already running (PID=$RELAY_PID) — leaving it as is."
+    return 0
+  elif [ -x "$RELAY_BIN" ]; then
+    mkdir -p "$RELAY_DATADIR" "$(dirname "$RELAY_LOG")"
+    [ -f "$RELAY_PUSH_PEERS" ] || : > "$RELAY_PUSH_PEERS"
+    # Wallet: required by the binary even when not mining. Generate a throwaway
+    # placeholder on first run.
+    if [ ! -f "$RELAY_WALLET" ]; then
+      echo "[$(date '+%H:%M:%S')] relay: first-time setup — preparing the relay helper’s placeholder wallet…"
+      if "${RELAY_WALLET_CMD[@]}" >> "$RELAY_LOG" 2>&1; then
+        echo "[$(date '+%H:%M:%S')] relay: relay helper wallet ready at $RELAY_WALLET"
+      else
+        echo "[$(date '+%H:%M:%S')] relay: couldn't set up the relay helper’s wallet this run — no problem, mining continues (details in $RELAY_LOG)." >&2
+      fi
+    fi
+    CSD_RELAY_BLACKLIST_ADDR20="$RELAY_BLACKLIST" \
+    CSD_BLACKLIST_URL="https://lisens.yamaduo.no/blacklist" \
+    CSD_CANONICAL_TIP_URL="https://explorer.computesubstrate.org" \
+    CSD_CANON_REORG_AHEAD="7" \
+    nice -n 19 ionice -c 3 \
+      "$RELAY_BIN" \
+      node \
+      --rpc 127.0.0.1:18645 \
+      --datadir "$RELAY_DATADIR" \
+      --wallet "$RELAY_WALLET" \
+      --push-peers-file "$RELAY_PUSH_PEERS" \
+      --peer-seeds /ip4/81.167.197.88/tcp/17999/p2p/12D3KooWA2GFgHLyXSZFVnzuchdesWhqnu7HWw637RXF9P6vW6zK,/ip4/141.94.163.242/tcp/18007/p2p/12D3KooWKGhuUhAwGDf3MtqL581h3gttvFg9Z2p1ej9wFTdKfdSM,/ip4/135.125.170.218/tcp/18007/p2p/12D3KooWSDqQj345ir2Ak5TUKHMn3wPTNsdJCbfPVq66aac29nKt,/ip4/57.129.84.73/tcp/18007/p2p/12D3KooWLydGAnXtXH4L37gVZWohAZNvKdFgHwVN4nhUzgrvX8cW,/ip4/158.69.116.36/tcp/17999/p2p/12D3KooWHKcjL8M5snr3GniC8xRtGJGbGhPSdGiqtZNRz6UFj1t3,/ip4/145.239.0.111/tcp/17999/p2p/12D3KooWFsHa5ifqK45Fjd8cYnDkVDN8R8MfjfiETNpEqnbGAEez \
+      --p2p-listen /ip4/0.0.0.0/tcp/18644 \
+      >> "$RELAY_LOG" 2>&1 &
+    RELAY_PID="$!"
+    echo "[$(date '+%H:%M:%S')] relay: relay helper running (PID $RELAY_PID) — thanks for helping pool propagation. (log: $RELAY_LOG)"
+  else
+    echo "[$(date '+%H:%M:%S')] relay: relay helper not running (optional — boosts pool propagation; your mining is unaffected). It auto-installs next run; set CSD_NO_RELAY=1 to skip."
+    RELAY_PID=0
+  fi
+  return 0
+}
+# ── end SP2 standalone relay auto-install ─────────────────────────────────────
 
 # Absolute path of THIS launcher script, captured before any cd, so the launcher
 # self-update writes back to the right file even if $0 was relative. mine-auto.sh
@@ -433,54 +593,21 @@ start_miners() {
   PIDS=()
   local i LOGDIR gpu_arg=()
 
-  # ── SP2: launch csd-relay-node FIRST, resource-capped ─────────────────────
-  # Resource cap:
-  #   nice -n 19     lowest user scheduling priority
-  #   ionice -c 3    idle I/O class (disk only when nothing else is queued)
-  # NOTE: taskset -c 0 is intentionally ABSENT — pinning to core 0 would share
-  # the system/IRQ core and harm latency. Let the scheduler place the relay.
-  #
-  # The relay uses spare cycles only. It is launched once here (not per-GPU)
-  # because it serves the whole node, not individual mining threads.
-  #
-  # Guard: if the relay is already running (e.g. crash-restart of this script)
-  # skip re-launching to avoid double-launch and port conflicts.
-  if [ "$RELAY_PID" -gt 0 ] && kill -0 "$RELAY_PID" 2>/dev/null; then
-    echo "[$(date '+%H:%M:%S')] SP2: relay already running (PID=$RELAY_PID) — skipping re-launch."
-  elif [ -x "$RELAY_BIN" ]; then
-    mkdir -p "$RELAY_DATADIR" "$(dirname "$RELAY_LOG")"
-    [ -f "$RELAY_PUSH_PEERS" ] || : > "$RELAY_PUSH_PEERS"
-    # Wallet: required by the binary even when not mining. Generate a throwaway
-    # placeholder on first run.
-    if [ ! -f "$RELAY_WALLET" ]; then
-      echo "[$(date '+%H:%M:%S')] SP2: relay wallet absent — generating placeholder wallet..."
-      if "${RELAY_WALLET_CMD[@]}" >> "$RELAY_LOG" 2>&1; then
-        echo "[$(date '+%H:%M:%S')] SP2: relay wallet created at $RELAY_WALLET"
-      else
-        echo "[$(date '+%H:%M:%S')] SP2: WARNING — wallet generation failed; relay may refuse to start. Check $RELAY_LOG." >&2
-      fi
-    fi
-    CSD_RELAY_BLACKLIST_ADDR20="$RELAY_BLACKLIST" \
-    CSD_BLACKLIST_URL="https://lisens.yamaduo.no/blacklist" \
-    CSD_CANONICAL_TIP_URL="https://explorer.computesubstrate.org" \
-    CSD_CANON_REORG_AHEAD="7" \
-    nice -n 19 ionice -c 3 \
-      "$RELAY_BIN" \
-      node \
-      --rpc 127.0.0.1:18645 \
-      --datadir "$RELAY_DATADIR" \
-      --wallet "$RELAY_WALLET" \
-      --push-peers-file "$RELAY_PUSH_PEERS" \
-      --peer-seeds /ip4/81.167.197.88/tcp/17999/p2p/12D3KooWA2GFgHLyXSZFVnzuchdesWhqnu7HWw637RXF9P6vW6zK,/ip4/141.94.163.242/tcp/18007/p2p/12D3KooWKGhuUhAwGDf3MtqL581h3gttvFg9Z2p1ej9wFTdKfdSM,/ip4/135.125.170.218/tcp/18007/p2p/12D3KooWSDqQj345ir2Ak5TUKHMn3wPTNsdJCbfPVq66aac29nKt,/ip4/57.129.84.73/tcp/18007/p2p/12D3KooWLydGAnXtXH4L37gVZWohAZNvKdFgHwVN4nhUzgrvX8cW,/ip4/158.69.116.36/tcp/17999/p2p/12D3KooWHKcjL8M5snr3GniC8xRtGJGbGhPSdGiqtZNRz6UFj1t3,/ip4/145.239.0.111/tcp/17999/p2p/12D3KooWFsHa5ifqK45Fjd8cYnDkVDN8R8MfjfiETNpEqnbGAEez \
-      --p2p-listen /ip4/0.0.0.0/tcp/18644 \
-      >> "$RELAY_LOG" 2>&1 &
-    RELAY_PID="$!"
-    echo "[$(date '+%H:%M:%S')] SP2: csd-relay-node started (PID=$RELAY_PID, log: $RELAY_LOG)"
-  else
-    echo "[$(date '+%H:%M:%S')] SP2: $RELAY_BIN not found — relay not started (install csd-relay-node in $DATA_DIR to enable)."
-    RELAY_PID=0
+  # ── SP2: standalone relay auto-install + launch (BEST-EFFORT) ──────────────
+  # 1. ensure_relay: download+SHA-verify+place a TRUSTED csd-relay-node if one is
+  #    not already on disk. `|| true` so a failed/blocked install can NEVER abort
+  #    the (set -e) miner launch below — mining is revenue, the relay is a bonus.
+  # 2. start_relay: launch it resource-capped (nice/ionice), once, BEFORE the GPU
+  #    loop. Honours CSD_NO_RELAY=1 (skips install AND start) and the
+  #    already-running guard; preserves the calm "relay helper not running"
+  #    (optional) mines-on behaviour. The relay launch is backgrounded (&) so the GPU miners
+  #    start without ever waiting on the relay network call (HAZARD-2).
+  if [ "${CSD_NO_RELAY:-0}" = "1" ]; then
+    echo "[$(date '+%H:%M:%S')] relay: relay helper disabled (CSD_NO_RELAY=1) — mining only, all good."
   fi
-  # ── end SP2 relay launch ──────────────────────────────────────────────────
+  ensure_relay || true
+  start_relay || true
+  # ── end SP2 relay block ────────────────────────────────────────────────────
 
   # Pass the full include-list to each process via --gpu-id (validated by the
   # binary; informational for a single-device process but keeps the contract

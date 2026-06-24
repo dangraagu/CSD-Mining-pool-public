@@ -56,6 +56,16 @@ assert_contains() {
   fi
 }
 
+# Byte-exact "does FILE contain exactly the bytes of OTHER FILE" (sha256 compare).
+# Used by the ensure_relay hermetic tests to assert the placed relay binary is
+# byte-identical to the staged "release" payload.
+file_is_string_er() {
+  local a b
+  a="$(sha256sum "$1" 2>/dev/null | awk '{print $1}')"
+  b="$(sha256sum "$2" 2>/dev/null | awk '{print $1}')"
+  [ -n "$a" ] && [ "$a" = "$b" ]
+}
+
 assert_not_contains() {
   local name="$1" file="$2" pattern="$3"
   if grep -qE "$pattern" "$file" 2>/dev/null; then
@@ -403,6 +413,363 @@ for newseed in \
   assert_contains "mine-auto.sh: seed $newseed present" "$REPO_ROOT/mine-auto.sh"     "$newseed"
   assert_contains "mine-auto.bat: seed $newseed present" "$REPO_ROOT/mine-auto.bat"   "$newseed"
 done
+
+# ── 21. ensure_relay(): standalone relay auto-install (HERMETIC) ──────────────
+# The standalone Linux launcher must now AUTO-DOWNLOAD + SHA-verify + start the
+# relay binary (csd-relay-node), not just print "not found". These tests source
+# mine-auto.sh with CSD_SOURCE_ONLY=1 (so the prompt/GPU-probe/mining-loop don't
+# run), then drive the new idempotent `ensure_relay` function against a LOCAL
+# fake "release" dir. The single `download()` override controls BOTH the relay
+# fetch and the SHA256SUMS lookup (expected_sha uses download() too). We force
+# the OS-sha256sum verifier path (BIN → a stub whose `verify-file --help` exits
+# non-zero), exercising the SAME trusted-verifier discipline $BIN uses.
+#
+# THREE BINDING RULES under test:
+#   1. BEST-EFFORT: a relay download/SHA/start failure NEVER blocks the miner.
+#      Each behavioural case (R1-R5) drives `ensure_relay || true` followed by a
+#      MINER stub that drops a marker; the marker MUST exist in every case
+#      (proves the miner launch was reached even when the relay path fails).
+#   2. FAIL-CLOSED: never chmod+exec an unverified / SHA-mismatched relay binary.
+#   3. OPT-OUT: CSD_NO_RELAY=1 skips download AND start with a clear message.
+echo
+echo "-- ensure_relay(): standalone relay auto-install (hermetic) --"
+
+LAUNCHER="$REPO_ROOT/mine-auto.sh"
+
+# A stub "$BIN": present + executable but does NOT understand `verify-file`
+# (its --help exits non-zero) → ensure_relay falls through to OS sha256sum (the
+# path a standalone rig without a verify-file-capable binary actually takes).
+ER_SANDBOX="$(mktemp -d)"
+ER_BIN_STUB="$ER_SANDBOX/bin-stub"
+printf '#!/usr/bin/env bash\nexit 2\n' > "$ER_BIN_STUB"
+chmod +x "$ER_BIN_STUB"
+
+# Shim dir: stub `nice` and `ionice` so the relay-start block (which wraps the
+# relay in `nice -n 19 ionice -c 3 …`) runs hermetically — ionice/pkill do NOT
+# exist on Git Bash for Windows. Each shim strips its own flags then execs the
+# remaining argv (so `nice -n 19 ionice -c 3 RELAY node …` ends up exec-ing the
+# relay stub). pkill is a harmless no-op stub (no relay procs in a sandbox).
+ER_SHIMDIR="$ER_SANDBOX/shims"
+mkdir -p "$ER_SHIMDIR"
+cat > "$ER_SHIMDIR/nice" <<'SH'
+#!/usr/bin/env bash
+# drop "-n <N>" then exec the rest
+while [ "${1:-}" = "-n" ]; do shift 2; done
+exec "$@"
+SH
+cat > "$ER_SHIMDIR/ionice" <<'SH'
+#!/usr/bin/env bash
+# drop "-c <N>" then exec the rest
+while [ "${1:-}" = "-c" ]; do shift 2; done
+exec "$@"
+SH
+cat > "$ER_SHIMDIR/pkill" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+chmod +x "$ER_SHIMDIR/nice" "$ER_SHIMDIR/ionice" "$ER_SHIMDIR/pkill"
+
+# A stub relay binary payload (the "release" bytes) and a stub MINER. The relay
+# stub, when started, appends to relay-started.log; the miner stub drops a marker.
+ER_RELAY_PAYLOAD="$ER_SANDBOX/relay-payload"
+cat > "$ER_RELAY_PAYLOAD" <<'RELAYSTUB'
+#!/usr/bin/env bash
+# Relay stub: emulates the two subcommands the launcher invokes.
+#   `wallet new --out <path>` → write a placeholder wallet file (exit 0)
+#   `node …`                  → log that the relay node started (exit 0)
+if [ "${1:-}" = "wallet" ] && [ "${2:-}" = "new" ]; then
+  out=""; shift 2
+  while [ $# -gt 0 ]; do [ "$1" = "--out" ] && { out="$2"; shift 2; continue; }; shift; done
+  [ -n "$out" ] && printf 'stub-wallet\n' > "$out"
+  exit 0
+fi
+if [ "${1:-}" = "node" ]; then
+  echo "relay-node up args:[$*]" >> "$CSD_TEST_RELAY_RAN"
+  exit 0
+fi
+exit 0
+RELAYSTUB
+ER_RELAY_SHA="$(sha256sum "$ER_RELAY_PAYLOAD" | awk '{print $1}')"
+ER_BAD_SHA="0000000000000000000000000000000000000000000000000000000000000000"
+
+# run_relay_case TAG MODE  → echoes a result block the caller greps.
+#   MODE:
+#     FRESH   no relay on disk; SHA256SUMS lists the correct relay digest
+#     BADSHA  no relay on disk; SHA256SUMS lists an all-zeros (wrong) digest
+#     DLFAIL  relay download() returns non-zero (404); SHA256SUMS fine
+#     NORELAY CSD_NO_RELAY=1; download() is a TRIPWIRE that fails the test if hit
+#     PRESENT relay ALREADY on disk + correct SHA; download() is a re-download
+#             TRIPWIRE (any fetch of the relay asset fails the test)
+# Each scenario runs in its OWN bash to avoid global-state bleed. After
+# ensure_relay we run a MINER stub that drops "$work/miner-marker" — its presence
+# proves control flow reached the miner launch (best-effort rule #1).
+run_relay_case() {
+  local tag="$1" mode="$2"
+  local work="$ER_SANDBOX/case-$tag"
+  mkdir -p "$work"
+
+  # Stage the fake-release SHA256SUMS for this case (keyed by the relay basename).
+  local sums="$work/SHA256SUMS"
+  case "$mode" in
+    FRESH|DLFAIL|NORELAY|PRESENT) printf '%s  csd-relay-node\n' "$ER_RELAY_SHA" > "$sums" ;;
+    BADSHA)                       printf '%s  csd-relay-node\n' "$ER_BAD_SHA"   > "$sums" ;;
+  esac
+
+  # PRESENT: pre-place a byte-identical, already-executable relay on disk.
+  if [ "$mode" = "PRESENT" ]; then
+    cp "$ER_RELAY_PAYLOAD" "$work/csd-relay-node"
+    chmod +x "$work/csd-relay-node"
+  fi
+
+  CSD_SOURCE_ONLY=1 \
+  CASE_DIR="$work" CASE_MODE="$mode" \
+  RELAY_PAYLOAD="$ER_RELAY_PAYLOAD" BIN_STUB="$ER_BIN_STUB" \
+  CSD_TEST_RELAY_RAN="$work/relay-started.log" \
+  PATH="$ER_SHIMDIR:$PATH" \
+  bash -c '
+    set -uo pipefail
+    source "'"$LAUNCHER"'" >/dev/null 2>&1
+
+    # Redirect ALL relay state into the sandbox.
+    DATA_DIR="$CASE_DIR"
+    CFG_DIR="$CASE_DIR"
+    BIN="$BIN_STUB"
+    RELAY_BIN_NAME="csd-relay-node"
+    RELAY_BIN="$CASE_DIR/csd-relay-node"
+    RELAY_DATADIR="$CASE_DIR/relay-data"
+    RELAY_WALLET="$CASE_DIR/relay-wallet.json"
+    RELAY_BLACKLIST="$CASE_DIR/relay-blacklist.txt"
+    RELAY_LOG="$CASE_DIR/relay.log"
+    RELAY_PUSH_PEERS="$CASE_DIR/relay-push-peers.txt"
+    RELAY_WALLET_CMD=("$RELAY_BIN" wallet new --out "$RELAY_WALLET")
+    RELAY_PID=0
+    if [ "$CASE_MODE" = "NORELAY" ]; then export CSD_NO_RELAY=1; fi
+
+    # download() override → serve the LOCAL fake release.
+    #   .../csd-relay-node → copy payload (FRESH/BADSHA) | FAIL (DLFAIL) |
+    #                        TRIPWIRE-FAIL (NORELAY/PRESENT: must never be fetched)
+    #   .../SHA256SUMS     → copy the staged sums
+    download() {
+      local url="$1" out="$2"
+      case "$url" in
+        *"/csd-relay-node")
+          case "$CASE_MODE" in
+            DLFAIL)          return 1 ;;
+            NORELAY|PRESENT) echo "TRIPWIRE: relay asset was fetched (CASE_MODE=$CASE_MODE)"; touch "$CASE_DIR/TRIPWIRE_HIT"; return 1 ;;
+            *)               cp "$RELAY_PAYLOAD" "$out" ;;
+          esac ;;
+        *"/SHA256SUMS")
+          cp "$CASE_DIR/SHA256SUMS" "$out" ;;
+        *) return 1 ;;
+      esac
+    }
+
+    # Sourcing inherits set -e; guard so a fail-closed return(0/1) does not abort.
+    # Mirror the real call-site contract from start_miners():
+    #   ensure_relay || true      (install: download/verify/place — best-effort)
+    #   start_relay  || true       (launch the relay if a usable binary is present)
+    rc=0
+    ensure_relay || rc=$?
+    start_relay  || true
+
+    # BEST-EFFORT proof: the GPU-miner launch must be reached regardless. The real
+    # start_miners() continues into the GPU loop after the relay block; we drop a
+    # marker here to prove control flow was never aborted by a relay failure. This
+    # marker is set BEFORE we wait on the (backgrounded) relay — proving the miner
+    # launch never waits on the relay (HAZARD-2: relay start is `&` in start_relay).
+    : > "$CASE_DIR/miner-marker"
+
+    # The relay is launched in the BACKGROUND (&), so its stub may not have written
+    # its start-log yet. Reap it (bounded) so RELAY_STARTED reflects reality. A
+    # plain `wait` blocks until the (fast-exiting) relay stub finishes; cap with a
+    # short poll as a belt so a hang here can never wedge the test run.
+    if [ "$RELAY_PID" -gt 0 ]; then
+      n=0
+      while [ ! -s "$CASE_DIR/relay-started.log" ] && [ "$n" -lt 50 ]; do
+        kill -0 "$RELAY_PID" 2>/dev/null || break
+        sleep 0.1; n=$((n + 1))
+      done
+      wait "$RELAY_PID" 2>/dev/null || true
+    fi
+
+    echo "RC=$rc"
+    [ -x "$RELAY_BIN" ] && echo "RELAY_PRESENT=1" || echo "RELAY_PRESENT=0"
+    [ -e "$CASE_DIR/relay-started.log" ] && echo "RELAY_STARTED=1" || echo "RELAY_STARTED=0"
+    [ -e "$CASE_DIR/miner-marker" ]      && echo "MINER_LAUNCHED=1" || echo "MINER_LAUNCHED=0"
+    [ -e "$CASE_DIR/TRIPWIRE_HIT" ]      && echo "TRIPWIRE=1" || echo "TRIPWIRE=0"
+  ' 2>&1
+  # ^ merge stderr→stdout: ensure_relay/start_relay emit their failure messages on
+  #   stderr (verify-FAILED, download-failed, etc.); the message assertions below
+  #   grep the combined stream. The KEY=VAL status lines are on stdout regardless.
+}
+
+# Helper to pull a KEY=VAL line out of a case's output.
+er_val() { printf '%s\n' "$1" | grep -oE "^$2=[0-9]+" | tail -1 | cut -d= -f2; }
+
+# ── R1. Fresh rig (no relay) → download + verify + place + start ──────────────
+R1_OUT="$(run_relay_case R1 FRESH || true)"
+R1_PRESENT="$(er_val "$R1_OUT" RELAY_PRESENT)"
+R1_STARTED="$(er_val "$R1_OUT" RELAY_STARTED)"
+R1_MINER="$(er_val "$R1_OUT" MINER_LAUNCHED)"
+if [ "$R1_PRESENT" = "1" ] && file_is_string_er "$ER_SANDBOX/case-R1/csd-relay-node" "$ER_RELAY_PAYLOAD"; then
+  ok "R1 fresh rig: relay downloaded, verified, placed (exists + exec + byte-correct)"
+else
+  fail "R1 fresh rig: relay placed" "expected \$RELAY_BIN present & byte-identical to payload; out=[$R1_OUT]"
+fi
+if [ "$R1_STARTED" = "1" ]; then
+  ok "R1 fresh rig: relay STARTED from the freshly-installed binary"
+else
+  fail "R1 fresh rig: relay started" "expected relay-started.log; out=[$R1_OUT]"
+fi
+if [ "$R1_MINER" = "1" ]; then
+  ok "R1 fresh rig: GPU miner launch reached (best-effort)"
+else
+  fail "R1 fresh rig: miner launched" "miner marker absent; out=[$R1_OUT]"
+fi
+
+# ── R2. SHA mismatch (all-zeros) → relay ABSENT + verify-FAILED + MINER lives ─
+# CORE SAFETY: never chmod+exec a SHA-mismatched relay; the miner must still run.
+R2_OUT="$(run_relay_case R2 BADSHA || true)"
+R2_PRESENT="$(er_val "$R2_OUT" RELAY_PRESENT)"
+R2_MINER="$(er_val "$R2_OUT" MINER_LAUNCHED)"
+if [ "$R2_PRESENT" = "0" ] && [ ! -e "$ER_SANDBOX/case-R2/csd-relay-node" ]; then
+  ok "R2 SHA mismatch: relay binary ABSENT (fail-closed; never placed)"
+else
+  fail "R2 SHA mismatch: relay absent" "a relay binary was placed despite a SHA mismatch; out=[$R2_OUT]"
+fi
+if printf '%s\n' "$R2_OUT" | grep -qiE 'verify (FAILED|failed)|SHA-?256'; then
+  ok "R2 SHA mismatch: verify-FAILED message emitted"
+else
+  fail "R2 SHA mismatch: message" "expected a SHA verify-FAILED message; out=[$R2_OUT]"
+fi
+if [ "$R2_MINER" = "1" ]; then
+  ok "R2 SHA mismatch: GPU miner STILL launched (best-effort, relay failure non-fatal)"
+else
+  fail "R2 SHA mismatch: miner launched" "miner marker absent — a relay verify failure blocked mining; out=[$R2_OUT]"
+fi
+
+# ── R3. Download 404/fail → relay ABSENT + calm "unavailable" notice + MINER lives ─
+# Messages were softened (miner-facing): the download-unavailable path now reads
+# "relay helper unavailable right now (offline?) … will retry next run" instead of
+# "relay not started / download failed". This regex matches the NEW calm wording
+# while staying DISTINCT from R2 (SHA-256 verify-fail) and R4 (CSD_NO_RELAY opt-out).
+R3_OUT="$(run_relay_case R3 DLFAIL || true)"
+R3_PRESENT="$(er_val "$R3_OUT" RELAY_PRESENT)"
+R3_MINER="$(er_val "$R3_OUT" MINER_LAUNCHED)"
+if [ "$R3_PRESENT" = "0" ] && [ ! -e "$ER_SANDBOX/case-R3/csd-relay-node" ]; then
+  ok "R3 download fail: relay binary ABSENT"
+else
+  fail "R3 download fail: relay absent" "a relay binary was placed despite a failed download; out=[$R3_OUT]"
+fi
+if printf '%s\n' "$R3_OUT" | grep -qiE 'relay helper unavailable|unavailable right now|offline\?|will retry next run'; then
+  ok "R3 download fail: calm 'relay helper unavailable / will retry' message emitted"
+else
+  fail "R3 download fail: message" "expected a calm 'relay helper unavailable (offline?) … will retry next run' message; out=[$R3_OUT]"
+fi
+if [ "$R3_MINER" = "1" ]; then
+  ok "R3 download fail: GPU miner STILL launched (best-effort)"
+else
+  fail "R3 download fail: miner launched" "miner marker absent; out=[$R3_OUT]"
+fi
+
+# ── R4. CSD_NO_RELAY=1 → no download, no start, clean opt-out, MINER lives ────
+# download() is a TRIPWIRE for the relay asset: if the URL is fetched, TRIPWIRE=1.
+R4_OUT="$(run_relay_case R4 NORELAY || true)"
+R4_PRESENT="$(er_val "$R4_OUT" RELAY_PRESENT)"
+R4_STARTED="$(er_val "$R4_OUT" RELAY_STARTED)"
+R4_MINER="$(er_val "$R4_OUT" MINER_LAUNCHED)"
+R4_TRIP="$(er_val "$R4_OUT" TRIPWIRE)"
+if [ "$R4_TRIP" = "0" ] && [ ! -e "$ER_SANDBOX/case-R4/TRIPWIRE_HIT" ]; then
+  ok "R4 CSD_NO_RELAY=1: relay asset was NOT fetched (download tripwire untouched)"
+else
+  fail "R4 CSD_NO_RELAY=1: no fetch" "the relay URL was fetched despite opt-out; out=[$R4_OUT]"
+fi
+if [ "$R4_PRESENT" = "0" ] && [ "$R4_STARTED" = "0" ]; then
+  ok "R4 CSD_NO_RELAY=1: relay neither placed nor started (opt-out honoured)"
+else
+  fail "R4 CSD_NO_RELAY=1: skipped" "relay present/started despite opt-out; out=[$R4_OUT]"
+fi
+if printf '%s\n' "$R4_OUT" | grep -qiE 'CSD_NO_RELAY|opt-?out|relay.*(skip|disabled)|skip.*relay'; then
+  ok "R4 CSD_NO_RELAY=1: clean opt-out message emitted"
+else
+  fail "R4 CSD_NO_RELAY=1: message" "expected an opt-out/skip message; out=[$R4_OUT]"
+fi
+if [ "$R4_MINER" = "1" ]; then
+  ok "R4 CSD_NO_RELAY=1: GPU miner launched"
+else
+  fail "R4 CSD_NO_RELAY=1: miner launched" "miner marker absent; out=[$R4_OUT]"
+fi
+
+# ── R5. Relay already present + correct SHA → NO re-download, byte-unchanged ──
+# download() is a re-download TRIPWIRE: any fetch of the relay asset fails the test.
+R5_PRE_SHA="$(sha256sum "$ER_RELAY_PAYLOAD" | awk '{print $1}')"
+R5_OUT="$(run_relay_case R5 PRESENT || true)"
+R5_PRESENT="$(er_val "$R5_OUT" RELAY_PRESENT)"
+R5_STARTED="$(er_val "$R5_OUT" RELAY_STARTED)"
+R5_MINER="$(er_val "$R5_OUT" MINER_LAUNCHED)"
+R5_TRIP="$(er_val "$R5_OUT" TRIPWIRE)"
+R5_POST_SHA="$(sha256sum "$ER_SANDBOX/case-R5/csd-relay-node" 2>/dev/null | awk '{print $1}')"
+if [ "$R5_TRIP" = "0" ] && [ ! -e "$ER_SANDBOX/case-R5/TRIPWIRE_HIT" ]; then
+  ok "R5 relay present: NO re-download (tripwire untouched — idempotent)"
+else
+  fail "R5 relay present: no re-download" "the relay asset was re-fetched though a good binary exists; out=[$R5_OUT]"
+fi
+if [ -n "$R5_POST_SHA" ] && [ "$R5_POST_SHA" = "$R5_PRE_SHA" ]; then
+  ok "R5 relay present: on-disk relay byte-UNCHANGED"
+else
+  fail "R5 relay present: unchanged" "on-disk relay changed (pre=$R5_PRE_SHA post=$R5_POST_SHA); out=[$R5_OUT]"
+fi
+if [ "$R5_STARTED" = "1" ]; then
+  ok "R5 relay present: relay STARTED from the existing binary"
+else
+  fail "R5 relay present: started" "expected relay-started.log from existing binary; out=[$R5_OUT]"
+fi
+if [ "$R5_MINER" = "1" ]; then
+  ok "R5 relay present: GPU miner launched"
+else
+  fail "R5 relay present: miner launched" "miner marker absent; out=[$R5_OUT]"
+fi
+
+rm -rf "$ER_SANDBOX"
+
+# ── 22. STATIC: ensure_relay call site is best-effort (|| true / if-guard) ────
+# Regression lock on the set -e stall path: a relay-install failure must never
+# abort start_miners. The call site must be `ensure_relay || true` (or guarded by
+# an if/||). A bare `ensure_relay` under `set -e` would kill the launcher.
+echo
+echo "-- static: ensure_relay call site is best-effort + watchdog decoupling --"
+if grep -nE 'ensure_relay[[:space:]]*\|\|[[:space:]]*true' "$REPO_ROOT/mine-auto.sh" >/dev/null 2>&1; then
+  ok "S1 ensure_relay invoked best-effort (\`ensure_relay || true\`) — no set -e stall"
+elif grep -nE '(if[[:space:]]+ensure_relay|ensure_relay[[:space:]]*\|\|)' "$REPO_ROOT/mine-auto.sh" >/dev/null 2>&1; then
+  ok "S1 ensure_relay invoked under an if/|| guard — no set -e stall"
+else
+  fail "S1 ensure_relay best-effort" "the ensure_relay call site must be \`|| true\` or if-guarded (set -e safety)"
+fi
+
+# ── 23. STATIC: watchdog `while true … miners_running` loop has ZERO RELAY_PID ─
+# Locks the decoupling: the liveness/restart loop must not key off the relay PID,
+# so a relay crash never restarts (or blocks) the GPU miners. Extract the loop
+# body (from the final `while true; do` to EOF) and assert no RELAY_PID token.
+echo
+WHILE_LINE=$(grep -nE '^while true; do' "$REPO_ROOT/mine-auto.sh" | tail -1 | cut -d: -f1)
+if [ -n "$WHILE_LINE" ]; then
+  LOOP_BODY="$(tail -n +"$WHILE_LINE" "$REPO_ROOT/mine-auto.sh")"
+  if printf '%s\n' "$LOOP_BODY" | grep -qE 'RELAY_PID'; then
+    fail "S2 watchdog decoupling" "the 'while true … miners_running' loop (from line $WHILE_LINE) references RELAY_PID — relay must not drive miner liveness"
+  else
+    ok "S2 watchdog loop (from line $WHILE_LINE) contains ZERO RELAY_PID references (relay/miner decoupled)"
+  fi
+else
+  fail "S2 watchdog decoupling" "could not locate the 'while true; do' watchdog loop"
+fi
+
+# ── 24. ensure_relay is sourceable (defined BEFORE the CSD_SOURCE_ONLY cutoff) ─
+echo
+if CSD_SOURCE_ONLY=1 bash -c 'source "'"$REPO_ROOT/mine-auto.sh"'" >/dev/null 2>&1; declare -F ensure_relay >/dev/null'; then
+  ok "S3 ensure_relay is defined + sourceable under CSD_SOURCE_ONLY=1"
+else
+  fail "S3 ensure_relay sourceable" "ensure_relay not defined after sourcing (must sit before the CSD_SOURCE_ONLY cutoff)"
+fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo
