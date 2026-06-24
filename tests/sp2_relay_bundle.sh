@@ -771,6 +771,49 @@ else
   fail "S3 ensure_relay sourceable" "ensure_relay not defined after sourcing (must sit before the CSD_SOURCE_ONLY cutoff)"
 fi
 
+# ── 25. download() refuses to write THROUGH a pre-planted symlink ─────────────
+# The shared download() stages to a PREDICTABLE path ($out.tmp). A symlink
+# planted there must NOT redirect the fetch to an arbitrary target (curl -o /
+# wget -O both FOLLOW a symlink at the output path and write through it). We stub
+# curl to write the payload to its -o target, plant a symlink at $out.tmp -> a
+# "secret", call the REAL download(), and assert the secret is UNTOUCHED and the
+# real destination is a regular file. (Does not touch the verify-then-swap flow.)
+echo
+DL_SB="$(mktemp -d)"
+printf 'TOP-SECRET-ORIGINAL\n' > "$DL_SB/secret"
+ln -s "$DL_SB/secret" "$DL_SB/asset.tmp" 2>/dev/null
+if [ ! -L "$DL_SB/asset.tmp" ]; then
+  # This platform's `ln -s` did not create a real symlink (Git-Bash/MSYS without
+  # winsymlinks copies instead), so the symlink-follow vuln cannot be exercised
+  # here. Skip rather than false-pass; the path runs for real on Linux (the fleet).
+  echo "  [SKIP] S4/S5 download() symlink hardening — real symlinks unavailable on this platform; verified on Linux"
+  rm -rf "$DL_SB"
+else
+  DL_SHIM="$DL_SB/shim"; mkdir -p "$DL_SHIM"
+  cat > "$DL_SHIM/curl" <<'CURLEOF'
+#!/usr/bin/env bash
+out=""; while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2;; *) shift;; esac; done
+printf 'DOWNLOADED-BYTES\n' > "$out"
+CURLEOF
+  chmod +x "$DL_SHIM/curl"
+  PATH="$DL_SHIM:$PATH" CSD_SOURCE_ONLY=1 bash -c '
+    source "'"$REPO_ROOT/mine-auto.sh"'" >/dev/null 2>&1
+    download "http://example.invalid/asset" "'"$DL_SB/asset"'" >/dev/null 2>&1
+  ' >/dev/null 2>&1
+  DL_SECRET_AFTER="$(cat "$DL_SB/secret" 2>/dev/null)"
+  if [ "$DL_SECRET_AFTER" = "TOP-SECRET-ORIGINAL" ]; then
+    ok "S4 download() does NOT write through a planted \$out.tmp symlink (secret untouched)"
+  else
+    fail "S4 download symlink write-through" "the planted \$out.tmp symlink redirected the fetch; secret now: '$DL_SECRET_AFTER'"
+  fi
+  if grep -q DOWNLOADED-BYTES "$DL_SB/asset" 2>/dev/null && [ ! -L "$DL_SB/asset" ]; then
+    ok "S5 download() still delivers bytes to the real destination (regular file)"
+  else
+    fail "S5 download delivers" "\$out did not receive the bytes as a regular file"
+  fi
+  rm -rf "$DL_SB"
+fi
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo
 echo "========================================"

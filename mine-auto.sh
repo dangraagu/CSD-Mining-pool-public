@@ -111,6 +111,13 @@ echo
 download() {
   local url="$1" out="$2" max_time="${3:-}" tmp
   tmp="$out.tmp"
+  # Harden the predictable staging path: drop any pre-existing entry and create
+  # $tmp fresh under noclobber (O_EXCL) BEFORE fetching, so curl/wget cannot
+  # follow a planted symlink at $tmp and write THROUGH it to an arbitrary target.
+  # $tmp sits beside $out (same filesystem) so the final mv stays an atomic
+  # rename(2). The verify-then-swap trust flow downstream is unchanged.
+  rm -f "$tmp"
+  ( set -C; : > "$tmp" ) 2>/dev/null || { echo "[X] download: staging path '$tmp' not creatable as a fresh regular file" >&2; return 1; }
   if command -v curl >/dev/null 2>&1; then
     if [ -n "$max_time" ]; then
       curl -fL --retry 3 --max-time "$max_time" -o "$tmp" "$url" && mv "$tmp" "$out"
