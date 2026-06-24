@@ -93,6 +93,46 @@ pub fn target_from_difficulty(d: f64) -> [u8; 32] {
     u256_div_u64_be(&PDIFF1_BE, divisor)
 }
 
+/// Number of hashes per share at pool-difficulty 1 (≈ 2^32). A pdiff-1 target
+/// has its top set bytes at indices [4],[5] (`0x00000000FFFF0000…`), so on
+/// average ~2^32 hashes are needed to find one share at difficulty 1, and ~`d`
+/// times that at difficulty `d`. The exact pdiff-1 expectation is
+/// `2^256 / (pdiff_1_target + 1)` ≈ 2^32 to one part in 2^16 — close enough for
+/// a startup *suggestion* that the pool's vardiff will refine anyway.
+const HASHES_PER_PDIFF1_SHARE: f64 = 4_294_967_296.0; // 2^32
+
+/// Inverse of [`target_from_difficulty`] at the rate level: from a measured
+/// hashrate `hashrate_hps` (hashes/second) and a desired share interval
+/// `target_secs`, return the Stratum share difficulty that yields ~1 share every
+/// `target_secs`.
+///
+/// Derivation: at difficulty `d` a share needs ~`d * 2^32` hashes; in
+/// `target_secs` the miner computes `hashrate_hps * target_secs` hashes; setting
+/// those equal gives `d = hashrate_hps * target_secs / 2^32`.
+///
+/// Floors at `1.0` (the pool's minimum) and is **fail-safe**: any non-finite or
+/// non-positive input (a bogus/empty benchmark, a zero/NaN target time) returns
+/// `1.0` rather than propagating a NaN/inf onto the wire. A wrong-but-finite
+/// suggestion is harmless — the pool clamps it into its allowed band and vardiff
+/// overrides it within a few shares — but a malformed value must never be sent.
+pub fn suggested_difficulty(hashrate_hps: f64, target_secs: f64) -> f64 {
+    if !hashrate_hps.is_finite()
+        || hashrate_hps <= 0.0
+        || !target_secs.is_finite()
+        || target_secs <= 0.0
+    {
+        return 1.0;
+    }
+    let d = hashrate_hps * target_secs / HASHES_PER_PDIFF1_SHARE;
+    // `d` is finite and positive here (finite positives in, finite op), but a
+    // pathologically huge product could in principle round to non-finite — guard
+    // it so the contract "always returns a finite value >= 1.0" holds absolutely.
+    if !d.is_finite() {
+        return 1.0;
+    }
+    d.max(1.0)
+}
+
 /// Big-endian 256-bit / 64-bit long division. `dividend` is 32 big-endian
 /// bytes; returns the 32-big-endian-byte quotient (remainder discarded — share
 /// targets only need the floor, exactly as integer `BigUint` division gives).
@@ -206,6 +246,13 @@ pub trait WorkSource {
     /// attached `StatsHandle`.
     fn record_hashrate(&self, _ghs: f64) {}
 
+    /// Apply a startup-benchmark-derived share difficulty `d`: cache it (so it is
+    /// re-sent on every reconnect) AND send a `mining.suggest_difficulty(d)` now.
+    /// Default no-op (the test mock, which has no socket); `StratumClient`
+    /// overrides it to cache on `Shared` + write the suggest frame. Best-effort —
+    /// a send failure is logged by the implementer and never stops mining.
+    fn apply_suggest_difficulty(&self, _d: f64) {}
+
     /// Heartbeat hook for the optional G6 Discord accepted-share milestone.
     /// Called from the loop's 30s heartbeat (NOT the share path). Default no-op:
     /// the test mock inherits it. `StratumClient` overrides it to post the
@@ -293,6 +340,19 @@ impl WorkSource for StratumClient {
     }
     fn notify_heartbeat(&self) {
         StratumClient::notify_heartbeat_sample(self)
+    }
+    fn apply_suggest_difficulty(&self, d: f64) {
+        // Cache first so the reconnect path always re-sends the latest value,
+        // then send it now over the live socket. A send error is non-fatal: the
+        // cache still holds it for the next reconnect, and vardiff ramps from the
+        // floor in the meantime.
+        StratumClient::set_suggest_difficulty(self, d);
+        match StratumClient::send_suggest_difficulty(self, d) {
+            Ok(()) => tracing::info!("stratum: sent mining.suggest_difficulty({d:.2})"),
+            Err(e) => tracing::info!(
+                "stratum: suggest_difficulty send failed (continuing, cached for reconnect): {e}"
+            ),
+        }
     }
 }
 
@@ -1109,6 +1169,59 @@ mod tests {
         let d256 = target_from_difficulty(256.0);
         assert!(hash_leq_target(&d16, &d1) && d16 != d1);
         assert!(hash_leq_target(&d256, &d16) && d256 != d16);
+    }
+
+    // --- suggested_difficulty tests (the inverse of target_from_difficulty:
+    //     from a measured hashrate, what share difficulty lands ~1 share / T) ---
+
+    #[test]
+    fn suggested_difficulty_known_value() {
+        // A share at pdiff-1 is ~2^32 hashes. At H hashes/s over T seconds the
+        // miner does H*T hashes, so the difficulty that yields ~1 share per T is
+        // d = H*T / 2^32. Pick H and T so the math is exact:
+        //   H = 2^32 hashes/s, T = 20s  ⇒  d = 20.
+        let two_pow_32 = 4_294_967_296.0_f64;
+        let d = suggested_difficulty(two_pow_32, 20.0);
+        assert!((d - 20.0).abs() < 1e-9, "expected ~20, got {d}");
+        // H = 2^32, T = 1  ⇒  d = 1 exactly (the floor case, not the clamp).
+        assert!((suggested_difficulty(two_pow_32, 1.0) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn suggested_difficulty_floors_at_one() {
+        // A weak miner (H*T/2^32 < 1) must never suggest below 1.0 — the pool's
+        // minimum difficulty. A few-hundred-MH/s CPU over 20s is well under 2^32.
+        let d = suggested_difficulty(200_000_000.0, 20.0);
+        assert_eq!(d, 1.0, "tiny work must clamp to the diff-1 floor");
+    }
+
+    #[test]
+    fn suggested_difficulty_rejects_non_finite_and_non_positive() {
+        // Defensive: a bogus benchmark (0, NaN, inf, negative) must yield 1.0,
+        // never NaN/inf/negative — a wrong-but-sane suggest is harmless (the pool
+        // clamps + vardiff overrides), but a NaN on the wire would be malformed.
+        assert_eq!(suggested_difficulty(0.0, 20.0), 1.0);
+        assert_eq!(suggested_difficulty(-5.0, 20.0), 1.0);
+        assert_eq!(suggested_difficulty(f64::NAN, 20.0), 1.0);
+        assert_eq!(suggested_difficulty(f64::INFINITY, 20.0), 1.0);
+        // A non-finite / non-positive TARGET TIME is equally bogus ⇒ 1.0.
+        assert_eq!(suggested_difficulty(1e12, 0.0), 1.0);
+        assert_eq!(suggested_difficulty(1e12, f64::NAN), 1.0);
+        assert_eq!(suggested_difficulty(1e12, -1.0), 1.0);
+    }
+
+    #[test]
+    fn suggested_difficulty_large_hashrate_gives_large_d() {
+        // A strong GPU rig (~5 GH/s) over 20s should suggest a difficulty far
+        // above the diff-8 floor the pool would otherwise ramp from.
+        let d = suggested_difficulty(5_000_000_000.0, 20.0);
+        // 5e9 * 20 / 2^32 ≈ 23.28
+        assert!(d > 20.0 && d < 30.0, "expected ~23, got {d}");
+        // Monotonic in H: more hashrate ⇒ strictly higher suggestion.
+        assert!(suggested_difficulty(10e9, 20.0) > suggested_difficulty(5e9, 20.0));
+        // And finite + positive for a huge but realistic fleet aggregate.
+        let big = suggested_difficulty(1e15, 20.0);
+        assert!(big.is_finite() && big > 1.0);
     }
 
     #[test]

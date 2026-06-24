@@ -177,6 +177,22 @@ pub fn authorize_request(id: u64, worker: &str) -> Request {
     }
 }
 
+/// Build a `mining.suggest_difficulty` request: `[<difficulty: f64>]`.
+///
+/// Sent once post-handshake (and re-sent after each reconnect) to hint the pool
+/// at a starting share difficulty derived from a local hashrate benchmark, so
+/// vardiff starts near-correct instead of ramping from the diff-8 floor. `id` is
+/// `null`: like `set_difficulty`/`notify`, this is a fire-and-forget hint the
+/// bridge does not reply to, so there is no response id to match. The pool is
+/// free to clamp, honour, or ignore it — vardiff still owns the final difficulty.
+pub fn suggest_difficulty_request(d: f64) -> Request {
+    Request {
+        id: None,
+        method: "mining.suggest_difficulty".to_string(),
+        params: serde_json::json!([d]),
+    }
+}
+
 /// Build a `mining.submit` request carrying the 5-tuple
 /// `[worker, job_id, extranonce2_hex, ntime_hex, nonce_hex]`.
 pub fn submit_request(
@@ -320,6 +336,37 @@ mod tests {
         let back: Request = serde_json::from_str(line.trim_end()).unwrap();
         assert_eq!(back.method, "mining.submit");
         assert_eq!(back.id, Some(42));
+        assert_eq!(back.params, req.params);
+    }
+
+    #[test]
+    fn suggest_difficulty_request_shape() {
+        // id is null (a notification-style request the bridge does not ack),
+        // method is mining.suggest_difficulty, params is a single-element f64
+        // array carrying the suggested difficulty.
+        let req = suggest_difficulty_request(1024.0);
+        assert_eq!(req.id, None);
+        assert_eq!(req.method, "mining.suggest_difficulty");
+        let p = req.params.as_array().unwrap();
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].as_f64().unwrap(), 1024.0);
+    }
+
+    #[test]
+    fn suggest_difficulty_request_exact_wire_line() {
+        // Pin the EXACT bytes that hit the socket: id null, method, single-f64
+        // params, one trailing newline, no pretty-printing. serde_json renders an
+        // integral f64 (16384.0) as "16384.0".
+        let req = suggest_difficulty_request(16384.0);
+        let line = serialize_line(&req).unwrap();
+        assert_eq!(
+            line,
+            "{\"id\":null,\"method\":\"mining.suggest_difficulty\",\"params\":[16384.0]}\n"
+        );
+        // And it round-trips back to the same request.
+        let back: Request = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(back.id, None);
+        assert_eq!(back.method, "mining.suggest_difficulty");
         assert_eq!(back.params, req.params);
     }
 

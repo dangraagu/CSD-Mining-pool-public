@@ -18,6 +18,7 @@
 
 pub mod backend;
 pub mod backends;
+pub mod bench;
 pub mod coinbase;
 pub mod consensus_types;
 pub mod endpoint;

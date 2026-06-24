@@ -20,6 +20,6 @@ pub mod watchdog;
 pub use client::{StratumClient, StratumJob};
 pub use loop_stratum::run_stratum;
 pub use protocol::{
-    authorize_request, serialize_line, submit_request, subscribe_request, NotifyParams,
-    Notification, Request, Response, SubscribeResult,
+    authorize_request, serialize_line, submit_request, subscribe_request,
+    suggest_difficulty_request, NotifyParams, Notification, Request, Response, SubscribeResult,
 };

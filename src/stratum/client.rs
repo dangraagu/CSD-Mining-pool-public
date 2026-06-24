@@ -31,8 +31,8 @@ use crate::endpoint::EndpointList;
 use crate::notify::{share_accepted_message, DiscordNotifier};
 use crate::stats_server::StatsHandle;
 use super::protocol::{
-    authorize_request, serialize_line, subscribe_request, submit_request, NotifyParams,
-    Notification, Response, SubscribeResult,
+    authorize_request, serialize_line, subscribe_request, submit_request,
+    suggest_difficulty_request, NotifyParams, Notification, Response, SubscribeResult,
 };
 use super::watchdog::{WatchdogSnapshot, WatchdogView};
 
@@ -299,6 +299,14 @@ struct Shared {
     /// primary) so the heartbeat + `/1/summary` show the TRUE pool after a
     /// failover. Behind a `Mutex`; written on reconnect, read by `health_snapshot`.
     current_endpoint: Mutex<String>,
+    /// Cached, benchmark-derived `mining.suggest_difficulty` value, bit-encoded as
+    /// an `f64` in an `AtomicU64` (lock-free, same trick as `difficulty_bits`).
+    /// Seeded to `f64::NAN` = "no suggestion yet"; set once after the startup
+    /// benchmark so the reconnect path can RE-send the same hint after every
+    /// reconnect (the bridge resets a session to its diff floor on reconnect, so
+    /// without this a reconnect would lose the head-start). A NaN/non-positive
+    /// value reads back as `None` and is never sent.
+    suggest_difficulty_bits: AtomicU64,
 }
 
 impl Shared {
@@ -307,6 +315,23 @@ impl Shared {
     }
     fn difficulty(&self) -> f64 {
         f64::from_bits(self.difficulty_bits.load(Ordering::Relaxed))
+    }
+    /// Cache a benchmark-derived suggest-difficulty so it can be re-sent on every
+    /// reconnect. A non-finite or non-positive `d` is rejected (the cache stays
+    /// `None`) — it would be malformed on the wire and must never be re-sent.
+    fn set_suggest_difficulty(&self, d: f64) {
+        let bits = if d.is_finite() && d > 0.0 {
+            d.to_bits()
+        } else {
+            f64::NAN.to_bits()
+        };
+        self.suggest_difficulty_bits.store(bits, Ordering::Relaxed);
+    }
+    /// The cached suggest-difficulty, or `None` if none has been set (the NaN
+    /// sentinel) — used by the reconnect path to decide whether to re-send.
+    fn suggest_difficulty(&self) -> Option<f64> {
+        let d = f64::from_bits(self.suggest_difficulty_bits.load(Ordering::Relaxed));
+        (d.is_finite() && d > 0.0).then_some(d)
     }
 }
 
@@ -389,6 +414,9 @@ impl StratumClient {
             force_failover: AtomicBool::new(false),
             stats: SessionStats::default(),
             current_endpoint: Mutex::new(endpoint.to_string()),
+            // No benchmark has run yet at connect time (the startup benchmark in
+            // `drive()` happens AFTER connect); seed the cache empty (NaN).
+            suggest_difficulty_bits: AtomicU64::new(f64::NAN.to_bits()),
         });
 
         let extranonce1 = hs.subscribe.extranonce1_hex.clone();
@@ -771,6 +799,37 @@ impl StratumClient {
         }
     }
 
+    /// Cache a benchmark-derived suggest-difficulty on the shared session so the
+    /// reconnect path re-sends it after every reconnect (the bridge resets a new
+    /// session to its diff floor, so a reconnect would otherwise lose the
+    /// head-start). Pairs with [`Self::send_suggest_difficulty`], which puts it on
+    /// the wire now. A non-finite / non-positive `d` is rejected by the cache (it
+    /// stays empty) and is never re-sent.
+    pub fn set_suggest_difficulty(&self, d: f64) {
+        self.shared.set_suggest_difficulty(d);
+    }
+
+    /// The cached suggest-difficulty, if one was set. Exposed for tests / callers
+    /// that want to know whether a startup benchmark produced a usable hint.
+    pub fn cached_suggest_difficulty(&self) -> Option<f64> {
+        self.shared.suggest_difficulty()
+    }
+
+    /// Send a single `mining.suggest_difficulty` line carrying `d`, serialized
+    /// through the writer mutex exactly like [`Self::send_submit`]. Fire-and-
+    /// forget: the bridge does not ack a suggest, so this only reports a local
+    /// serialize/write error (the caller logs it and keeps mining — a missed
+    /// suggest just means vardiff ramps from the floor, never a brick). Does NOT
+    /// itself cache `d`; call [`Self::set_suggest_difficulty`] for the
+    /// re-send-on-reconnect behaviour.
+    pub fn send_suggest_difficulty(&self, d: f64) -> Result<()> {
+        let mut w = self
+            .writer
+            .lock()
+            .map_err(|_| anyhow!("stratum writer mutex poisoned"))?;
+        send_suggest_difficulty_locked(&mut w, d)
+    }
+
     /// Send a `mining.submit` line for a found share. Serializes writes through
     /// the writer mutex. Errors bubble up so the caller can log/account them.
     pub fn send_submit(
@@ -852,6 +911,21 @@ impl WatchdogView for ClientWatchdog {
         }
         tracing::warn!("stratum: watchdog requested FAILOVER (rotate endpoint + reconnect)");
     }
+}
+
+/// Write one `mining.suggest_difficulty(d)` frame to an already-locked writer
+/// stream. Shared by [`StratumClient::send_suggest_difficulty`] (startup send,
+/// holding `self.writer`) and the reconnect path (which holds the freshly-swapped
+/// writer). Fire-and-forget: serialize → write → best-effort flush; a write error
+/// bubbles up so the caller can log it, but a missed suggest never stops mining
+/// (vardiff just ramps from the floor). Mirrors the submit write in `send_submit`.
+fn send_suggest_difficulty_locked(w: &mut TcpStream, d: f64) -> Result<()> {
+    let req = suggest_difficulty_request(d);
+    let line = serialize_line(&req)?;
+    w.write_all(line.as_bytes())
+        .context("writing mining.suggest_difficulty")?;
+    w.flush().ok();
+    Ok(())
 }
 
 /// Parse one received line and update [`Shared`] accordingly. Recognizes the
@@ -994,6 +1068,22 @@ fn reconnect(
                     // watchdog must hold to shut the socket, so a stale streak
                     // can't tear down the brand-new connection (review M1).
                     shared.stats.consecutive_unacked.store(0, Ordering::Relaxed);
+                    // Re-send the benchmark-derived suggest-difficulty over the
+                    // FRESH socket (a reconnect starts a new pool session at the
+                    // diff floor, so without this the head-start is lost on every
+                    // reconnect). Done under the same writer lock, right after the
+                    // swap. Fail-safe: a write error here is logged and ignored —
+                    // mining continues and vardiff just ramps from the floor.
+                    if let Some(d) = shared.suggest_difficulty() {
+                        match send_suggest_difficulty_locked(&mut w, d) {
+                            Ok(()) => tracing::info!(
+                                "stratum: re-sent mining.suggest_difficulty({d:.2}) after reconnect"
+                            ),
+                            Err(e) => tracing::info!(
+                                "stratum: suggest_difficulty re-send after reconnect failed (continuing): {e}"
+                            ),
+                        }
+                    }
                 }
                 *backoff = BACKOFF_MIN;
                 tracing::info!("stratum: reconnected to {ep}");
@@ -1031,6 +1121,7 @@ fn reconnect(
 mod tests {
     use super::*;
     use std::net::TcpListener;
+    use std::time::Instant;
 
     /// Build a fresh `Shared` with defaults, as `connect()` would.
     fn fresh_shared(xn1: &str, xn2_size: u64) -> Arc<Shared> {
@@ -1043,6 +1134,7 @@ mod tests {
             force_failover: AtomicBool::new(false),
             stats: SessionStats::default(),
             current_endpoint: Mutex::new("test-pool:3333".to_string()),
+            suggest_difficulty_bits: AtomicU64::new(f64::NAN.to_bits()),
         })
     }
 
@@ -1195,6 +1287,35 @@ mod tests {
         let line = r#"{"id":null,"method":"mining.set_difficulty","params":[2048.5]}"#;
         dispatch_frame(line, &shared);
         assert_eq!(shared.difficulty(), 2048.5);
+    }
+
+    #[test]
+    fn suggest_difficulty_cache_starts_none_and_round_trips() {
+        let shared = fresh_shared("00", 4);
+        // Fresh session: no benchmark-derived suggestion cached yet.
+        assert_eq!(shared.suggest_difficulty(), None);
+        // Caching a real value makes it Some(d), so the reconnect path can re-send.
+        shared.set_suggest_difficulty(4096.0);
+        assert_eq!(shared.suggest_difficulty(), Some(4096.0));
+        // Re-caching overwrites (a re-benchmark could, in principle, change it).
+        shared.set_suggest_difficulty(8192.0);
+        assert_eq!(shared.suggest_difficulty(), Some(8192.0));
+    }
+
+    #[test]
+    fn suggest_difficulty_cache_rejects_bogus_values() {
+        let shared = fresh_shared("00", 4);
+        // A non-finite or non-positive value must never become a cached "Some"
+        // (it would be malformed on the wire on every reconnect). Caching it
+        // leaves the cache empty / None.
+        shared.set_suggest_difficulty(f64::NAN);
+        assert_eq!(shared.suggest_difficulty(), None);
+        shared.set_suggest_difficulty(f64::INFINITY);
+        assert_eq!(shared.suggest_difficulty(), None);
+        shared.set_suggest_difficulty(0.0);
+        assert_eq!(shared.suggest_difficulty(), None);
+        shared.set_suggest_difficulty(-1.0);
+        assert_eq!(shared.suggest_difficulty(), None);
     }
 
     #[test]
@@ -1367,6 +1488,76 @@ mod tests {
         let job = job.expect("early notify (pre-authorize) must be surfaced, not discarded");
         assert_eq!(job.notify.job_id, "earlyjob");
         assert_eq!(client.current_difficulty(), 512.0);
+
+        drop(client);
+        let _ = server.join();
+    }
+
+    /// After a successful handshake, `send_suggest_difficulty(d)` must put a
+    /// `mining.suggest_difficulty` line carrying `d` on the wire (id null,
+    /// single-f64 params) — exactly as `send_submit` puts a submit line. The fake
+    /// bridge here captures everything the client writes and asserts the suggest
+    /// frame appears with the right value.
+    #[test]
+    fn send_suggest_difficulty_puts_frame_on_wire() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut br = BufReader::new(sock.try_clone().unwrap());
+            // Handshake: read subscribe + authorize, reply.
+            let mut line = String::new();
+            br.read_line(&mut line).unwrap(); // subscribe
+            line.clear();
+            br.read_line(&mut line).unwrap(); // authorize
+            sock.write_all(
+                b"{\"id\":1,\"result\":[[[\"mining.notify\",\"1\"]],\"abcd1234\",4],\"error\":null}\n",
+            )
+            .unwrap();
+            sock.write_all(b"{\"id\":2,\"result\":true,\"error\":null}\n")
+                .unwrap();
+            sock.flush().unwrap();
+            // Now forward every subsequent line the client writes to the test.
+            loop {
+                line.clear();
+                match br.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if tx.send(line.trim().to_string()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let client = StratumClient::connect(&addr.to_string(), "csd1testaddr").expect("connect ok");
+        // Cache + send a benchmark-derived suggestion.
+        client.set_suggest_difficulty(4096.0);
+        client.send_suggest_difficulty(4096.0).expect("send ok");
+
+        // The bridge must receive a mining.suggest_difficulty frame with d=4096.
+        let mut saw = false;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(frame) => {
+                    if frame.contains("mining.suggest_difficulty") {
+                        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+                        assert_eq!(v["method"], "mining.suggest_difficulty");
+                        assert!(v["id"].is_null(), "suggest is a fire-and-forget (id null)");
+                        assert_eq!(v["params"][0].as_f64().unwrap(), 4096.0);
+                        saw = true;
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(_) => break,
+            }
+        }
+        assert!(saw, "client must send mining.suggest_difficulty after connect");
 
         drop(client);
         let _ = server.join();

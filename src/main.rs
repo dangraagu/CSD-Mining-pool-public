@@ -22,7 +22,7 @@ use csd_gpu_miner::stats_server::{self, StatsHandle};
 use csd_gpu_miner::{hiveos, selfupdate};
 use csd_gpu_miner::nvml::GpuTelemetry;
 use csd_gpu_miner::stratum::StratumClient;
-use csd_gpu_miner::stratum::loop_stratum::run_stratum_full;
+use csd_gpu_miner::stratum::loop_stratum::{run_stratum_full, suggested_difficulty, WorkSource};
 use csd_gpu_miner::thermal::{self, ThermalGate};
 
 #[cfg(feature = "opencl")]
@@ -130,6 +130,24 @@ pub struct Cli {
     /// startup. Default 5.
     #[arg(long, default_value_t = 5)]
     auto_tune_secs: u64,
+
+    /// Target share interval (seconds) used to derive the startup
+    /// `mining.suggest_difficulty` hint: after connecting, the miner runs a brief
+    /// (≤ a few seconds, hard-capped) hashrate benchmark and suggests the share
+    /// difficulty that would yield ~1 share every this-many seconds, so the pool's
+    /// vardiff starts near-correct instead of ramping up from the diff-8 floor.
+    /// Should roughly match the pool's vardiff target (~20s). The pool is free to
+    /// clamp or override it. Default 20.0.
+    #[arg(long, default_value_t = 20.0)]
+    suggest_share_secs: f64,
+
+    /// Disable the startup `mining.suggest_difficulty` hint (also via env
+    /// `CSD_NO_SUGGEST_DIFF=1`). When set, the miner skips the startup benchmark
+    /// and lets the pool's vardiff ramp from its floor. The hint is ENABLED by
+    /// default; it is purely a client-side Stratum suggestion (no consensus / PoW
+    /// / share-validation effect) and never blocks mining.
+    #[arg(long, default_value_t = false)]
+    no_suggest_diff: bool,
 
     /// Dual mining: CPU worker threads to run alongside the GPU
     /// backend. 0 disables CPU mining (GPU-only).
@@ -1071,6 +1089,7 @@ fn drive<W: csd_gpu_miner::stratum::loop_stratum::WorkSource + Sync>(
                 cli.reserve
             );
             // CPU backend has no GPU to watch ⇒ watchdog disabled.
+            maybe_suggest_difficulty(work, cli, &b, &stop);
             run_stratum_full(
                 &b,
                 work,
@@ -1103,6 +1122,7 @@ fn drive<W: csd_gpu_miner::stratum::loop_stratum::WorkSource + Sync>(
                 b.blocks, b.threads_per_block, b.nonces_per_thread,
                 (b.blocks as u64) * (b.threads_per_block as u64) * (b.nonces_per_thread as u64),
             );
+            maybe_suggest_difficulty(work, cli, &b, &stop);
             run_stratum_full(
                 &b,
                 work,
@@ -1146,6 +1166,7 @@ fn drive<W: csd_gpu_miner::stratum::loop_stratum::WorkSource + Sync>(
                 b.blocks, b.threads_per_block, b.nonces_per_thread,
                 (b.blocks as u64) * (b.threads_per_block as u64) * (b.nonces_per_thread as u64),
             );
+            maybe_suggest_difficulty(work, cli, &b, &stop);
             run_stratum_full(
                 &b,
                 work,
@@ -1181,6 +1202,7 @@ fn drive<W: csd_gpu_miner::stratum::loop_stratum::WorkSource + Sync>(
                             b.blocks, b.threads_per_block, b.nonces_per_thread,
                             (b.blocks as u64) * (b.threads_per_block as u64) * (b.nonces_per_thread as u64),
                         );
+                        maybe_suggest_difficulty(work, cli, &b, &stop);
                         return run_stratum_full(
                             &b,
                             work,
@@ -1226,6 +1248,7 @@ fn drive<W: csd_gpu_miner::stratum::loop_stratum::WorkSource + Sync>(
                             b.blocks, b.threads_per_block, b.nonces_per_thread,
                             (b.blocks as u64) * (b.threads_per_block as u64) * (b.nonces_per_thread as u64),
                         );
+                        maybe_suggest_difficulty(work, cli, &b, &stop);
                         return run_stratum_full(
                             &b,
                             work,
@@ -1256,6 +1279,7 @@ fn drive<W: csd_gpu_miner::stratum::loop_stratum::WorkSource + Sync>(
                 "auto: no GPU backend was usable — run `csd-gpu-miner devices` (or `--list-devices`) for the probe, or rebuild with `--features cuda` / `--features opencl` to compile GPU support in"
             );
             // Fell back to CPU ⇒ no GPU to watch ⇒ watchdog disabled.
+            maybe_suggest_difficulty(work, cli, &b, &stop);
             run_stratum_full(
                 &b,
                 work,
@@ -1264,6 +1288,69 @@ fn drive<W: csd_gpu_miner::stratum::loop_stratum::WorkSource + Sync>(
                 build_gpu_watchdog_cfg(cli, false),
                 Arc::clone(&thermal_gate),
             )
+        }
+    }
+}
+
+/// Is the startup `mining.suggest_difficulty` hint enabled? ON by default;
+/// disabled by `--no-suggest-diff` OR the env var `CSD_NO_SUGGEST_DIFF=1`. Pure
+/// (env read aside) so the precedence is obvious and unit-testable.
+fn suggest_diff_enabled(cli: &Cli) -> bool {
+    if cli.no_suggest_diff {
+        return false;
+    }
+    !matches!(
+        std::env::var("CSD_NO_SUGGEST_DIFF").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes")
+    )
+}
+
+/// Run the bounded startup hashrate benchmark against the SELECTED backend and,
+/// if it yields a usable rate, derive a Stratum share difficulty and send the
+/// pool a `mining.suggest_difficulty` hint (cached so it re-sends on reconnect).
+///
+/// HARD BRICK-SAFETY (no-clawback fleet rule): this can NEVER prevent mining.
+/// It is gated off by `--no-suggest-diff` / `CSD_NO_SUGGEST_DIFF`; the benchmark
+/// is time-bounded and panic-safe (returns `None` on any failure); and on `None`
+/// — or a non-positive rate — it logs one info line and returns, leaving the
+/// miner to start normally and let the pool's vardiff ramp from its floor. A
+/// wrong-but-finite suggestion is harmless: the pool clamps it to its band and
+/// vardiff overrides it within a few shares. No consensus / PoW / share path is
+/// touched — this is a client-side Stratum suggestion only.
+fn maybe_suggest_difficulty<W, B>(work: &W, cli: &Cli, backend: &B, stop: &Arc<AtomicBool>)
+where
+    W: WorkSource + Sync,
+    B: csd_gpu_miner::backend::MiningBackend,
+{
+    if !suggest_diff_enabled(cli) {
+        tracing::info!(
+            "suggest-diff: disabled (--no-suggest-diff / CSD_NO_SUGGEST_DIFF); skipping"
+        );
+        return;
+    }
+    let budget = csd_gpu_miner::bench::DEFAULT_BENCH_BUDGET;
+    tracing::info!(
+        "suggest-diff: benchmarking {} for ~{:?} to derive a starting difficulty…",
+        backend.name(),
+        budget,
+    );
+    match csd_gpu_miner::bench::benchmark_hashrate(backend, budget, stop) {
+        Some(hps) if hps > 0.0 => {
+            let d = suggested_difficulty(hps, cli.suggest_share_secs);
+            tracing::info!(
+                "suggest-diff: measured {:.2} MH/s ⇒ suggesting difficulty {:.2} (target ~{:.0}s/share)",
+                hps / 1e6,
+                d,
+                cli.suggest_share_secs,
+            );
+            // Cache + send (best-effort; logged by the impl). Re-sent on reconnect.
+            work.apply_suggest_difficulty(d);
+        }
+        _ => {
+            // Benchmark failed / timed out / returned no usable rate. Mine anyway.
+            tracing::info!(
+                "suggest-diff: benchmark produced no usable rate; skipping suggest (mining normally)"
+            );
         }
     }
 }
@@ -1386,8 +1473,81 @@ fn ctrlc_lite<F: Fn() + Send + 'static>(handler: F) {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_address, Cli};
+    use super::{suggest_diff_enabled, validate_address, Cli};
     use clap::Parser;
+    use std::sync::Mutex;
+
+    /// Serializes the two tests that mutate the process-global `CSD_NO_SUGGEST_DIFF`
+    /// env var, so they can't race each other under parallel test execution.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn suggest_diff_flags_parse_with_sane_defaults() {
+        // Default run: hint is ENABLED, target ~20s, kill-switch off.
+        let cli = Cli::try_parse_from(["csd-pool-miner", "--address", &"a".repeat(40)]).unwrap();
+        assert!(!cli.no_suggest_diff, "suggest-diff is ON by default");
+        assert_eq!(cli.suggest_share_secs, 20.0);
+
+        // --no-suggest-diff flips the kill switch; --suggest-share-secs overrides T.
+        let cli = Cli::try_parse_from([
+            "csd-pool-miner",
+            "--address",
+            &"a".repeat(40),
+            "--no-suggest-diff",
+            "--suggest-share-secs",
+            "30",
+        ])
+        .unwrap();
+        assert!(cli.no_suggest_diff);
+        assert_eq!(cli.suggest_share_secs, 30.0);
+    }
+
+    #[test]
+    fn suggest_diff_enabled_default_on_flag_off() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // No flag, no env override ⇒ enabled. (Guard: clear the env var first so a
+        // stray value in the test environment can't flip the default.)
+        std::env::remove_var("CSD_NO_SUGGEST_DIFF");
+        let cli = Cli::try_parse_from(["csd-pool-miner", "--address", &"a".repeat(40)]).unwrap();
+        assert!(suggest_diff_enabled(&cli), "default must be ENABLED");
+
+        // The --no-suggest-diff flag disables it regardless of env.
+        let cli = Cli::try_parse_from([
+            "csd-pool-miner",
+            "--address",
+            &"a".repeat(40),
+            "--no-suggest-diff",
+        ])
+        .unwrap();
+        assert!(
+            !suggest_diff_enabled(&cli),
+            "--no-suggest-diff must disable"
+        );
+    }
+
+    #[test]
+    fn suggest_diff_enabled_env_kill_switch() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // CSD_NO_SUGGEST_DIFF=1 disables even without the flag; clearing it
+        // re-enables. Set + restore around the assertions (process-global env).
+        let prev = std::env::var("CSD_NO_SUGGEST_DIFF").ok();
+        let cli = Cli::try_parse_from(["csd-pool-miner", "--address", &"a".repeat(40)]).unwrap();
+
+        std::env::set_var("CSD_NO_SUGGEST_DIFF", "1");
+        assert!(!suggest_diff_enabled(&cli), "env=1 must disable");
+
+        std::env::set_var("CSD_NO_SUGGEST_DIFF", "0");
+        assert!(suggest_diff_enabled(&cli), "env=0 must NOT disable");
+
+        std::env::remove_var("CSD_NO_SUGGEST_DIFF");
+        assert!(suggest_diff_enabled(&cli), "no env var ⇒ enabled");
+
+        // Restore whatever was there before so we don't leak into sibling tests.
+        match prev {
+            Some(v) => std::env::set_var("CSD_NO_SUGGEST_DIFF", v),
+            None => std::env::remove_var("CSD_NO_SUGGEST_DIFF"),
+        }
+    }
 
     #[test]
     fn accepts_40_lowercase_hex() {
