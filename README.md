@@ -47,19 +47,22 @@ and see [Quick start](#quick-start).
 ## Install (Ubuntu / Linux — one command)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/dangraagu/CSD-Mining-pool-public/main/install-csd-miner.sh | bash
+curl -fsSL https://raw.githubusercontent.com/dangraagu/CSD-Mining-pool-public/main/install-csd-miner.sh | CSD_ADDR=<YOUR_ADDR20> bash
 ```
 
 Auto-detects your GPU (NVIDIA / AMD, else CPU), downloads the matching prebuilt
-binary from the latest GitHub Release, asks for your addr20 the first time (and
-remembers it under `~/.config/csd-pool-miner/`), then starts mining. Force a
-variant by passing it through: `… | bash -s -- nvidia|amd|cpu`.
+binary from the latest GitHub Release, and starts mining to `<YOUR_ADDR20>`
+(remembered under `~/.config/csd-pool-miner/`, so later runs need no address).
+Force a variant by passing it through: `… | CSD_ADDR=<addr> bash -s -- nvidia|amd|cpu`.
 
-Piping into `bash` leaves no terminal to prompt on, so supply your addr20 in the
-environment (or as the 2nd arg) the first time:
+**Supply `CSD_ADDR` the first time.** Piping into `bash` leaves no terminal to
+prompt on, so the address must come from the environment (as above) or as the 2nd
+positional arg. If you run the script from a saved file in a real terminal instead
+of piping, it will prompt:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/dangraagu/CSD-Mining-pool-public/main/install-csd-miner.sh | CSD_ADDR=<YOUR_ADDR20> bash
+curl -fsSL https://raw.githubusercontent.com/dangraagu/CSD-Mining-pool-public/main/install-csd-miner.sh -o install-csd-miner.sh
+bash install-csd-miner.sh        # prompts for your addr20 the first time
 ```
 
 Prefer to run it yourself? Download `csd-pool-miner-linux-<nvidia|amd|cpu>` from
@@ -67,6 +70,12 @@ Prefer to run it yourself? Download `csd-pool-miner-linux-<nvidia|amd|cpu>` from
 then `chmod +x csd-pool-miner-linux-<variant>` and run it with `--address
 <YOUR_ADDR20>`. For 24/7 rigs, `mine-all-gpus.sh` (every card) and `mine-auto.sh`
 (every card + auto-update) are fetched alongside the installer.
+
+> **Where the installer puts the binary.** The one-command installer saves the
+> miner to `~/.local/share/csd-pool-miner/csd-pool-miner-linux-<variant>` — this
+> path is **not on your `PATH`**, so call it with its full path (the examples
+> below use a `MINER=` shortcut). The launchers (`mine-auto.sh` /
+> `mine-all-gpus.sh`) already know this path; you only need it for ad-hoc runs.
 
 ## Requirements
 
@@ -84,8 +93,13 @@ with the matching feature (see [Building](#building)).
 
 ## Quick start
 
+The installer leaves the binary at
+`~/.local/share/csd-pool-miner/csd-pool-miner-linux-<variant>` (**not on `PATH`**).
+Set a shortcut to the variant you installed, then run it by full path:
+
 ```sh
-csd-pool-miner --address <YOUR_ADDR20>
+MINER=~/.local/share/csd-pool-miner/csd-pool-miner-linux-cpu   # or -nvidia / -amd
+"$MINER" --address <YOUR_ADDR20>
 ```
 
 That's it. The miner will:
@@ -99,18 +113,18 @@ That's it. The miner will:
 Auto-detect is the default. To force one:
 
 ```sh
-csd-pool-miner --address <YOUR_ADDR20> --backend auto    # default: cuda -> opencl -> cpu
-csd-pool-miner --address <YOUR_ADDR20> --backend cuda     # NVIDIA
-csd-pool-miner --address <YOUR_ADDR20> --backend opencl   # AMD / other
-csd-pool-miner --address <YOUR_ADDR20> --backend cpu      # CPU only
+"$MINER" --address <YOUR_ADDR20> --backend auto      # default: cuda -> opencl -> cpu
+"$MINER" --address <YOUR_ADDR20> --backend cuda       # NVIDIA
+"$MINER" --address <YOUR_ADDR20> --backend opencl     # AMD / other
+"$MINER" --address <YOUR_ADDR20> --backend cpu        # CPU only
 ```
 
 ### Useful extras
 
 ```sh
-csd-pool-miner devices         # list detected GPUs (handy if auto keeps picking CPU)
-csd-pool-miner --list-devices  # same list, as a flag
-csd-pool-miner selftest        # cross-check every backend vs the reference CPU hasher + probe pool reachability
+"$MINER" devices         # list detected GPUs (handy if auto keeps picking CPU)
+"$MINER" --list-devices  # same list, as a flag
+"$MINER" selftest        # cross-check every backend vs the reference CPU hasher + probe pool reachability
 ```
 
 ## Monitoring (stats endpoint + Discord)
@@ -119,7 +133,7 @@ Expose an **xmrig-`/1/summary`-compatible** JSON endpoint for dashboards
 (Awesome Miner, Home Assistant, custom scrapers) — off unless you ask for it:
 
 ```sh
-csd-pool-miner --address <ADDR> --stats-port 3380
+"$MINER" --address <ADDR> --stats-port 3380
 # then GET  http://127.0.0.1:3380/1/summary   (and /healthz)
 ```
 
@@ -133,7 +147,7 @@ counts), so a dashboard can flag an unstable link or a flaky pool at a glance.
 Get a **Discord** ping when you pass an accepted-share milestone:
 
 ```sh
-csd-pool-miner --address <ADDR> --discord-webhook https://discord.com/api/webhooks/...
+"$MINER" --address <ADDR> --discord-webhook https://discord.com/api/webhooks/...
 ```
 
 Notifications are best-effort and non-blocking — a slow or dead webhook never
@@ -232,7 +246,7 @@ characters** (an optional `0x` prefix is accepted).
 
 - **Windows** — download & double-click **`create-wallet.bat`**
 - **Linux** — `curl -fsSL https://raw.githubusercontent.com/dangraagu/CSD-Mining-pool-public/main/create-wallet.sh | bash`
-- **Already have the miner?** — `csd-pool-miner newwallet`
+- **Already have the miner?** — `~/.local/share/csd-pool-miner/csd-pool-miner-linux-<variant> newwallet`
 
 It generates a fresh key locally, prints your **addr20**, and writes it (with the
 private key) to `csd-wallet.txt`. ⚠️ **Back up that file — losing the private key

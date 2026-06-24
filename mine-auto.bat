@@ -140,6 +140,9 @@ if defined CSD_GPU_IDS (
   for /l %%i in (0,1,!LAST!) do set "DEVLIST=!DEVLIST! %%i"
   echo Rig has !NGPU! GPU(s).
 )
+REM First-run banner: which build is running and where its per-GPU logs land.
+echo Selected build: %VARIANT%   (binary: %BIN%)
+echo Per-GPU logs:   %DIR%\gpu^<N^>-log\stdout.log
 echo Mining to !ADDR!.
 echo Auto-checking GitHub for updates every %CHECK_MIN% min (liveness every %LIVE_SEC%s). Keep this open.
 echo(
@@ -269,6 +272,7 @@ if not "!INSTALLED!"=="none" (
       powershell -NoProfile -Command "Start-Sleep -Seconds !BACKOFF!"
     )
     echo [%time%] miners not running - restarting
+    call :report_crash_logs
     call :start_miners
     set /a RESTARTS=!RESTARTS!+1
   ) else (
@@ -526,6 +530,20 @@ if !errorlevel!==0 (
   if exist "!SELF_DL!" del /f /q "!SELF_DL!" >nul 2>&1
   del /f /q "%SELF_SHA%" >nul 2>&1
 )
+goto :eof
+
+:report_crash_logs
+REM Surface WHY the miners are not running: tail the newest gpu*-log\stdout.log so
+REM the operator sees the crash reason, then print an actionable re-run hint naming
+REM the running build. MESSAGE-ONLY (no auto-swap of the build), mirroring mine-auto.sh.
+set "NEWEST="
+for /f "usebackq delims=" %%L in (`powershell -NoProfile -Command "$f=Get-ChildItem -Path '%DIR%\gpu*-log\stdout.log' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1; if($f){$f.FullName}"`) do set "NEWEST=%%L"
+if defined NEWEST (
+  echo [%time%] last miner output ^(!NEWEST!^):
+  powershell -NoProfile -Command "if(Test-Path -LiteralPath '!NEWEST!'){ Get-Content -LiteralPath '!NEWEST!' -Tail 8 | ForEach-Object { '    | ' + $_ } }"
+)
+echo [%time%] the %VARIANT% build keeps exiting - re-run with a different build: nvidia ^| amd ^| cpu
+echo [%time%]   e.g.  mine-auto.bat nvidia   ^(or amd, or cpu^)
 goto :eof
 
 :start_miners

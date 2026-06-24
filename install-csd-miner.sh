@@ -70,17 +70,37 @@ expected_sha() {
   fi
 }
 
+# --- Shared GPU auto-detection (identical in mine-auto.sh / mine-all-gpus.sh).
+# Returns: nvidia | amd | cpu. NVIDIA wins on ANY of three independent signals so
+# a driver-only / container box (nvidia-smi may be absent, but the device nodes
+# and/or libcuda.so are present) is correctly detected as nvidia, not amd/cpu:
+#   1. nvidia-smi exists AND runs,
+#   2. an NVIDIA device node exists (/dev/nvidiactl or /dev/nvidia* — the
+#      CSD_NVIDIA_DEV_GLOB override lets the test point this at a fake dir),
+#   3. ldconfig lists libcuda.so on the loader path.
+# Only if NONE of those hold do we consider AMD/OpenCL (lspci or clinfo), then cpu.
+detect_variant() {
+  local glob="${CSD_NVIDIA_DEV_GLOB:-/dev/nvidia*}"
+  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+    echo nvidia; return
+  fi
+  if [ -e /dev/nvidiactl ] || compgen -G "$glob" >/dev/null 2>&1; then
+    echo nvidia; return
+  fi
+  if command -v ldconfig >/dev/null 2>&1 && ldconfig -p 2>/dev/null | grep -q 'libcuda\.so'; then
+    echo nvidia; return
+  fi
+  if { command -v lspci >/dev/null 2>&1 && lspci 2>/dev/null | grep -Eiq '\[AMD/ATI\]|Advanced Micro Devices|Radeon|\bATI\b'; } \
+     || { command -v clinfo >/dev/null 2>&1 && clinfo 2>/dev/null | grep -Eiq 'Advanced Micro Devices|Radeon|\bAMD\b'; }; then
+    echo amd; return
+  fi
+  echo cpu
+}
+
 # --- 1. Pick the build variant (arg overrides auto-detect) -----------------
 VARIANT="${1:-}"
 if [ -z "$VARIANT" ]; then
-  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
-    VARIANT="nvidia"
-  elif { command -v lspci >/dev/null 2>&1 && lspci 2>/dev/null | grep -Eiq 'VGA.*(AMD|ATI)|Radeon|Display.*(AMD|ATI)'; } \
-       || { command -v clinfo >/dev/null 2>&1 && clinfo 2>/dev/null | grep -Eiq 'AMD|Advanced Micro Devices|Radeon'; }; then
-    VARIANT="amd"
-  else
-    VARIANT="cpu"
-  fi
+  VARIANT="$(detect_variant)"
 fi
 
 case "$VARIANT" in
@@ -179,7 +199,7 @@ chmod +x "$STAGED"
 mv "$STAGED" "$BIN"
 
 # --- 2b. Also fetch the multi-GPU + auto-update launchers next to this file -
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 echo "Fetching the multi-GPU / auto-update launchers ..."
 for f in mine-all-gpus.sh mine-auto.sh; do
   if download "$RAW_BASE/$f" "$SCRIPT_DIR/$f" 2>/dev/null; then

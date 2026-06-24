@@ -28,7 +28,7 @@ BIN="$DATA_DIR/$BIN_NAME"
 URL="https://github.com/$REPO/releases/latest/download/$BIN_NAME"
 
 # This script's own directory (so csd-wallet.txt lands right next to it).
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
 echo
 echo " === CSD Pool Miner - create a new wallet (Linux) ==="

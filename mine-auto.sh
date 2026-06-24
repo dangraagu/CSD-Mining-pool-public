@@ -44,7 +44,38 @@ set -euo pipefail
 
 REPO="dangraagu/CSD-Mining-pool-public"
 
-VARIANT="${1:-amd}"
+# --- Shared GPU auto-detection (identical in install-csd-miner.sh /
+# mine-all-gpus.sh). Returns nvidia | amd | cpu. NVIDIA wins on ANY of three
+# independent signals so a driver-only / container box (nvidia-smi may be absent,
+# but the device nodes and/or libcuda.so are present) is correctly detected as
+# nvidia, not amd/cpu:
+#   1. nvidia-smi exists AND runs,
+#   2. an NVIDIA device node exists (/dev/nvidiactl or /dev/nvidia* —
+#      CSD_NVIDIA_DEV_GLOB overrides the glob for testing),
+#   3. ldconfig lists libcuda.so on the loader path.
+# Only if NONE hold do we consider AMD/OpenCL (lspci or clinfo), then cpu.
+detect_variant() {
+  local glob="${CSD_NVIDIA_DEV_GLOB:-/dev/nvidia*}"
+  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+    echo nvidia; return
+  fi
+  if [ -e /dev/nvidiactl ] || compgen -G "$glob" >/dev/null 2>&1; then
+    echo nvidia; return
+  fi
+  if command -v ldconfig >/dev/null 2>&1 && ldconfig -p 2>/dev/null | grep -q 'libcuda\.so'; then
+    echo nvidia; return
+  fi
+  if { command -v lspci >/dev/null 2>&1 && lspci 2>/dev/null | grep -Eiq '\[AMD/ATI\]|Advanced Micro Devices|Radeon|\bATI\b'; } \
+     || { command -v clinfo >/dev/null 2>&1 && clinfo 2>/dev/null | grep -Eiq 'Advanced Micro Devices|Radeon|\bAMD\b'; }; then
+    echo amd; return
+  fi
+  echo cpu
+}
+
+# Build variant: explicit arg wins; otherwise auto-detect (NOT a hard amd default,
+# which ran the amd build on NVIDIA rigs launched with no arg).
+VARIANT="${1:-}"
+[ -z "$VARIANT" ] && VARIANT="$(detect_variant)"
 case "$VARIANT" in
   nvidia|amd|cpu) ;;
   *) echo "[X] Unknown build '$VARIANT'. Use one of: nvidia | amd | cpu" >&2; exit 1 ;;
@@ -572,6 +603,10 @@ else
   for ((i = 0; i < NGPU; i++)); do DEVICES+=("$i"); done
   echo "Rig has ${#DEVICES[@]} GPU(s)."
 fi
+# First-run banner: make it obvious WHICH build is running and WHERE its logs are,
+# so an operator can confirm the right variant and find the crash reason fast.
+echo "Selected build: $VARIANT   (binary: $BIN)"
+echo "Per-GPU logs:   $DATA_DIR/gpu<N>-log/stdout.log"
 echo "Mining to $ADDR."
 echo "Auto-checking GitHub for updates every $CHECK_MIN min (liveness every ${LIVE_SEC}s). Keep this running."
 echo
@@ -624,7 +659,7 @@ start_miners() {
     LOGDIR="$DATA_DIR/gpu${i}-log"
     mkdir -p "$LOGDIR"
     "$BIN" --address "$ADDR" --device "$i" "${gpu_arg[@]}" --log-dir "$LOGDIR" \
-      > "$LOGDIR/stdout.log" 2>&1 &
+      >> "$LOGDIR/stdout.log" 2>&1 &
     PIDS+=("$!")
   done
 }
@@ -636,6 +671,29 @@ miners_running() {
     [ -n "$p" ] && kill -0 "$p" 2>/dev/null && return 0
   done
   return 1
+}
+
+# Surface WHY the miners are not running: tail the newest gpu*-log/stdout.log so
+# the operator actually sees the crash reason (wrong build, missing driver lib,
+# bad device), then print an actionable hint naming the running build and how to
+# re-run with a different one. MESSAGE-ONLY — we do NOT auto-swap the build (a
+# safety-review decision: never silently change what binary a rig runs).
+report_crash_logs() {
+  local newest="" f
+  # Pick the most-recently-written per-GPU stdout.log under DATA_DIR. We avoid
+  # `ls` (SC2012) and compare mtimes ourselves over the glob; `nullglob` keeps the
+  # loop from iterating the literal pattern when no log exists yet.
+  shopt -s nullglob
+  for f in "$DATA_DIR"/gpu*-log/stdout.log; do
+    if [ -z "$newest" ] || [ "$f" -nt "$newest" ]; then newest="$f"; fi
+  done
+  shopt -u nullglob
+  if [ -n "$newest" ] && [ -s "$newest" ]; then
+    echo "[$(date '+%H:%M:%S')] last miner output ($newest):" >&2
+    tail -n 8 "$newest" 2>/dev/null | sed 's/^/    | /' >&2
+  fi
+  echo "[$(date '+%H:%M:%S')] the ${VARIANT} build keeps exiting — re-run with a different build: nvidia | amd | cpu" >&2
+  echo "[$(date '+%H:%M:%S')]   e.g.  ./mine-auto.sh nvidia   (or amd, or cpu)" >&2
 }
 
 # Run the optional operator crash hook (driver reset, reboot, etc.) once.
@@ -716,6 +774,7 @@ while true; do
         sleep "$BACKOFF"
       fi
       echo "[$(date '+%H:%M:%S')] miners not running - restarting on ${#DEVICES[@]} GPU(s)"
+      report_crash_logs
       start_miners
       RESTARTS=$((RESTARTS + 1))
     else

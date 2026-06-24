@@ -34,7 +34,38 @@ set -euo pipefail
 
 REPO="dangraagu/CSD-Mining-pool-public"
 
-VARIANT="${1:-amd}"
+# --- Shared GPU auto-detection (identical in install-csd-miner.sh /
+# mine-auto.sh). Returns nvidia | amd | cpu. NVIDIA wins on ANY of three
+# independent signals so a driver-only / container box (nvidia-smi may be absent,
+# but the device nodes and/or libcuda.so are present) is correctly detected as
+# nvidia, not amd/cpu:
+#   1. nvidia-smi exists AND runs,
+#   2. an NVIDIA device node exists (/dev/nvidiactl or /dev/nvidia* —
+#      CSD_NVIDIA_DEV_GLOB overrides the glob for testing),
+#   3. ldconfig lists libcuda.so on the loader path.
+# Only if NONE hold do we consider AMD/OpenCL (lspci or clinfo), then cpu.
+detect_variant() {
+  local glob="${CSD_NVIDIA_DEV_GLOB:-/dev/nvidia*}"
+  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+    echo nvidia; return
+  fi
+  if [ -e /dev/nvidiactl ] || compgen -G "$glob" >/dev/null 2>&1; then
+    echo nvidia; return
+  fi
+  if command -v ldconfig >/dev/null 2>&1 && ldconfig -p 2>/dev/null | grep -q 'libcuda\.so'; then
+    echo nvidia; return
+  fi
+  if { command -v lspci >/dev/null 2>&1 && lspci 2>/dev/null | grep -Eiq '\[AMD/ATI\]|Advanced Micro Devices|Radeon|\bATI\b'; } \
+     || { command -v clinfo >/dev/null 2>&1 && clinfo 2>/dev/null | grep -Eiq 'Advanced Micro Devices|Radeon|\bAMD\b'; }; then
+    echo amd; return
+  fi
+  echo cpu
+}
+
+# Build variant: explicit arg wins; otherwise auto-detect (NOT a hard amd default,
+# which ran the amd build on NVIDIA rigs launched with no arg).
+VARIANT="${1:-}"
+[ -z "$VARIANT" ] && VARIANT="$(detect_variant)"
 case "$VARIANT" in
   nvidia|amd|cpu) ;;
   *) echo "[X] Unknown build '$VARIANT'. Use one of: nvidia | amd | cpu" >&2; exit 1 ;;

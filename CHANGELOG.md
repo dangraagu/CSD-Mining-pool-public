@@ -1,5 +1,96 @@
 # Changelog
 
+## 0.1.15
+
+**Launcher / installer / docs hardening — no binary or consensus change.** All
+fixes are brick-safe: any failure leaves the rig mining on the binary it already
+has, and the always-on relay helper is unchanged.
+
+### Fixed
+- **`curl | bash` no longer aborts under `set -u`** — `install-csd-miner.sh` and
+  `create-wallet.sh` computed `SCRIPT_DIR` from `${BASH_SOURCE[0]}`, which is
+  unset when the script is delivered over a pipe (`$0` is `bash`, `BASH_SOURCE`
+  is empty). Under `set -euo pipefail` that tripped an "unbound variable" abort
+  before anything ran. Now `${BASH_SOURCE[0]:-$0}`.
+- **NVIDIA driver-only / container rigs are detected as `nvidia`** — a shared
+  `detect_variant()` (identical in `install-csd-miner.sh`, `mine-auto.sh`,
+  `mine-all-gpus.sh`) returns `nvidia` when **any** of: `nvidia-smi` runs, an
+  NVIDIA device node (`/dev/nvidiactl` or `/dev/nvidia*`) exists, or `ldconfig`
+  lists `libcuda.so`. Previously a container with passed-through device nodes but
+  no `nvidia-smi` was mis-detected as `amd`/`cpu` and ran the wrong build.
+- **No more hard `amd` default** — `mine-auto.sh` / `mine-all-gpus.sh` launched
+  with no build arg defaulted to `amd` (running the amd build on NVIDIA rigs).
+  They now call `detect_variant()` for the no-arg case.
+- **Crash reason is surfaced, not swallowed** — per-GPU stdout is now appended
+  (`>>`) so a crash message survives restarts instead of being overwritten, and
+  the "miners not running — restarting" path tails the newest
+  `gpu*-log/stdout.log` and prints an actionable hint naming the running build and
+  the `nvidia | amd | cpu` re-run options. Mirrored in `mine-auto.bat`.
+  (Message-only — the launcher never silently swaps which build it runs.)
+
+### Added
+- **First-run banner** — `mine-auto.sh` / `mine-auto.bat` now print the selected
+  build and the per-GPU log path on start, so you can confirm what is running and
+  find the logs immediately.
+
+### Docs
+- README: the primary Linux install is now the address-included one-liner
+  (`curl … | CSD_ADDR=<addr> bash`), and the ad-hoc run examples use the real
+  installed path `~/.local/share/csd-pool-miner/csd-pool-miner-linux-<variant>`
+  (which is **not** on `PATH`) instead of a bare `csd-pool-miner`.
+
+## 0.1.14
+
+**Launcher robustness.** `download()` staging in the launchers was hardened
+against symlink-follow on the temp path (a local-attacker edge), and the relay
+helper's user-facing messages were softened so an absent/blocked relay reads as
+informational rather than an error. The README Discord invite was pointed at the
+current server. No miner-binary behaviour change.
+
+## 0.1.13
+
+**Standalone relay auto-install.** The launchers can now best-effort download,
+SHA-verify, and place a trusted `csd-relay-node` when one is not already on disk,
+so a standalone rig gets the relay helper without a manual step. Fail-closed and
+fully decoupled from hashing — a failed or blocked relay install can never abort
+or delay the miner launch.
+
+## 0.1.12
+
+**GPU telemetry + thermal safety + Windows service (all opt-in / gated).**
+Folded into the fleet variants behind cargo features so the default and
+`linux-cpu` builds stay lean.
+
+### Added
+- **NVML GPU telemetry + thermal pause** (`nvml` feature) — reads real GPU
+  temperature/power and pauses hashing above a configurable limit (with
+  hysteresis) so a hot card backs off instead of cooking. `gpu_temp_c` /
+  `gpu_power_w` are exposed in the stats endpoint and the HiveOS `temp[]`.
+- **Windows-Service mode** (`winsvc` feature) — run the miner as a Windows
+  service (install/start/stop/uninstall), so a rig keeps mining across logouts.
+
+## 0.1.11
+
+**Launcher self-update (brick-safe) + relay launch fix.**
+
+### Fixed
+- **Launcher can update itself** — `mine-auto` swapped only the miner *binary*, so
+  a fix to the launcher script never reached a rig running the on-disk launcher.
+  `update_launcher_self` now refreshes the launcher too: **fail-closed** (any
+  download/verify failure keeps the old launcher byte-for-byte) and **no-brick**
+  (atomic on-disk replace via a startup trampoline, never a mid-run re-exec).
+- **Relay launch fix** — corrected the standalone relay launch path so the relay
+  helper starts cleanly alongside the miner.
+
+## 0.1.10
+
+**Self-update semver correctness.** The auto-updater compared versions with a
+string `!=`, which mis-ordered `0.1.10` vs `0.1.9`. Updates are now decided by a
+numeric semver compare (the miner's own `check-update`), so a higher patch
+release is correctly recognised as newer. The download is still SHA-256 verified
+against the release `SHA256SUMS` before any atomic swap, and the updater still
+fails closed.
+
 ## 0.1.9
 
 **Bundled canonical-follow relay node.** This release ships a background
