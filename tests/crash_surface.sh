@@ -85,6 +85,30 @@ else
   fail "mine-auto.bat mirror" "the .bat restart path does not tail stdout.log + print the re-run hint"
 fi
 
+# ── (4) BRICK-SAFETY (OPS-1): report_crash_logs must NOT abort the self-heal loop ─
+# The launcher runs under `set -euo pipefail` and calls report_crash_logs AFTER a
+# miner crash. If `tail` is missing/broken on a rig, the tail|sed pipe (pipefail)
+# would abort the loop -> the FIRST crash would permanently stop mining. Force tail
+# to fail and assert the caller reaches the sentinel PAST report_crash_logs.
+FN2="$(mktemp)"
+awk '/^report_crash_logs\(\)[[:space:]]*\{/{f=1} f{print} f&&/^\}/{exit}' "$LAUNCHER" > "$FN2"
+SB2="$(mktemp -d)"; mkdir -p "$SB2/data/gpu0-log"; printf 'up\nFATAL boom\n' > "$SB2/data/gpu0-log/stdout.log"
+SHIM2="$SB2/shim"; mkdir -p "$SHIM2"; printf '#!/usr/bin/env bash\nexit 127\n' > "$SHIM2/tail"; chmod +x "$SHIM2/tail"
+SURV="$(PATH="$SHIM2:$PATH" DATA_DIR="$SB2/data" VARIANT="amd" bash -c 'set -euo pipefail; source "$1"; report_crash_logs; echo SENTINEL-SURVIVED' _ "$FN2" 2>&1)"
+if printf '%s' "$SURV" | grep -q 'SENTINEL-SURVIVED'; then
+  ok "report_crash_logs is brick-safe: a failing tail under set -euo pipefail does NOT abort the loop"
+else
+  fail "crash-path brick-safety (OPS-1)" "set -e + failing tail killed the loop before the sentinel. got: $(printf '%s' "$SURV" | tr '\n' '|')"
+fi
+rm -rf "$SB2"; rm -f "$FN2"
+
+# ── (5) belt: the watchdog call site guards report_crash_logs (|| true) ───────
+if grep -Eq 'report_crash_logs[[:space:]]*\|\|[[:space:]]*true' "$LAUNCHER"; then
+  ok "report_crash_logs call site is guarded (|| true), mirroring ensure_relay || true"
+else
+  fail "call-site guard" "report_crash_logs called UNGUARDED in the watchdog loop (set -e brick risk)"
+fi
+
 echo
 echo "========================================"
 echo "  Passed: $PASS  Failed: $FAIL"

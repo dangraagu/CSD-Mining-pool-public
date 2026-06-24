@@ -690,7 +690,7 @@ report_crash_logs() {
   shopt -u nullglob
   if [ -n "$newest" ] && [ -s "$newest" ]; then
     echo "[$(date '+%H:%M:%S')] last miner output ($newest):" >&2
-    tail -n 8 "$newest" 2>/dev/null | sed 's/^/    | /' >&2
+    tail -n 8 "$newest" 2>/dev/null | sed 's/^/    | /' >&2 || true
   fi
   echo "[$(date '+%H:%M:%S')] the ${VARIANT} build keeps exiting — re-run with a different build: nvidia | amd | cpu" >&2
   echo "[$(date '+%H:%M:%S')]   e.g.  ./mine-auto.sh nvidia   (or amd, or cpu)" >&2
@@ -774,7 +774,7 @@ while true; do
         sleep "$BACKOFF"
       fi
       echo "[$(date '+%H:%M:%S')] miners not running - restarting on ${#DEVICES[@]} GPU(s)"
-      report_crash_logs
+      report_crash_logs || true
       start_miners
       RESTARTS=$((RESTARTS + 1))
     else
