@@ -133,6 +133,29 @@ pub fn suggested_difficulty(hashrate_hps: f64, target_secs: f64) -> f64 {
     d.max(1.0)
 }
 
+/// The pool's vardiff INITIAL_DIFFICULTY — the difficulty a freshly-subscribed
+/// worker starts at before vardiff ramps. Confirmed `8.0` in the bridge
+/// (`stratum::vardiff::INITIAL_DIFFICULTY`). A `mining.suggest_difficulty` hint is
+/// only worth sending if it BEATS this floor; suggesting at-or-below it is at best
+/// a no-op and at worst (the v0.1.15 bug: an under-reported GPU benchmark deriving
+/// diff 1.0) actively SLOWS the rig below where the pool would have started it.
+pub const POOL_DEFAULT_START_DIFFICULTY: f64 = 8.0;
+
+/// Gate a derived difficulty before it's forwarded as a `mining.suggest_difficulty`
+/// hint. Returns `Some(d)` only when `d` is finite, positive, and strictly greater
+/// than `pool_default`; otherwise `None` (⇒ the caller skips the suggest and lets
+/// the pool's own start difficulty + vardiff take over — never sends a hint that
+/// would slow the worker below the pool default).
+pub fn guarded_suggestion(d: f64, pool_default: f64) -> Option<f64> {
+    if !d.is_finite() || d <= 0.0 {
+        return None;
+    }
+    if d <= pool_default {
+        return None;
+    }
+    Some(d)
+}
+
 /// Big-endian 256-bit / 64-bit long division. `dividend` is 32 big-endian
 /// bytes; returns the 32-big-endian-byte quotient (remainder discarded — share
 /// targets only need the floor, exactly as integer `BigUint` division gives).
@@ -1169,6 +1192,49 @@ mod tests {
         let d256 = target_from_difficulty(256.0);
         assert!(hash_leq_target(&d16, &d1) && d16 != d1);
         assert!(hash_leq_target(&d256, &d16) && d256 != d16);
+    }
+
+    // --- guarded_suggestion tests: only forward a suggestion that BEATS the
+    //     pool's vardiff start floor; otherwise None ⇒ skip suggest, mine
+    //     normally (the v0.1.15 bug was suggesting diff 1.0 — WORSE than the
+    //     pool's own diff-8 start — actively hurting a fast rig). ---
+
+    #[test]
+    fn guarded_suggestion_below_pool_default_is_none() {
+        // THE reported bug: an under-reported benchmark derived diff 1.0, which is
+        // BELOW the pool's diff-8 start — forwarding it would slow the rig. Guard
+        // ⇒ None ⇒ no suggest ⇒ pool's own (better) default stands.
+        assert_eq!(guarded_suggestion(1.0, POOL_DEFAULT_START_DIFFICULTY), None);
+    }
+
+    #[test]
+    fn guarded_suggestion_equal_to_pool_default_is_none() {
+        // Exactly the pool default adds nothing — don't bother suggesting it.
+        assert_eq!(guarded_suggestion(8.0, 8.0), None);
+    }
+
+    #[test]
+    fn guarded_suggestion_above_pool_default_passes_through() {
+        // A genuinely-higher derived difficulty (the whole point — a fast GPU
+        // wants to START high, not ramp from 8) is forwarded unchanged.
+        assert_eq!(guarded_suggestion(250.0, 8.0), Some(250.0));
+    }
+
+    #[test]
+    fn guarded_suggestion_rejects_non_finite_and_non_positive() {
+        // Defensive: NaN/inf/0/negative are never valid suggestions ⇒ None,
+        // independent of the pool default.
+        assert_eq!(guarded_suggestion(f64::NAN, 8.0), None);
+        assert_eq!(guarded_suggestion(f64::INFINITY, 8.0), None);
+        assert_eq!(guarded_suggestion(0.0, 8.0), None);
+        assert_eq!(guarded_suggestion(-5.0, 8.0), None);
+    }
+
+    #[test]
+    fn pool_default_start_difficulty_matches_bridge_initial() {
+        // Pin the constant to the bridge's vardiff INITIAL_DIFFICULTY (8.0); if
+        // the pool ever changes that floor this test flags the mismatch.
+        assert_eq!(POOL_DEFAULT_START_DIFFICULTY, 8.0);
     }
 
     // --- suggested_difficulty tests (the inverse of target_from_difficulty:

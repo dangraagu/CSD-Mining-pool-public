@@ -22,7 +22,10 @@ use csd_gpu_miner::stats_server::{self, StatsHandle};
 use csd_gpu_miner::{hiveos, selfupdate};
 use csd_gpu_miner::nvml::GpuTelemetry;
 use csd_gpu_miner::stratum::StratumClient;
-use csd_gpu_miner::stratum::loop_stratum::{run_stratum_full, suggested_difficulty, WorkSource};
+use csd_gpu_miner::stratum::loop_stratum::{
+    guarded_suggestion, run_stratum_full, suggested_difficulty, WorkSource,
+    POOL_DEFAULT_START_DIFFICULTY,
+};
 use csd_gpu_miner::thermal::{self, ThermalGate};
 
 #[cfg(feature = "opencl")]
@@ -136,9 +139,10 @@ pub struct Cli {
     /// (≤ a few seconds, hard-capped) hashrate benchmark and suggests the share
     /// difficulty that would yield ~1 share every this-many seconds, so the pool's
     /// vardiff starts near-correct instead of ramping up from the diff-8 floor.
-    /// Should roughly match the pool's vardiff target (~20s). The pool is free to
-    /// clamp or override it. Default 20.0.
-    #[arg(long, default_value_t = 20.0)]
+    /// Should match the pool's vardiff TARGET_SHARE_SECS (~30s) so the suggestion
+    /// targets steady state rather than the pool's faster initial ramp. The pool
+    /// is free to clamp or override it. Default 30.0.
+    #[arg(long, default_value_t = 30.0)]
     suggest_share_secs: f64,
 
     /// Disable the startup `mining.suggest_difficulty` hint (also via env
@@ -1337,14 +1341,26 @@ where
     match csd_gpu_miner::bench::benchmark_hashrate(backend, budget, stop) {
         Some(hps) if hps > 0.0 => {
             let d = suggested_difficulty(hps, cli.suggest_share_secs);
-            tracing::info!(
-                "suggest-diff: measured {:.2} MH/s ⇒ suggesting difficulty {:.2} (target ~{:.0}s/share)",
-                hps / 1e6,
-                d,
-                cli.suggest_share_secs,
-            );
-            // Cache + send (best-effort; logged by the impl). Re-sent on reconnect.
-            work.apply_suggest_difficulty(d);
+            // Only forward a suggestion that BEATS the pool's vardiff start floor.
+            // The v0.1.15 bug forwarded an under-reported diff (e.g. 1.0) that was
+            // BELOW the pool's diff-8 start — actively slowing a fast rig. Gate it.
+            match guarded_suggestion(d, POOL_DEFAULT_START_DIFFICULTY) {
+                Some(d) => {
+                    tracing::info!(
+                        "suggest-diff: measured {:.2} MH/s ⇒ suggesting difficulty {:.2} (target ~{:.0}s/share)",
+                        hps / 1e6,
+                        d,
+                        cli.suggest_share_secs,
+                    );
+                    // Cache + send (best-effort; logged by the impl). Re-sent on reconnect.
+                    work.apply_suggest_difficulty(d);
+                }
+                None => {
+                    tracing::info!(
+                        "suggest-diff: derived diff <= pool default; skipping (mine normally)"
+                    );
+                }
+            }
         }
         _ => {
             // Benchmark failed / timed out / returned no usable rate. Mine anyway.
@@ -1483,10 +1499,12 @@ mod tests {
 
     #[test]
     fn suggest_diff_flags_parse_with_sane_defaults() {
-        // Default run: hint is ENABLED, target ~20s, kill-switch off.
+        // Default run: hint is ENABLED, kill-switch off, and the target share
+        // interval defaults to 30s — matching the pool's vardiff TARGET_SHARE_SECS
+        // so the suggestion targets steady state, not the pool's faster ramp.
         let cli = Cli::try_parse_from(["csd-pool-miner", "--address", &"a".repeat(40)]).unwrap();
         assert!(!cli.no_suggest_diff, "suggest-diff is ON by default");
-        assert_eq!(cli.suggest_share_secs, 20.0);
+        assert_eq!(cli.suggest_share_secs, 30.0);
 
         // --no-suggest-diff flips the kill switch; --suggest-share-secs overrides T.
         let cli = Cli::try_parse_from([
@@ -1495,11 +1513,11 @@ mod tests {
             &"a".repeat(40),
             "--no-suggest-diff",
             "--suggest-share-secs",
-            "30",
+            "45",
         ])
         .unwrap();
         assert!(cli.no_suggest_diff);
-        assert_eq!(cli.suggest_share_secs, 30.0);
+        assert_eq!(cli.suggest_share_secs, 45.0);
     }
 
     #[test]
