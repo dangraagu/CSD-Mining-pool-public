@@ -15,6 +15,7 @@ name: release
 #   csd-relay-node                                           (SP2: canonical-anchor relay, fetched from csd2 release)
 #   latest-version.txt                                       (just the version string, e.g. "0.1.10"; CDN-served so the
 #                                                             launchers resolve "latest" WITHOUT the 60/hr GitHub API limit)
+#   csd-dashboard.sh / csd-dashboard.bat                     (live terminal miner dashboard; read-only /1/summary viewer; self-updating via --update)
 #   SHA256SUMS                                               (digests of all the above)
 #
 # SP2 — csd-relay-node binary source
@@ -240,6 +241,11 @@ jobs:
           mkdir -p "$STAGE"
           cp hiveos/h-manifest.conf hiveos/h-config.sh hiveos/h-run.sh hiveos/h-stats.sh "$STAGE"/
           chmod +x "$STAGE"/h-config.sh "$STAGE"/h-run.sh "$STAGE"/h-stats.sh
+          # Bundle the live terminal dashboard so it's already on every rig. Run it
+          # from the Hive Shell: /hive/miners/custom/csd-pool-miner/csd-dashboard.sh
+          # (read-only viewer of the miner's own /1/summary; never touches mining).
+          cp csd-dashboard.sh "$STAGE"/csd-dashboard.sh
+          chmod +x "$STAGE"/csd-dashboard.sh
           # The HiveOS binary must be named csd-gpu-miner (the manifest CUSTOM_BIN).
           cp target/release/csd-gpu-miner "$STAGE"/csd-gpu-miner
           chmod +x "$STAGE"/csd-gpu-miner
@@ -281,11 +287,17 @@ jobs:
       # flattens and checksums — is what makes SHA256SUMS cover them WITHOUT a second
       # publisher racing the digests file. Without this step the launcher
       # self-update is a permanent no-op (the asset 404s / has no checksum entry).
-      - name: Stage self-updating launchers (mine-auto.sh / mine-auto.bat)
+      - name: Stage self-updating launchers + dashboards (mine-auto + csd-dashboard)
         run: |
           set -euo pipefail
-          cp mine-auto.sh mine-auto.bat dist/
-          echo "staged launchers:"; ls -1 dist/mine-auto.sh dist/mine-auto.bat
+          # The dashboards self-update exactly like the launchers: csd-dashboard
+          # --update downloads releases/latest/download/csd-dashboard.{sh,bat} and
+          # SHA-verifies it against THIS release's SHA256SUMS (fail-closed if the
+          # asset or its checksum entry is absent). Staging them in the SAME linux
+          # job whose dist/ the single release job flattens + checksums is what makes
+          # SHA256SUMS cover them without a second publisher racing the digests file.
+          cp mine-auto.sh mine-auto.bat csd-dashboard.sh csd-dashboard.bat dist/
+          echo "staged launchers + dashboards:"; ls -1 dist/mine-auto.sh dist/mine-auto.bat dist/csd-dashboard.sh dist/csd-dashboard.bat
 
       - name: List built artifacts
         run: ls -la dist

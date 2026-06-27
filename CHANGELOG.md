@@ -1,6 +1,24 @@
 # Changelog
 
-## 0.1.15
+## Unreleased
+
+**Live terminal dashboard — script-only, no binary or consensus change.** A
+read-only viewer; it cannot affect mining.
+
+### Added
+- **`csd-dashboard.sh` (Linux/macOS/HiveOS) and `csd-dashboard.bat` (Windows)** —
+  a live, refreshing terminal view of a running miner: hashrate (10s / 1m / 15m),
+  accepted / rejected / stale shares with reject%, GPU temp + power (when the
+  miner reports them), and reconnects / failovers. It only GETs the miner's own
+  xmrig-`/1/summary` endpoint over localhost — it never writes config, never
+  touches the share/submit path, and never opens a non-loopback socket; worst
+  case it prints "endpoint unreachable". The Linux script needs **no `jq`** (dual
+  jq / pure-`sed` parse) so it runs on a stock HiveOS shell. Flags: `--port`,
+  `--refresh`, `--once`, `--no-color`, `--update`. Self-updates with `--update`
+  (fail-closed SHA-verify against the release `SHA256SUMS`, same as the
+  launchers). Bundled into the HiveOS tarball and published as a release asset.
+
+
 
 **Launcher / installer / docs hardening — no binary or consensus change.** All
 fixes are brick-safe: any failure leaves the rig mining on the binary it already

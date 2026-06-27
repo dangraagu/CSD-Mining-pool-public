@@ -144,6 +144,32 @@ It binds **localhost only** by default. To expose it on your LAN, add
 The `connection` object also reports `reconnects` and `failovers` (lifetime
 counts), so a dashboard can flag an unstable link or a flaky pool at a glance.
 
+### Live terminal dashboard
+
+Prefer a live, refreshing view over raw JSON? Point the bundled dashboard at the
+same endpoint. It's a **read-only viewer** — it only GETs `/1/summary`, never
+touches the miner, its config, or the share path, and never opens a non-loopback
+socket. Worst case it prints "endpoint unreachable"; it cannot affect mining.
+
+```sh
+# Linux / macOS / HiveOS  (the miner must be running with --stats-port)
+./csd-dashboard.sh                       # port 3380, refreshes every 2s
+./csd-dashboard.sh --port 3380 --refresh 5
+./csd-dashboard.sh --once                # print one frame and exit (scripts/cron)
+```
+```bat
+:: Windows
+csd-dashboard.bat
+csd-dashboard.bat --port 3380 --refresh 5
+```
+
+It shows hashrate (10s / 1m / 15m), accepted / rejected / stale shares with
+reject%, GPU temp + power (when the miner reports them), and reconnects /
+failovers. **No `jq` required.** Override the port with `CSD_STATS_PORT`, or point
+at a non-default host with `CSD_STATS_URL=http://host:port/1/summary`. The
+dashboard self-updates with `--update` (fail-closed SHA-verify against the
+release `SHA256SUMS`, same as the launchers).
+
 Get a **Discord** ping when you pass an accepted-share milestone:
 
 ```sh

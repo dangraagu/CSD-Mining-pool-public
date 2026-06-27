@@ -1,0 +1,7 @@
+{
+  "id": "csd-pool-miner",
+  "version": "0.1.16",
+  "uptime": 42,
+  "hashrate": { "total": [0, 0, 0] },
+  "connection": { "pool": "pool.yamaduo.no:3333" }
+}

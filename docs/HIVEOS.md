@@ -36,3 +36,15 @@ Every release ships a ready-made HiveOS **Custom-miner package**, so setup is ju
   - **While running** a background poll checks roughly every 15 minutes (`CHECK_MIN`); when a newer version verifies, it swaps the binary and bounces the miner so HiveOS relaunches on the new build.
   - **Fail-safe:** any update failure (no network, GitHub rate-limit, SHA mismatch, partial download, disk full) is logged and the rig keeps mining on the **existing** binary — an update problem never strands or bricks a rig. Update activity is written to the miner log under `/var/log/miner/csd-pool-miner/`.
   - The **Installation URL above is the non-staling `releases/latest/download/` form**, so re-running the install (or adding a new rig) always pulls the current release. You only ever need to re-apply the Flight Sheet to *reinstall the glue* (e.g. after a HiveOS image wipe), not to update the miner.
+
+## Live terminal dashboard
+
+Every rig ships a **read-only terminal dashboard** next to the miner. Open the **Hive Shell** (the web terminal in the HiveOS dashboard) or SSH into the rig and run:
+
+```sh
+/hive/miners/custom/csd-pool-miner/csd-dashboard.sh
+```
+
+It shows a live, refreshing view of **this rig's** hashrate (10s / 1m / 15m), accepted / rejected / stale shares with reject%, GPU temp + power, and reconnects / failovers. Press **`q`** or **Ctrl-C** to quit; add `--once` for a single snapshot. HiveOS runs the miner's stats endpoint on port **3380**, which is the dashboard's default, so no flags are needed.
+
+It is a **viewer only** — it just reads the miner's own stats endpoint over localhost. It never changes config, never touches the share/submit path, and cannot slow or interrupt mining.
