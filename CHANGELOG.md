@@ -1,9 +1,25 @@
 # Changelog
 
-## Unreleased
+## 0.1.16
 
-**Live terminal dashboard — script-only, no binary or consensus change.** A
-read-only viewer; it cannot affect mining.
+Live terminal dashboard (script-only) **plus** a miner-only fix to the startup
+suggest-difficulty benchmark. No pool, payout, or csd consensus change.
+
+### Fixed
+- **Startup benchmark under-reported GPU hashrate ~67×** (`src/bench.rs`) — the
+  old loop swept only `CHUNK_NONCES` (200k) per `hash_range` call, far too small
+  to fill even one GPU launch, so it measured per-call setup overhead instead of
+  throughput and derived a difficulty floored to ~diff-1. It now sweeps the full
+  `[0, u32::MAX)` saturating geometry per call (matching the proven mining path),
+  so a fast rig's `mining.suggest_difficulty` starts near its true rate instead of
+  ramping from diff-8. Fully fail-safe: any benchmark error/timeout/panic still
+  returns `None` ⇒ the rig mines normally.
+- **Suggested-difficulty over-read is now capped** (`guarded_suggestion`, new
+  `MAX_SUGGEST_DIFFICULTY = 100_000`) — a backend instant-`None` error path could
+  count phantom nonce sweeps and derive a diff of order 1e6; such an over-read is
+  now **rejected** (not clamped), so the rig falls back to the pool default +
+  vardiff rather than being handed near-unsolvable work. 100k is ~100× above any
+  real single-worker rate, so a legitimate suggestion is never rejected.
 
 ### Added
 - **`csd-dashboard.sh` (Linux/macOS/HiveOS) and `csd-dashboard.bat` (Windows)** —

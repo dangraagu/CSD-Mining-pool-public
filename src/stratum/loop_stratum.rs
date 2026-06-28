@@ -141,16 +141,32 @@ pub fn suggested_difficulty(hashrate_hps: f64, target_secs: f64) -> f64 {
 /// diff 1.0) actively SLOWS the rig below where the pool would have started it.
 pub const POOL_DEFAULT_START_DIFFICULTY: f64 = 8.0;
 
+/// Upper sanity ceiling for a `mining.suggest_difficulty` hint. A real GPU/CPU
+/// worker running this miner tops out around diff ~1000 (even a ~50 GH/s single
+/// GPU at the 30 s target ≈ 350); anything far above that is a benchmark
+/// malfunction, not a device — e.g. the instant-`None` backend-error path can
+/// count phantom full nonce sweeps and derive a difficulty of order 1e6.
+/// Suggestions above this ceiling are REJECTED, not clamped: a too-high start
+/// would hand the rig near-unsolvable work and it would look dead, so we fall back
+/// to the pool default + vardiff, which finds the right difficulty within a few
+/// shares. 100k is ~100× above any real single-worker rate and well below the
+/// pathology, so it never rejects a legitimate suggestion.
+pub const MAX_SUGGEST_DIFFICULTY: f64 = 100_000.0;
+
 /// Gate a derived difficulty before it's forwarded as a `mining.suggest_difficulty`
-/// hint. Returns `Some(d)` only when `d` is finite, positive, and strictly greater
-/// than `pool_default`; otherwise `None` (⇒ the caller skips the suggest and lets
-/// the pool's own start difficulty + vardiff take over — never sends a hint that
-/// would slow the worker below the pool default).
+/// hint. Returns `Some(d)` only when `d` is finite, positive, strictly greater
+/// than `pool_default`, and not above [`MAX_SUGGEST_DIFFICULTY`]; otherwise `None`
+/// (⇒ the caller skips the suggest and lets the pool's own start difficulty +
+/// vardiff take over — never sends a hint that would slow the worker below the pool
+/// default, nor an over-read pathology that would stall it with unsolvable work).
 pub fn guarded_suggestion(d: f64, pool_default: f64) -> Option<f64> {
     if !d.is_finite() || d <= 0.0 {
         return None;
     }
     if d <= pool_default {
+        return None;
+    }
+    if d > MAX_SUGGEST_DIFFICULTY {
         return None;
     }
     Some(d)
@@ -1228,6 +1244,24 @@ mod tests {
         assert_eq!(guarded_suggestion(f64::INFINITY, 8.0), None);
         assert_eq!(guarded_suggestion(0.0, 8.0), None);
         assert_eq!(guarded_suggestion(-5.0, 8.0), None);
+    }
+
+    #[test]
+    fn guarded_suggestion_rejects_over_read_above_ceiling() {
+        // A benchmark malfunction (the instant-None backend-error path counting
+        // phantom nonce sweeps) can derive a diff of order 1e6. Forwarding it would
+        // hand the rig near-unsolvable work ⇒ looks dead. Reject ⇒ None ⇒ fall back
+        // to pool default + vardiff. Must reject regardless of how far above.
+        assert_eq!(guarded_suggestion(1_000_000.0, 8.0), None);
+        assert_eq!(guarded_suggestion(MAX_SUGGEST_DIFFICULTY + 1.0, 8.0), None);
+    }
+
+    #[test]
+    fn guarded_suggestion_at_and_below_ceiling_passes() {
+        // The ceiling is generous: a legitimate high-end single-worker suggestion
+        // (well under the ceiling) and the boundary value itself pass through.
+        assert_eq!(guarded_suggestion(MAX_SUGGEST_DIFFICULTY, 8.0), Some(MAX_SUGGEST_DIFFICULTY));
+        assert_eq!(guarded_suggestion(5000.0, 8.0), Some(5000.0));
     }
 
     #[test]
