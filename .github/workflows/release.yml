@@ -261,8 +261,8 @@ jobs:
           PKG="csdpool"
           STAGE="hiveos-pkg/$PKG"
           mkdir -p "$STAGE"
-          cp hiveos/h-manifest.conf hiveos/h-config.sh hiveos/h-run.sh hiveos/h-stats.sh "$STAGE"/
-          chmod +x "$STAGE"/h-config.sh "$STAGE"/h-run.sh "$STAGE"/h-stats.sh
+          cp hiveos/h-manifest.conf hiveos/h-config.sh hiveos/h-run.sh hiveos/h-stats.sh hiveos/h-stop.sh "$STAGE"/
+          chmod +x "$STAGE"/h-config.sh "$STAGE"/h-run.sh "$STAGE"/h-stats.sh "$STAGE"/h-stop.sh
           # Bundle the live terminal dashboard so it's already on every rig. Run it
           # from the Hive Shell: /hive/miners/custom/csdpool/csd-dashboard.sh
           # (read-only viewer of the miner's own /1/summary; never touches mining).
@@ -300,7 +300,7 @@ jobs:
           tar -czf "dist/${PKG}-${VER}.tar.gz" -C hiveos-pkg "$PKG"
           echo "packed dist/${PKG}-${VER}.tar.gz"
           # Also publish a STABLE-NAMED copy so the HiveOS Installation URL can be
-          # the non-staling  releases/latest/download/csd-pool-miner.tar.gz  form
+          # the non-staling  releases/latest/download/csdpool.tar.gz  form
           # (docs/HIVEOS.md) instead of a pinned vX.Y.Z tarball that goes stale
           # every release. Byte-identical to the versioned tarball; SHA256SUMS
           # (generated in the release job over every dist/ file) covers both.

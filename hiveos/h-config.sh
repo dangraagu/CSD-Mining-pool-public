@@ -68,12 +68,17 @@ fi
 
 # Extra run flags for h-run.sh: whatever the operator typed in the "extra config
 # arguments" box verbatim (e.g. --backend cuda --cpu-threads 0 --gpu-id 0,1).
-# The stats flags are forced in h-run.sh, not here, so they can never be
-# overridden away.
+# h-run.sh forces --stats-port/--stats-bind so h-stats.sh can always scrape the
+# miner on 127.0.0.1:$CUSTOM_API_PORT. clap is last-value-wins, so an operator
+# who pastes --stats-port/--stats-bind into the extra-args box would otherwise
+# override the forced value (miner serves stats on a port h-stats doesn't scrape
+# -> dashboard shows 0 H/s; or --stats-bind 0.0.0.0 undoes loopback-only). Strip
+# both flags (and any "=value" form) out here so they CANNOT be overridden.
 EXTRA_FLAGS_FILE="$CONF_DIR/extra-flags"
 {
   if [ -n "${CUSTOM_USER_CONFIG:-}" ]; then
-    printf '%s' "$CUSTOM_USER_CONFIG"
+    printf '%s' "$CUSTOM_USER_CONFIG" \
+      | sed -E 's/(^|[[:space:]])--stats-port([[:space:]]+|=)[^[:space:]]*/\1/g; s/(^|[[:space:]])--stats-bind([[:space:]]+|=)[^[:space:]]*/\1/g'
   fi
   printf '\n'
 } > "$EXTRA_FLAGS_FILE"

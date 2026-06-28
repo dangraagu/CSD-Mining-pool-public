@@ -16,7 +16,8 @@
 /// Output shape:
 /// ```json
 /// { "hs": [<khs>], "hs_units": "khs", "temp": [], "fan": [],
-///   "uptime": <u64>, "ar": [<good>, <rejected>, 0, <stale>], "algo": "sha256d" }
+///   "uptime": <u64>, "ar": [<good>, <rejected>, 0, <stale>], "algo": "sha256d",
+///   "ver": "<crate version>" }
 /// ```
 ///
 /// **The key transform:** `summary.hashrate.total[0]` is the 10s window in
@@ -89,6 +90,10 @@ pub fn hiveos_stats_from_summary(summary: &serde_json::Value) -> serde_json::Val
         // separate "invalid" counter, so it is a constant 0.
         "ar": [good, rejected, 0, stale],
         "algo": "sha256d",
+        // HiveOS dashboard "miner version" column. Required field per the
+        // hiveos-linux custom-miner stats contract; absent => blank version + an
+        // "incomplete payload" on the agent side. Compile-time crate version.
+        "ver": env!("CARGO_PKG_VERSION"),
     })
 }
 
@@ -143,6 +148,10 @@ mod tests {
         // Always-present empty arrays HiveOS expects.
         assert_eq!(h["temp"], serde_json::json!([]));
         assert_eq!(h["fan"], serde_json::json!([]));
+        // "ver" is a required HiveOS stats field (dashboard miner-version column);
+        // it must be present and the real crate version, never empty/absent.
+        assert_eq!(h["ver"], env!("CARGO_PKG_VERSION"));
+        assert!(h["ver"].as_str().map(|s| !s.is_empty()).unwrap_or(false));
     }
 
     #[test]

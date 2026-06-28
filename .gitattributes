@@ -4,4 +4,8 @@
 *.service              text eol=lf
 *.timer                text eol=lf
 deploy/systemd/*.env*  text eol=lf
+# h-manifest.conf is SOURCED by HiveOS in POSIX sh on the rig; a trailing \r would
+# make CUSTOM_BIN="...csd-gpu-miner\r" (path missing -> miner never starts) and
+# CUSTOM_API_PORT=3380\r (breaks the h-stats scrape -> no hashrate). Pin LF.
+*.conf                 text eol=lf
 *      text=auto

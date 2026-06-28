@@ -52,13 +52,13 @@ printf 'AMDBIN'     > "$T/target/release/csd-gpu-miner"  # last build = AMD/open
 printf 'NVBIN'      > "$T/dist/csd-pool-miner-linux-nvidia"
 printf 'relaybytes' > "$T/dist/csd-relay-node"
 printf 'dash'       > "$T/csd-dashboard.sh"
-for f in h-manifest.conf h-config.sh h-run.sh h-stats.sh; do printf '%s\n' "$f" > "$T/hiveos/$f"; done
+for f in h-manifest.conf h-config.sh h-run.sh h-stats.sh h-stop.sh; do printf '%s\n' "$f" > "$T/hiveos/$f"; done
 
 (
   cd "$T" || exit 1
   PKG=csdpool; STAGE="hiveos-pkg/$PKG"; mkdir -p "$STAGE"
   cp dist/csd-relay-node "$STAGE"/csd-relay-node                       # relay (csdpool path)
-  cp hiveos/h-manifest.conf hiveos/h-config.sh hiveos/h-run.sh hiveos/h-stats.sh "$STAGE"/
+  cp hiveos/h-manifest.conf hiveos/h-config.sh hiveos/h-run.sh hiveos/h-stats.sh hiveos/h-stop.sh "$STAGE"/
   cp csd-dashboard.sh "$STAGE"/csd-dashboard.sh
   if [ -f csd-gpu-miner-hiveos-seed ]; then
     cp csd-gpu-miner-hiveos-seed "$STAGE"/csd-gpu-miner                # seed, NOT target/release
@@ -80,6 +80,7 @@ TL="$(tar -tzf "$T/csdpool.tar.gz" 2>/dev/null)"
 printf '%s\n' "$TL" | grep -q '^csdpool/.installed-variant$' && ok "tar contains csdpool/.installed-variant" || no "tar missing the marker"
 printf '%s\n' "$TL" | grep -q '^csdpool/csd-gpu-miner$'      && ok "tar contains csdpool/csd-gpu-miner"       || no "tar missing the binary"
 printf '%s\n' "$TL" | grep -q '^csdpool/csd-relay-node$'     && ok "tar contains csdpool/csd-relay-node (relay staging fix)" || no "tar MISSING the relay"
+printf '%s\n' "$TL" | grep -q '^csdpool/h-stop.sh$'          && ok "tar contains csdpool/h-stop.sh (HiveOS stop hook)" || no "tar MISSING the stop hook"
 
 echo
 echo "  Passed: $pass  Failed: $fail"

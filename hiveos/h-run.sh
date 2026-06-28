@@ -401,7 +401,7 @@ hive_update_sidecar() {
   while true; do
     # If the miner isn't running, the slot was stopped (not an update restart):
     # exit so we don't poll forever after HiveOS tears the slot down.
-    if ! pgrep -f "$MINER_PROC" >/dev/null 2>&1; then
+    if ! pgrep -x "$MINER_PROC" >/dev/null 2>&1; then
       echo "[h-run] auto-update sidecar: miner no longer running — exiting sidecar." >> "$LOG" 2>&1
       exit 0
     fi

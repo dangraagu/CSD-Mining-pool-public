@@ -20,7 +20,7 @@ cd "$(dirname "$0")" || exit 1
 [ -e h-manifest.conf ] && . ./h-manifest.conf
 
 PORT="${CUSTOM_API_PORT:-3380}"
-BIN="${CUSTOM_BIN:-/hive/miners/custom/csd-pool-miner/csd-gpu-miner}"
+BIN="${CUSTOM_BIN:-$(dirname "$0")/csd-gpu-miner}"   # install-path-agnostic fallback (we already cd'd here)
 
 # Ask the miner to scrape its own /1/summary and print the HiveOS h-stats JSON.
 # The subcommand never hangs and never panics; on error it prints a zero object.
@@ -33,7 +33,7 @@ stats="$("$BIN" hiveos-stats --stats-port "$PORT" 2>/dev/null)"
 if [ -z "$stats" ]; then
   # Binary missing or produced nothing → report a zero (but valid) rig.
   khs=0
-  stats='{"hs":[0],"hs_units":"khs","temp":[],"fan":[],"uptime":0,"ar":[0,0,0,0],"algo":"sha256d"}'
+  stats='{"hs":[0],"hs_units":"khs","temp":[],"fan":[],"uptime":0,"ar":[0,0,0,0],"algo":"sha256d","ver":"0"}'
 else
   # Total kH/s = sum of the hs[] array (already in kH/s from the subcommand).
   # Prefer jq; fall back to a tiny awk extractor if jq is absent on the rig.

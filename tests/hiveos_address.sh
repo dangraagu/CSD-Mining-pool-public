@@ -46,6 +46,27 @@ check "--address with 0X (uppercase) prefix -> stripped"  ""                 "--
 check "extras with NO --address -> blank"                 ""                 "--backend cuda"                  ""
 check "template present wins over extras --address"       "$ADDR40"          "--address ffffffffffffffffffffffffffffffffffffffff" "$ADDR40"
 
+# render the extra-flags file h-config writes from the extras box
+render_flags() {
+  local u="$1" d
+  d="$(mktemp -d)"
+  cp "$HCONF" "$d/h-config.sh"
+  printf 'CUSTOM_CONFIG_FILENAME=%s/config.toml\n' "$d" > "$d/h-manifest.conf"
+  ( cd "$d" && CUSTOM_TEMPLATE="$ADDR40" CUSTOM_USER_CONFIG="$u" bash ./h-config.sh >/dev/null 2>&1 )
+  tr -s ' ' < "$d/extra-flags" 2>/dev/null | sed 's/^ //; s/ $//'
+  rm -rf "$d"
+}
+checkflags() { # desc  userconfig  expected-flags
+  local got; got="$(render_flags "$2")"
+  [ "$got" = "$3" ] && ok "$1" || no "$1" "$got" "$3"
+}
+
+echo "== forced stats flags cannot be overridden from the extras box =="
+checkflags "legit flags pass through untouched"          "--backend cuda --gpu-id 0,1"                 "--backend cuda --gpu-id 0,1"
+checkflags "--stats-port <space> stripped"               "--stats-port 4000 --backend cuda"            "--backend cuda"
+checkflags "--stats-port=<val> stripped"                 "--backend cuda --stats-port=5000"            "--backend cuda"
+checkflags "--stats-bind stripped (loopback-only kept)"  "--backend opencl --stats-bind 0.0.0.0 --gpu-id 0,1" "--backend opencl --gpu-id 0,1"
+
 echo
 echo "  Passed: $pass  Failed: $fail"
 [ "$fail" -eq 0 ] && { echo "ALL HIVEOS ADDRESS ASSERTIONS PASSED"; exit 0; } || { echo "ADDRESS TEST FAILED"; exit 1; }
