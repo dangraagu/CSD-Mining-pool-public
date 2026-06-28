@@ -75,9 +75,17 @@ PORT="${CUSTOM_API_PORT:-3380}"
 LOG="${CUSTOM_LOG_BASENAME:-/var/log/miner/csdpool/csd-pool-miner}.log"
 mkdir -p "$(dirname "$LOG")"
 
-# Re-render the config/flags from the current flightsheet (HiveOS also calls
-# h-config.sh, but doing it here makes a manual `h-run.sh` run self-contained).
-[ -x ./h-config.sh ] && ./h-config.sh >/dev/null 2>&1
+# Re-render the config/flags ONLY if config.toml has no valid address yet. In the
+# normal HiveOS flow, HiveOS runs h-config.sh (WITH the flight-sheet env) BEFORE us,
+# so config.toml + extra-flags are already correct. HiveOS does NOT export
+# $CUSTOM_USER_CONFIG / $CUSTOM_TEMPLATE into h-run.sh's environment, so re-running
+# h-config here would regenerate them env-less and BLANK the address + --backend
+# (the v0.1.17 P0: miner exits "got 0 chars", and the dropped backend forced the CPU
+# build). Only (re)generate when the config is genuinely missing/addressless (e.g. a
+# manual h-run.sh invocation); h-config is idempotent as a second-line backstop.
+if [ -x ./h-config.sh ] && ! grep -qE '^address = "[0-9a-fA-F]{40}"' "$CONF" 2>/dev/null; then
+  ./h-config.sh >/dev/null 2>&1
+fi
 
 # Load the extra flags h-config.sh wrote (word-split intentionally so each
 # token becomes its own argv entry).

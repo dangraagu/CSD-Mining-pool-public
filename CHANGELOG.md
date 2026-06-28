@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.18
+
+P0 HiveOS hotfix — a fresh v0.1.17 HiveOS install (or any HiveOS restart) blanked
+its own config and refused to start. No pool, payout, or csd consensus change.
+
+### Fixed
+- **HiveOS config.toml + extra-flags were blanked on launch → `--address must be 40
+  hex chars; got 0 chars`, and the miner fell back to the CPU build.** HiveOS runs
+  `h-config.sh` *with* the flight-sheet env to bake the config, then runs `h-run.sh`,
+  which **does not** receive `$CUSTOM_USER_CONFIG` / `$CUSTOM_TEMPLATE`. `h-run.sh`
+  re-ran `h-config.sh` unconditionally, so that env-less second run overwrote the
+  baked `config.toml` (address → empty) and `extra-flags` (dropped `--backend` →
+  variant-aware updater fetched the CPU build). One cause, both symptoms. Fix:
+  `h-run.sh` now re-renders only when `config.toml` lacks a valid 40-hex address, and
+  `h-config.sh` is idempotent — an env-less call recovers the baked address and
+  preserves the existing `extra-flags` instead of blanking them. Regression test
+  reproduces the two-call / stripped-env flow (fails before, passes after).
+
 ## 0.1.17
 
 HiveOS install fixes — a fresh HiveOS rig now installs, gets its **correct GPU

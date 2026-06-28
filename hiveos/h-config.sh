@@ -59,6 +59,20 @@ if [ -z "$ADDR" ]; then
   esac
 fi
 
+# IDEMPOTENCY GUARD (v0.1.18 P0). HiveOS runs h-config.sh WITH the flight-sheet env
+# to bake config.toml, then runs h-run.sh — which does NOT receive
+# $CUSTOM_USER_CONFIG / $CUSTOM_TEMPLATE. If h-run.sh (or anything) re-invokes us
+# env-less, ADDR is empty here; recover the address already baked into config.toml
+# instead of CLOBBERING it with "" (which made the miner exit "got 0 chars"). A
+# second env-less call must be a no-op, never a blank.
+if [ -z "$ADDR" ] && [ -f "$CONF" ]; then
+  _prev="$(sed -n 's/^address = "\([^"]*\)".*/\1/p' "$CONF" 2>/dev/null | head -1)"
+  case "$_prev" in
+    '' | *[!0-9a-fA-F]*) : ;;                       # absent / not clean hex -> ignore
+    *) [ "${#_prev}" -eq 40 ] && ADDR="$_prev" ;;   # a valid 40-hex addr -> recover
+  esac
+fi
+
 # Build the TOML config. address is the only required key; the pool endpoint is
 # compiled into the binary and cannot be overridden from the flightsheet.
 {
@@ -75,13 +89,21 @@ fi
 # -> dashboard shows 0 H/s; or --stats-bind 0.0.0.0 undoes loopback-only). Strip
 # both flags (and any "=value" form) out here so they CANNOT be overridden.
 EXTRA_FLAGS_FILE="$CONF_DIR/extra-flags"
-{
-  if [ -n "${CUSTOM_USER_CONFIG:-}" ]; then
+if [ -n "${CUSTOM_USER_CONFIG:-}" ]; then
+  # Flight-sheet extras present this run -> (re)write them, stripping the forced
+  # --stats-port/--stats-bind so they cannot be overridden.
+  {
     printf '%s' "$CUSTOM_USER_CONFIG" \
       | sed -E 's/(^|[[:space:]])--stats-port([[:space:]]+|=)[^[:space:]]*/\1/g; s/(^|[[:space:]])--stats-bind([[:space:]]+|=)[^[:space:]]*/\1/g'
-  fi
-  printf '\n'
-} > "$EXTRA_FLAGS_FILE"
+    printf '\n'
+  } > "$EXTRA_FLAGS_FILE"
+elif [ ! -s "$EXTRA_FLAGS_FILE" ]; then
+  # No extras AND no prior non-empty file -> create an empty one for h-run to read.
+  printf '\n' > "$EXTRA_FLAGS_FILE"
+fi
+# else: an env-less re-run with extras already baked -> PRESERVE them (same
+# idempotency guarantee as the address recovery above). Without this, the dropped
+# --backend made the variant-aware updater fetch the CPU build instead of the GPU one.
 
 if [ -z "$ADDR" ]; then
   echo "h-config: WARNING — empty address. HiveOS does not pass the 'Wallet and worker template' field for a coinless custom miner (CSD), so set your CSD addr20 (40-hex) via '--address <addr>' in the 'Extra config arguments' box. The miner refuses to start until this is set."
