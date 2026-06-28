@@ -13,21 +13,21 @@ Every release ships a ready-made HiveOS **Custom-miner package**, so setup is ju
    | Installation URL | `https://github.com/dangraagu/CSD-Mining-pool-public/releases/latest/download/csdpool.tar.gz` |
    | Miner name | `csdpool` |
    | Hash algorithm | *anything — not used* |
-   | Wallet and worker template | *your **CSD address** (40-hex `addr20`) — **not** `%WAL%`* |
+   | Wallet and worker template | *leave blank* — HiveOS does **not** pass this field for a coinless miner (CSD); set your address with `--address` in *Extra config arguments* (step 3) |
    | Pool URL | `stratum+tcp://127.0.0.1:1` |
-   | Extra config arguments | *backend flag — see step 3* |
+   | Extra config arguments | *your `--address` **and** backend flag — see step 3* |
 
    > ⚠️ **The Miner name must be EXACTLY `csdpool`** (HiveOS auto-fills this from the URL — leave it). HiveOS derives the install folder from the tarball filename by stripping the last `-`-separated token as a "version", so a hyphen in the name breaks it (`csd-pool-miner` → `csd-pool`, `csd-pool` → `csd`). The package is named `csdpool` (no hyphen) precisely so HiveOS derives it cleanly; a mismatched name makes the rig report **"Miner screen is not running."**
 
    > ⚠️ **Pool URL cannot be blank** — HiveOS won't save a Custom flight sheet without one. The miner **ignores** it (the pool is compiled into the binary), so use the harmless placeholder `stratum+tcp://127.0.0.1:1` exactly as shown. Do **not** point it at a real pool.
 
-   > ⚠️ **Put your CSD address literally in "Wallet and worker template" — do NOT use `%WAL%`.** `%WAL%` is HiveOS's wallet macro and only expands if you've added a wallet under a HiveOS-known coin; CSD isn't one, so `%WAL%` stays empty and the miner exits with *"--address must be 40 hex chars … got 0 chars"*. Paste the bare 40-hex `addr20` (a `0x` prefix and a `.worker` suffix are both fine and get stripped).
+   > ⚠️ **Set your CSD address with `--address <addr>` in *Extra config arguments* — the "Wallet and worker template" field does NOT work for CSD.** HiveOS only passes that field for a HiveOS-known coin; CSD isn't one, so it stays empty and the miner exits with *"--address must be 40 hex chars … got 0 chars"*. Put the bare 40-hex `addr20` after `--address` (a `0x`/`0X` prefix and a `.worker` suffix are both fine and get stripped).
 
-3. **Pick your backend** in *Extra config arguments*:
-   - NVIDIA → `--backend cuda`
-   - AMD → `--backend opencl`
-   - CPU → `--backend cpu`
-   - *(leave empty to auto-detect; add `--gpu-id 0,1` to choose specific cards)*
+3. **Set your address and backend** in *Extra config arguments* — both on one line, e.g.
+   `--backend cuda --address <your 40-hex CSD addr20>` (paste YOUR own address, not the example):
+   - **Address (required):** `--address <your 40-hex addr20>`
+   - **Backend:** NVIDIA → `--backend cuda` · AMD → `--backend opencl` · CPU → `--backend cpu`
+   - *(omit `--backend` to auto-detect; add `--gpu-id 0,1` to choose specific cards)*
 
 4. **Apply** the Flight Sheet to your rig. Done — hashrate and accepted/rejected shares show on the HiveOS dashboard.
 

@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.1.17
+
+HiveOS install fixes — a fresh HiveOS rig now installs, gets its **correct GPU
+build**, and mines with zero manual steps. No pool, payout, or csd consensus change.
+
+### Fixed
+- **Fresh HiveOS installs ran the WRONG GPU binary.** The release bundled whatever
+  variant built LAST in CI (AMD/opencl — the NVIDIA/AMD builds overwrite the same
+  output path), and `h-run.sh`'s startup auto-update only swapped on a *version*
+  change, so an NVIDIA rig with `--backend cuda` stayed stuck on the opencl binary
+  (`cuda=false opencl=true`). The tarball now bundles the **CPU build** as a
+  brick-safe universal seed (runs on any card, no driver dep) plus a
+  `.installed-variant` marker, and `h-run.sh` is **variant-aware**: it detects the
+  installed variant from the binary's own `devices` self-report (marker fallback)
+  and fetches+verifies+swaps the build matching `--backend` even when the version
+  already matches. Fail-closed SHA-verified; any fetch/verify failure keeps the
+  working CPU seed mining (never bricks).
+- **HiveOS address could not be set.** HiveOS does not pass the "Wallet and worker
+  template" field for a coinless custom miner (CSD), so the old documented path left
+  the address empty and the miner refused to start. `h-config.sh` now takes the
+  address from `--address <addr>` in the "Extra config arguments" box, stripping a
+  `0x`/`0X` prefix and a `.worker` suffix; docs updated to use this path.
+- **SP2 relay was missing from the HiveOS tarball** — staged to a directory the
+  package step never packed (`csd-pool-miner/` vs the renamed `csdpool/`). Now
+  staged into `csdpool/`, so the bundled canonical-anchor relay ships again.
+
+### Notes
+- Existing HiveOS rigs already on the wrong variant self-heal after a **one-time
+  Flight Sheet re-apply** (the auto-updater swaps the binary; the install-time glue
+  comes from the tarball). New installs are correct automatically.
+
 ## 0.1.16
 
 Live terminal dashboard (script-only) **plus** a miner-only fix to the startup

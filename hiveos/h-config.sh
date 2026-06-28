@@ -30,7 +30,7 @@ mkdir -p "$CONF_DIR"
 # a 0x prefix; the miner validates the result strictly (40 hex, or 42 with 0x).
 ADDR="$(printf '%s' "${CUSTOM_TEMPLATE:-}" | tr -d '[:space:]')"
 ADDR="${ADDR%%.*}"   # drop a ".worker" suffix, if any
-ADDR="${ADDR#0x}"    # drop a 0x prefix, if any
+ADDR="${ADDR#0[xX]}" # drop a 0x/0X prefix, if any
 # If any HiveOS macro (%WAL%, %WORKER_NAME%, …) was left UNEXPANDED, blank it so
 # the miner emits its clear "address must be 40 hex chars" error rather than
 # trying to mine to a literal "%WAL%".
@@ -49,7 +49,8 @@ if [ -z "$ADDR" ]; then
   case "$_flags" in
     *--address*)
       _a="$(printf '%s' "$_flags" | sed -n 's/.*--address[ =]*\([^ ]*\).*/\1/p')"
-      _a="${_a#0x}"
+      _a="${_a%%.*}"      # drop a ".worker" suffix, if any
+      _a="${_a#0[xX]}"    # drop a 0x/0X prefix, if any
       case "$_a" in
         '' | *[!0-9a-fA-F]*) : ;;   # not clean hex → ignore
         *) ADDR="$_a" ;;
@@ -78,7 +79,7 @@ EXTRA_FLAGS_FILE="$CONF_DIR/extra-flags"
 } > "$EXTRA_FLAGS_FILE"
 
 if [ -z "$ADDR" ]; then
-  echo "h-config: WARNING — empty address. Put your CSD addr20 (40-hex) DIRECTLY in the 'Wallet and worker template' field, NOT %WAL%. The miner will refuse to start until this is set."
+  echo "h-config: WARNING — empty address. HiveOS does not pass the 'Wallet and worker template' field for a coinless custom miner (CSD), so set your CSD addr20 (40-hex) via '--address <addr>' in the 'Extra config arguments' box. The miner refuses to start until this is set."
 else
   echo "h-config: wrote $CONF (address=$ADDR) and $EXTRA_FLAGS_FILE"
 fi
