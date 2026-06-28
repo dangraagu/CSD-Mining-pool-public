@@ -576,7 +576,12 @@ echo "[h-run] starting csd-gpu-miner (stats on 127.0.0.1:$PORT)" | tee -a "$LOG"
 
 # EXEC the real binary. Word-splitting $EXTRA_FLAGS is intentional (each token
 # is a separate argv entry), so shellcheck SC2086 is suppressed for that one
-# expansion only.
+# expansion only. $EXTRA_FLAGS can no longer contain --stats-port/--stats-bind
+# (h-config.sh strips them), so the forced localhost stats binding always applies.
+#
+# DO NOT wrap this exec (e.g. `exec taskset … csd-gpu-miner`): the process must
+# keep /proc/comm == "csd-gpu-miner" — both the auto-update sidecar's liveness
+# probe (pgrep -x) and h-stop.sh's reaper (pkill -x) match on that exact comm.
 # shellcheck disable=SC2086
 exec "$CUSTOM_BIN" --config "$CONF" \
   --stats-port "$PORT" --stats-bind 127.0.0.1 \

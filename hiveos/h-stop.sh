@@ -13,11 +13,17 @@
 # I/O on a rig HiveOS believes is idle — and the sidecar keeps polling GitHub and
 # can `pkill` a later miner. Reap both here.
 #
-# Match by the UNIQUE sidecar marker and the relay binary name. NEVER
-# `pkill -f h-run.sh` (it would match unrelated processes / this very script's
-# call graph). The miner itself is already gone via `screen -X quit`; the final
-# `pkill -x csd-gpu-miner` is belt-and-suspenders for a stuck instance.
-pkill -f csd-hive-update-sidecar 2>/dev/null || true   # the auto-update sidecar (unique marker)
-pkill -f csd-relay-node          2>/dev/null || true   # the SP2 relay
-pkill -x csd-gpu-miner           2>/dev/null || true   # the miner (usually already stopped)
+# Match by the UNIQUE sidecar marker (must be -f: the marker lives in the child's
+# argv, not its comm) and by EXACT process name for the relay + miner (-x matches
+# /proc/comm, so it can't broad-match a log-tailer, an scp, or an editor that has
+# "csd-relay-node" in its cmdline). NEVER `pkill -f h-run.sh` (would match this
+# script's own call graph). The miner is already gone via `screen -X quit`; the
+# final `pkill -x csd-gpu-miner` is belt-and-suspenders for a stuck instance.
+#
+# RIG-ONLY: this reaps csd-relay-node / csd-gpu-miner by name. Do NOT run it by
+# hand on a multi-service host (e.g. the pool VPS) — it would kill those services.
+# HiveOS invokes it only on a rig's own miner slot.
+pkill -f csd-hive-update-sidecar 2>/dev/null || true   # the auto-update sidecar (unique argv marker)
+pkill -x csd-relay-node          2>/dev/null || true   # the SP2 relay (exact comm)
+pkill -x csd-gpu-miner           2>/dev/null || true   # the miner (exact comm; usually already stopped)
 exit 0

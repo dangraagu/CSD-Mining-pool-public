@@ -21,7 +21,7 @@ echo "== h-stop.sh exists + reaps the right targets =="
 [ -f "$STOP" ] && ok "hiveos/h-stop.sh exists" || no "hiveos/h-stop.sh MISSING"
 head -1 "$STOP" | grep -q '^#!.*bash' && ok "has a bash shebang" || no "no bash shebang"
 grep -q 'pkill -f csd-hive-update-sidecar' "$STOP" && ok "reaps the auto-update sidecar (by unique marker)" || no "does not reap the sidecar"
-grep -q 'pkill -f csd-relay-node' "$STOP" && ok "reaps the SP2 relay (csd-relay-node)" || no "does not reap the relay"
+grep -qE 'pkill -x csd-relay-node' "$STOP" && ok "reaps the SP2 relay (csd-relay-node, exact comm — no broad -f match)" || no "does not reap the relay by exact name"
 grep -qE 'pkill -x csd-gpu-miner' "$STOP" && ok "reaps the miner (belt-and-suspenders, exact name)" || no "does not reap the miner"
 grep -qE 'exit 0' "$STOP" && ok "exits 0 (never blocks the HiveOS stop path)" || no "no explicit exit 0"
 
