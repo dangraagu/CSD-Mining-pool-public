@@ -70,6 +70,34 @@ permissions:
   contents: write
 
 jobs:
+  # Shell-script test suite — the launcher/glue logic (HiveOS h-config/h-run variant
+  # auto-detect, address normalisation, the Windows .bat parity guards) is enforced
+  # here BEFORE anything is packaged or published. It is a REQUIRED predecessor of the
+  # linux job (which builds the HiveOS tarball + stages the self-updating launchers),
+  # so a regression in this glue (e.g. the v0.1.17 "0 GPU hashrate" backend-trap)
+  # blocks the release instead of shipping to the fleet. Pure bash + coreutils — no
+  # Rust build, so it is fast and gates the slow build jobs cheaply.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run shell test suite (tests/*.sh)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          fail=0
+          for t in tests/*.sh; do
+            echo "::group::$t"
+            if bash "$t"; then
+              echo "PASS: $t"
+            else
+              echo "::error::shell test FAILED: $t"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          [ "$fail" -eq 0 ] || { echo "::error::one or more shell tests failed"; exit 1; }
+
   windows:
     runs-on: windows-latest
     steps:
@@ -121,6 +149,7 @@ jobs:
           if-no-files-found: error
 
   linux:
+    needs: [test]   # gate the HiveOS/linux package + launcher staging on the shell suite
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -352,7 +381,7 @@ jobs:
   # on a tag (the build jobs still run on workflow_dispatch as a compile smoke
   # test, but nothing is published there).
   release:
-    needs: [windows, linux]
+    needs: [test, windows, linux]   # publish only after the shell suite + both build jobs pass
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:

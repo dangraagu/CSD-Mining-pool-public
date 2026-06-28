@@ -15,7 +15,7 @@ Every release ships a ready-made HiveOS **Custom-miner package**, so setup is ju
    | Hash algorithm | *anything — not used* |
    | Wallet and worker template | *leave blank* — HiveOS does **not** pass this field for a coinless miner (CSD); set your address with `--address` in *Extra config arguments* (step 3) |
    | Pool URL | `stratum+tcp://127.0.0.1:1` |
-   | Extra config arguments | *your `--address` **and** backend flag — see step 3* |
+   | Extra config arguments | *your `--address <40-hex addr20>` — see step 3 (backend is optional/auto-detected)* |
 
    > ⚠️ **The Miner name must be EXACTLY `csdpool`** (HiveOS auto-fills this from the URL — leave it). HiveOS derives the install folder from the tarball filename by stripping the last `-`-separated token as a "version", so a hyphen in the name breaks it (`csd-pool-miner` → `csd-pool`, `csd-pool` → `csd`). The package is named `csdpool` (no hyphen) precisely so HiveOS derives it cleanly; a mismatched name makes the rig report **"Miner screen is not running."**
 
@@ -23,11 +23,10 @@ Every release ships a ready-made HiveOS **Custom-miner package**, so setup is ju
 
    > ⚠️ **Set your CSD address with `--address <addr>` in *Extra config arguments* — the "Wallet and worker template" field does NOT work for CSD.** HiveOS only passes that field for a HiveOS-known coin; CSD isn't one, so it stays empty and the miner exits with *"--address must be 40 hex chars … got 0 chars"*. Put the bare 40-hex `addr20` after `--address` (a `0x`/`0X` prefix and a `.worker` suffix are both fine and get stripped).
 
-3. **Set your address and backend** in *Extra config arguments* — both on one line, e.g.
-   `--backend cuda --address <your 40-hex CSD addr20>` (paste YOUR own address, not the example):
+3. **Set your address** in *Extra config arguments* (backend is optional), e.g.
+   `--address <your 40-hex CSD addr20>` (paste YOUR own address, not the example):
    - **Address (required):** `--address <your 40-hex addr20>`
-   - **Backend:** NVIDIA → `--backend cuda` · AMD → `--backend opencl` · CPU → `--backend cpu`
-   - **`--backend` is REQUIRED — name it explicitly.** Do **not** omit it or use `auto`: HiveOS ships the CPU build as a universal seed and the auto-updater only fetches the **NVIDIA**/**AMD** build when you name `cuda`/`opencl`. A blank/`auto` backend leaves the rig on the CPU seed, which has no GPU compiled in — it connects to the pool and gets jobs but reports *"no GPU backend usable"* and **does not hash**. (Optionally add `--gpu-id 0,1` to pick specific cards.)
+   - **Backend (OPTIONAL — auto-detected):** the rig now detects its own GPU (NVIDIA/AMD/CPU) and fetches the matching build automatically, so you do **not** need `--backend` at all. Name it only to **override** the auto-detect: NVIDIA → `--backend cuda` · AMD → `--backend opencl` · CPU → `--backend cpu`. (Optionally add `--gpu-id 0,1` to pick specific cards.)
 
 4. **Apply** the Flight Sheet to your rig. Done — hashrate and accepted/rejected shares show on the HiveOS dashboard.
 
@@ -40,6 +39,14 @@ Every release ships a ready-made HiveOS **Custom-miner package**, so setup is ju
   - **While running** a background poll checks roughly every 15 minutes (`CHECK_MIN`); when a newer version verifies, it swaps the binary and bounces the miner so HiveOS relaunches on the new build.
   - **Fail-safe:** any update failure (no network, GitHub rate-limit, SHA mismatch, partial download, disk full) is logged and the rig keeps mining on the **existing** binary — an update problem never strands or bricks a rig. Update activity is written to the miner log under `/var/log/miner/csdpool/`.
   - The **Installation URL above is the non-staling `releases/latest/download/` form**, so re-running the install (or adding a new rig) always pulls the current release. You only ever need to re-apply the Flight Sheet to *reinstall the glue* (e.g. after a HiveOS image wipe), not to update the miner.
+- **Upgrading from a pre-0.1.17 rig:** the auto-detect + auto-fetch of the right GPU build lives in the *glue* (`h-run.sh`/`h-config.sh`), which only refreshes when the Flight Sheet is re-applied. A rig installed before 0.1.17 needs a **one-time Flight-Sheet re-apply** to pick up the new glue; after that it self-updates as above.
+- **Rig shows "online" but 0 H/s?** It almost always means the rig is running the CPU seed with no GPU build (the bug the auto-detect fixes) or an address problem. Open the Hive Shell (or SSH) and check the launcher log:
+
+  ```sh
+  tail /var/log/miner/csdpool/*.log | grep '\[h-run\]'
+  ```
+
+  Look for the variant the launcher resolved and any `WARNING` lines (e.g. a `--backend cuda` requested on a box with no NVIDIA driver). Then re-apply the Flight Sheet so the rig re-detects and fetches the correct GPU build.
 
 ## Live terminal dashboard
 

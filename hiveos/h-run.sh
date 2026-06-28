@@ -109,15 +109,51 @@ MINER_PROC="csd-gpu-miner"   # argv name HiveOS sees; used to detect/kill the mi
 # correct it even when the VERSION already matches — the 15-day fleet bug.
 VARIANT_MARKER="$(dirname "$UPDATE_BIN")/.installed-variant"
 
-# Map the flightsheet --backend to the release asset variant. Default to cpu
-# (always published) when no/unknown backend is given, so the asset name is
-# never empty and the cpu build is the safe fallback.
+# Shared GPU auto-detection — lifted VERBATIM from mine-auto.sh's detect_variant()
+# so the HiveOS fall-through (no/auto/unknown --backend) resolves the SAME way the
+# desktop no-arg launcher does, instead of mis-defaulting every GPU rig to the cpu
+# seed (the v0.1.17 "0 GPU hashrate" bug). Returns nvidia | amd | cpu. NVIDIA wins
+# on ANY of three independent signals so a driver-only / container box (nvidia-smi
+# may be absent, but the device nodes and/or libcuda.so are present) is correctly
+# detected as nvidia, not amd/cpu:
+#   1. nvidia-smi exists AND runs,
+#   2. an NVIDIA device node exists (/dev/nvidiactl or /dev/nvidia* —
+#      CSD_NVIDIA_DEV_GLOB overrides the glob for testing),
+#   3. ldconfig lists libcuda.so on the loader path.
+# Only if NONE hold do we consider AMD/OpenCL (lspci or clinfo), then cpu.
+detect_variant() {
+  local glob="${CSD_NVIDIA_DEV_GLOB:-/dev/nvidia*}"
+  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+    echo nvidia; return
+  fi
+  if [ -e /dev/nvidiactl ] || compgen -G "$glob" >/dev/null 2>&1; then
+    echo nvidia; return
+  fi
+  if command -v ldconfig >/dev/null 2>&1 && ldconfig -p 2>/dev/null | grep -q 'libcuda\.so'; then
+    echo nvidia; return
+  fi
+  if { command -v lspci >/dev/null 2>&1 && lspci 2>/dev/null | grep -Eiq '\[AMD/ATI\]|Advanced Micro Devices|Radeon|\bATI\b'; } \
+     || { command -v clinfo >/dev/null 2>&1 && clinfo 2>/dev/null | grep -Eiq 'Advanced Micro Devices|Radeon|\bAMD\b'; }; then
+    echo amd; return
+  fi
+  echo cpu
+}
+
+# Map the flightsheet --backend to the release asset variant. An EXPLICIT backend
+# (space- or equals-form) wins; anything else — NO --backend, `--backend auto`, or
+# a typo — falls through to detect_variant() (the proven GPU auto-detect, identical
+# to the desktop launcher) so a GPU rig is never silently pinned to the cpu seed
+# ("no GPU backend usable" / 0 H/s). detect_variant() itself returns cpu when no GPU
+# is found, so the asset name is always one of nvidia|amd|cpu and never empty.
 update_variant() {
   case "$EXTRA_FLAGS" in
-    *"--backend cuda"*)   echo "nvidia" ;;
-    *"--backend opencl"*) echo "amd" ;;
-    *"--backend cpu"*)    echo "cpu" ;;
-    *)                    echo "cpu" ;;
+    *"--backend cuda"*)     echo "nvidia" ;;
+    *"--backend=cuda"*)     echo "nvidia" ;;
+    *"--backend opencl"*)   echo "amd" ;;
+    *"--backend=opencl"*)   echo "amd" ;;
+    *"--backend cpu"*)      echo "cpu" ;;
+    *"--backend=cpu"*)      echo "cpu" ;;
+    *)                      detect_variant ;;   # auto-detect (it echoes nvidia|amd|cpu)
   esac
 }
 
@@ -484,7 +520,7 @@ rm -f "$UPDATE_BIN".new.* 2>/dev/null || true
 # needs the function and its whole call graph + the constants they read, so we
 # export them. Keep this export list in sync if a new ua_* helper is added.
 export -f hive_update_sidecar ua_latest_tag ua_installed_version ua_should_update \
-          ua_download_verify_swap ua_download ua_expected_sha update_variant \
+          ua_download_verify_swap ua_download ua_expected_sha update_variant detect_variant \
           ua_binary_variant ua_installed_variant ua_write_variant_marker
 export UPDATE_BIN REPO CHECK_MIN MINER_PROC LOG EXTRA_FLAGS VARIANT_MARKER
 bash -c 'hive_update_sidecar' "$SIDE_MARKER" >> "$LOG" 2>&1 &
@@ -564,18 +600,24 @@ else
 fi
 # ── end SP2 relay launch ──────────────────────────────────────────────────────
 
-# Driver check: if the flightsheet asks for a GPU backend, make sure the driver
-# is actually present, else log a clear line. We do NOT hard-exit (auto-fallback
-# in the binary will drop to CPU), but the operator sees why.
-case "$EXTRA_FLAGS" in
-  *"--backend cuda"*)
+# Driver check: warn (don't hard-exit — the binary auto-falls back to CPU) when a
+# GPU backend is going to be USED but its driver/GPU isn't actually present, so the
+# operator sees why. Derive the target from the RESOLVED variant (update_variant),
+# NOT raw $EXTRA_FLAGS: an address-only or `--backend auto` flightsheet now
+# auto-detects, so keying the warning off the raw flags would (a) miss an
+# auto-detected nvidia/amd rig with a half-broken driver and (b) more importantly
+# NEVER false-warn — a no-GPU box resolves to cpu here, so neither arm fires and the
+# operator isn't told a GPU is missing when none was requested.
+RESOLVED_VARIANT="$(update_variant)"
+case "$RESOLVED_VARIANT" in
+  nvidia)
     if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi -L >/dev/null 2>&1; then
-      echo "[h-run] WARNING: --backend cuda requested but nvidia-smi found no GPU; the miner will auto-fall back to CPU." | tee -a "$LOG"
+      echo "[h-run] WARNING: nvidia (cuda) build selected but nvidia-smi found no GPU; the miner will auto-fall back to CPU." | tee -a "$LOG"
     fi
     ;;
-  *"--backend opencl"*)
+  amd)
     if ! command -v clinfo >/dev/null 2>&1 || ! clinfo 2>/dev/null | grep -q 'Device Type.*GPU'; then
-      echo "[h-run] WARNING: --backend opencl requested but clinfo listed no GPU; the miner will auto-fall back to CPU." | tee -a "$LOG"
+      echo "[h-run] WARNING: amd (opencl) build selected but clinfo listed no GPU; the miner will auto-fall back to CPU." | tee -a "$LOG"
     fi
     ;;
 esac

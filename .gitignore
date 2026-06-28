@@ -22,3 +22,4 @@ csd-wallet.txt
 .claude/
 RELEASE-*.bat
 /docs/*-matrix.md
+.installed-variant

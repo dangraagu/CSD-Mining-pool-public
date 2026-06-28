@@ -23,12 +23,29 @@ CONF="${CUSTOM_CONFIG_FILENAME:-config.toml}"
 CONF_DIR="$(dirname "$CONF")"
 mkdir -p "$CONF_DIR"
 
+# Strip ONE matched leading+trailing quote (a pair of single OR a pair of double
+# quotes) from $1, echoing the result. HiveOS operators often paste the address
+# QUOTED — e.g. --address "<40hex>" or in the wallet box as "<40hex>" — and a
+# literal quote left in the value makes the miner's strict 40-hex check fail
+# ("got 42 chars" / non-hex). Only a MATCHED pair is removed (so a stray single
+# quote is left for the hex guard to reject), and removal happens BEFORE the
+# 0x/.worker normalisation below. POSIX-sh, no bashisms.
+_strip_one_quote() {
+  _q="$1"
+  case "$_q" in
+    \"*\") _q="${_q#\"}"; _q="${_q%\"}" ;;   # "value" -> value
+    \'*\') _q="${_q#\'}"; _q="${_q%\'}" ;;   # 'value' -> value
+  esac
+  printf '%s' "$_q"
+}
+
 # The flightsheet "wallet and worker template" is the addr20 payout address. Put
 # the LITERAL CSD address here, NOT %WAL% — CSD is not a HiveOS-known coin, so the
 # %WAL% macro is never expanded and would leave the address empty. An optional
 # ".worker" suffix (HiveOS appends %WORKER_NAME%) is dropped. Strip whitespace +
 # a 0x prefix; the miner validates the result strictly (40 hex, or 42 with 0x).
 ADDR="$(printf '%s' "${CUSTOM_TEMPLATE:-}" | tr -d '[:space:]')"
+ADDR="$(_strip_one_quote "$ADDR")"  # strip a matched leading+trailing "" or '' pair
 ADDR="${ADDR%%.*}"   # drop a ".worker" suffix, if any
 ADDR="${ADDR#0[xX]}" # drop a 0x/0X prefix, if any
 # If any HiveOS macro (%WAL%, %WORKER_NAME%, …) was left UNEXPANDED, blank it so
@@ -49,6 +66,7 @@ if [ -z "$ADDR" ]; then
   case "$_flags" in
     *--address*)
       _a="$(printf '%s' "$_flags" | sed -n 's/.*--address[ =]*\([^ ]*\).*/\1/p')"
+      _a="$(_strip_one_quote "$_a")"  # strip a matched leading+trailing "" or '' pair
       _a="${_a%%.*}"      # drop a ".worker" suffix, if any
       _a="${_a#0[xX]}"    # drop a 0x/0X prefix, if any
       case "$_a" in
@@ -90,6 +108,20 @@ fi
 # both flags (and any "=value" form) out here so they CANNOT be overridden.
 EXTRA_FLAGS_FILE="$CONF_DIR/extra-flags"
 if [ -n "${CUSTOM_USER_CONFIG:-}" ]; then
+  # If the operator NAMED a --backend, sanity-check the token: valid ones are
+  # auto|cuda|opencl|cpu (auto = explicit "let the rig detect"). A typo (e.g.
+  # --backend nvidia / --backend gpu) is NOT mapped by h-run.sh's update_variant,
+  # so it falls through to auto-detect — which is usually fine, but the operator
+  # likely meant a specific backend, so warn so they can fix the typo rather than
+  # silently getting auto-detect. Handles both the space and the =value forms.
+  _be="$(printf '%s' "$CUSTOM_USER_CONFIG" | tr '\n\t' '  ' \
+          | sed -n 's/.*--backend[ =]\{1,\}\([^ ]*\).*/\1/p')"
+  if [ -n "$_be" ]; then
+    case "$_be" in
+      auto|cuda|opencl|cpu) : ;;  # recognised
+      *) echo "h-config: WARNING — unrecognised --backend '$_be' (expected one of: auto, cuda, opencl, cpu). The rig will AUTO-DETECT the GPU instead; fix the token if you meant a specific backend." ;;
+    esac
+  fi
   # Flight-sheet extras present this run -> (re)write them, stripping the forced
   # --stats-port/--stats-bind so they cannot be overridden.
   {

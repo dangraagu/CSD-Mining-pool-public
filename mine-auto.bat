@@ -44,8 +44,16 @@ REM                   restart cap is hit (driver reset, etc.)
 REM ============================================================
 
 set "REPO=dangraagu/CSD-Mining-pool-public"
+REM --- Pick the build variant (arg overrides auto-detect) ---
+REM Default is the SAME WMI probe install-csd-miner.bat uses (NOT a hard "amd"
+REM default, which downloaded+ran the amd build on NVIDIA rigs launched with no
+REM arg -> "no GPU backend usable" / 0 H/s). Pipe-free PowerShell (no '|' to
+REM mis-escape inside the for/f backticks): .Name -join ',' + -match, cpu fallback.
 set "VARIANT=%~1"
-if not defined VARIANT set "VARIANT=amd"
+if not defined VARIANT (
+  for /f "usebackq delims=" %%i in (`powershell -NoProfile -Command "$n=((Get-CimInstance Win32_VideoController).Name -join ','); if ($n -match 'NVIDIA'){'nvidia'} elseif ($n -match 'AMD' -or $n -match 'Radeon'){'amd'} else {'cpu'}"`) do set "VARIANT=%%i"
+)
+if not defined VARIANT set "VARIANT=cpu"
 set "DIR=%LOCALAPPDATA%\csd-pool-miner"
 set "EXE=csd-pool-miner-%VARIANT%.exe"
 set "BIN=%DIR%\%EXE%"
@@ -117,9 +125,15 @@ set "ADDR="
 if exist "%CFG%" set /p ADDR=<"%CFG%"
 if not defined ADDR (
   set /p ADDR=Enter your addr20 payout address ^(40 hex^):
-  > "%CFG%" echo !ADDR!
 )
 if not defined ADDR ( echo [X] No address entered. & pause & exit /b 1 )
+REM Normalise + validate BEFORE the %CFG% write (mirror of mine-auto.sh:564-569):
+REM lowercase, strip a leading 0x/0X, drop a .worker suffix, then require exactly
+REM 40 hex chars. Abort on anything invalid so a bad address never reaches the
+REM config or the miner. Pipe-free PowerShell (no '|' inside the for/f backticks).
+for /f "usebackq delims=" %%a in (`powershell -NoProfile -Command "$a=('!ADDR!').Trim().ToLower(); $a=$a -replace '^0x',''; $a=($a -split '\.')[0]; if ($a -match '^[0-9a-f]{40}$'){$a} else {'__INVALID__'}"`) do set "ADDR=%%a"
+if "!ADDR!"=="__INVALID__" ( echo [X] Not a valid addr20 ^(need 40 hex characters^). & pause & exit /b 1 )
+> "%CFG%" echo !ADDR!
 
 REM --- which GPU device indices to mine ---
 REM Default: one process per detected card (0 .. NGPU-1). If CSD_GPU_IDS is set
