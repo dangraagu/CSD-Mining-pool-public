@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.1.19
+
+HiveOS + Windows: auto-detect the GPU and fetch the matching build when `--backend`
+is omitted or `auto`. No pool, payout, or csd consensus change. (Binary logic
+unchanged; version bumped so the auto-updater converges on the new tag.)
+
+### Fixed
+- **"Connected but 0 H/s" on HiveOS when `--backend` was omitted/`auto`/`--backend=cuda`.**
+  `h-run.sh`'s `update_variant()` matched only the space-form `--backend cuda|opencl|cpu`,
+  so every other case defaulted to the CPU seed → "no GPU backend usable". It now lifts
+  the proven `detect_variant()` (nvidia-smi / device-node / libcuda → nvidia; lspci/clinfo
+  → amd; else cpu) and honours the `--backend=` equals-form, so an omitted/`auto` backend
+  fetches the correct GPU build. `detect_variant` returns cpu when no GPU is found, so the
+  asset name is never empty (brick-safe); its external probes are `timeout`-guarded. The
+  GPU-driver warning now derives from the resolved variant. `--backend` is now OPTIONAL.
+- **Windows launchers had the same trap** — `mine-auto.bat` / `mine-all-gpus.bat`
+  hard-defaulted to the `amd` build, so a bare run on an NVIDIA box fetched the opencl
+  build. They now use the same Win32_VideoController probe as the installer, and
+  normalize+validate the payout address (lowercase, strip `0x`/`.worker`, 40-hex) before
+  saving it.
+- **HiveOS quoted address** — a pasted `--address "<40hex>"` (or quoted wallet field) is
+  now accepted (a matched quote pair is stripped); an unrecognised `--backend` token warns.
+
+### Internal
+- New `tests/hiveos_flow_e2e.sh` replays HiveOS's real two-call sequence (h-config WITH
+  env → h-run env-less) and asserts the resolved (address, variant, exec-argv) — it fails
+  on the old code and passes on the fix. New `tests/win_launcher_parity.sh`. The release
+  workflow now runs the full shell suite as a required gate before packaging.
+
 ## 0.1.18
 
 P0 HiveOS hotfix — a fresh v0.1.17 HiveOS install (or any HiveOS restart) blanked

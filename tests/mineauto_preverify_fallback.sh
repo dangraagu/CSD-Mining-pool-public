@@ -38,7 +38,7 @@ win() { cygpath -w "$1" 2>/dev/null || printf '%s' "$1" | sed 's|/|\\|g'; }
 # ── compile the real curl.exe shim ONCE ──────────────────────────────────────
 CSC="$(ls "C:/Windows/Microsoft.NET/Framework64/"*/csc.exe 2>/dev/null | head -n1)"
 [ -z "$CSC" ] && CSC="$(ls "C:/Windows/Microsoft.NET/Framework/"*/csc.exe 2>/dev/null | head -n1)"
-if [ -z "$CSC" ]; then echo "FATAL: csc.exe not found — cannot build curl shim"; exit 2; fi
+if [ -z "$CSC" ]; then echo "  [SKIP] csc.exe not found — Windows-only test (needs .NET csc + cmd.exe); skipping on non-Windows."; exit 0; fi
 SHIMDIR="$(mktemp -d)"
 cat > "$SHIMDIR/curlshim.cs" <<'CS'
 using System;

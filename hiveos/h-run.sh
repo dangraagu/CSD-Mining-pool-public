@@ -109,7 +109,9 @@ MINER_PROC="csd-gpu-miner"   # argv name HiveOS sees; used to detect/kill the mi
 # correct it even when the VERSION already matches — the 15-day fleet bug.
 VARIANT_MARKER="$(dirname "$UPDATE_BIN")/.installed-variant"
 
-# Shared GPU auto-detection — lifted VERBATIM from mine-auto.sh's detect_variant()
+# Shared GPU auto-detection — lifted from mine-auto.sh's detect_variant() (external
+# probes timeout-guarded here: this copy runs in the BACKGROUND update sidecar's poll
+# loop, where a wedged nvidia-smi/lspci/clinfo must never block a poll)
 # so the HiveOS fall-through (no/auto/unknown --backend) resolves the SAME way the
 # desktop no-arg launcher does, instead of mis-defaulting every GPU rig to the cpu
 # seed (the v0.1.17 "0 GPU hashrate" bug). Returns nvidia | amd | cpu. NVIDIA wins
@@ -123,7 +125,7 @@ VARIANT_MARKER="$(dirname "$UPDATE_BIN")/.installed-variant"
 # Only if NONE hold do we consider AMD/OpenCL (lspci or clinfo), then cpu.
 detect_variant() {
   local glob="${CSD_NVIDIA_DEV_GLOB:-/dev/nvidia*}"
-  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+  if command -v nvidia-smi >/dev/null 2>&1 && timeout 5 nvidia-smi >/dev/null 2>&1; then
     echo nvidia; return
   fi
   if [ -e /dev/nvidiactl ] || compgen -G "$glob" >/dev/null 2>&1; then
@@ -132,8 +134,8 @@ detect_variant() {
   if command -v ldconfig >/dev/null 2>&1 && ldconfig -p 2>/dev/null | grep -q 'libcuda\.so'; then
     echo nvidia; return
   fi
-  if { command -v lspci >/dev/null 2>&1 && lspci 2>/dev/null | grep -Eiq '\[AMD/ATI\]|Advanced Micro Devices|Radeon|\bATI\b'; } \
-     || { command -v clinfo >/dev/null 2>&1 && clinfo 2>/dev/null | grep -Eiq 'Advanced Micro Devices|Radeon|\bAMD\b'; }; then
+  if { command -v lspci >/dev/null 2>&1 && timeout 5 lspci 2>/dev/null | grep -Eiq '\[AMD/ATI\]|Advanced Micro Devices|Radeon|\bATI\b'; } \
+     || { command -v clinfo >/dev/null 2>&1 && timeout 5 clinfo 2>/dev/null | grep -Eiq 'Advanced Micro Devices|Radeon|\bAMD\b'; }; then
     echo amd; return
   fi
   echo cpu
