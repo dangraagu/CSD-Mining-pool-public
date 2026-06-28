@@ -27,7 +27,7 @@ Every release ships a ready-made HiveOS **Custom-miner package**, so setup is ju
    `--backend cuda --address <your 40-hex CSD addr20>` (paste YOUR own address, not the example):
    - **Address (required):** `--address <your 40-hex addr20>`
    - **Backend:** NVIDIA → `--backend cuda` · AMD → `--backend opencl` · CPU → `--backend cpu`
-   - *(omit `--backend` to auto-detect; add `--gpu-id 0,1` to choose specific cards)*
+   - **`--backend` is REQUIRED — name it explicitly.** Do **not** omit it or use `auto`: HiveOS ships the CPU build as a universal seed and the auto-updater only fetches the **NVIDIA**/**AMD** build when you name `cuda`/`opencl`. A blank/`auto` backend leaves the rig on the CPU seed, which has no GPU compiled in — it connects to the pool and gets jobs but reports *"no GPU backend usable"* and **does not hash**. (Optionally add `--gpu-id 0,1` to pick specific cards.)
 
 4. **Apply** the Flight Sheet to your rig. Done — hashrate and accepted/rejected shares show on the HiveOS dashboard.
 
