@@ -23,10 +23,18 @@ CONF="${CUSTOM_CONFIG_FILENAME:-config.toml}"
 CONF_DIR="$(dirname "$CONF")"
 mkdir -p "$CONF_DIR"
 
-# The flightsheet wallet/template is the addr20 payout address. Strip a 0x
-# prefix and surrounding whitespace; the miner validates it strictly.
+# The flightsheet "wallet and worker template" is the addr20 payout address. Put
+# the LITERAL CSD address here, NOT %WAL% — CSD is not a HiveOS-known coin, so the
+# %WAL% macro is never expanded and would leave the address empty. An optional
+# ".worker" suffix (HiveOS appends %WORKER_NAME%) is dropped. Strip whitespace +
+# a 0x prefix; the miner validates the result strictly (40 hex, or 42 with 0x).
 ADDR="$(printf '%s' "${CUSTOM_TEMPLATE:-}" | tr -d '[:space:]')"
-ADDR="${ADDR#0x}"
+ADDR="${ADDR%%.*}"   # drop a ".worker" suffix, if any
+ADDR="${ADDR#0x}"    # drop a 0x prefix, if any
+# If any HiveOS macro (%WAL%, %WORKER_NAME%, …) was left UNEXPANDED, blank it so
+# the miner emits its clear "address must be 40 hex chars" error rather than
+# trying to mine to a literal "%WAL%".
+case "$ADDR" in *%*) ADDR="" ;; esac
 
 # Build the TOML config. address is the only required key; the pool endpoint is
 # compiled into the binary and cannot be overridden from the flightsheet.
@@ -47,4 +55,8 @@ EXTRA_FLAGS_FILE="$CONF_DIR/extra-flags"
   printf '\n'
 } > "$EXTRA_FLAGS_FILE"
 
-echo "h-config: wrote $CONF (address=${ADDR:-<empty>}) and $EXTRA_FLAGS_FILE"
+if [ -z "$ADDR" ]; then
+  echo "h-config: WARNING — empty address. Put your CSD addr20 (40-hex) DIRECTLY in the 'Wallet and worker template' field, NOT %WAL%. The miner will refuse to start until this is set."
+else
+  echo "h-config: wrote $CONF (address=$ADDR) and $EXTRA_FLAGS_FILE"
+fi
