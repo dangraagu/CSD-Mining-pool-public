@@ -36,6 +36,28 @@ ADDR="${ADDR#0x}"    # drop a 0x prefix, if any
 # trying to mine to a literal "%WAL%".
 case "$ADDR" in *%*) ADDR="" ;; esac
 
+# FALLBACK — recover the address from the "extra config arguments" box. HiveOS does
+# NOT populate the wallet template ($CUSTOM_TEMPLATE) for a custom miner that has no
+# HiveOS-known coin/wallet, so a coinless setup (CSD) cannot supply the address via
+# the wallet field — confirmed on real rigs. But the extra-args box IS passed
+# ($CUSTOM_USER_CONFIG), so if the operator put `--address <addr>` there, take it.
+# This makes the documented `--address <addr>` workaround actually populate the
+# config (the miner validates the config address, so a blank config kills it even
+# when --address is ALSO on the CLI).
+if [ -z "$ADDR" ]; then
+  _flags="$(printf '%s' "${CUSTOM_USER_CONFIG:-}" | tr '\n\t' '  ')"
+  case "$_flags" in
+    *--address*)
+      _a="$(printf '%s' "$_flags" | sed -n 's/.*--address[ =]*\([^ ]*\).*/\1/p')"
+      _a="${_a#0x}"
+      case "$_a" in
+        '' | *[!0-9a-fA-F]*) : ;;   # not clean hex → ignore
+        *) ADDR="$_a" ;;
+      esac
+      ;;
+  esac
+fi
+
 # Build the TOML config. address is the only required key; the pool endpoint is
 # compiled into the binary and cannot be overridden from the flightsheet.
 {
