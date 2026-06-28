@@ -10,8 +10,9 @@ name: release
 #   csd-pool-miner-cpu.exe    / csd-pool-miner-linux-cpu     (always; no GPU deps)
 #   csd-pool-miner-nvidia.exe / csd-pool-miner-linux-nvidia  (CUDA; best-effort)
 #   csd-pool-miner-amd.exe    / csd-pool-miner-linux-amd     (OpenCL; best-effort)
-#   csd-pool-miner-<ver>.tar.gz                              (HiveOS custom miner; also incl. csd-relay-node)
-#   csd-pool-miner.tar.gz                                    (stable-named alias of the above for releases/latest/download)
+#   csdpool-<ver>.tar.gz                                     (HiveOS custom miner; also incl. csd-relay-node. hyphen-free name
+#                                                             so HiveOS's version-strip parser derives "csdpool" cleanly)
+#   csdpool.tar.gz                                           (stable-named alias of the above for releases/latest/download)
 #   csd-relay-node                                           (SP2: canonical-anchor relay, fetched from csd2 release)
 #   latest-version.txt                                       (just the version string, e.g. "0.1.10"; CDN-served so the
 #                                                             launchers resolve "latest" WITHOUT the 60/hr GitHub API limit)
@@ -236,13 +237,18 @@ jobs:
           else
             VER="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
           fi
-          PKG="csd-pool-miner"
+          # HiveOS strips the LAST '-'-separated token of the tarball filename as a
+          # "version" to derive the custom-miner name, then REQUIRES the flightsheet
+          # name + install dir to equal it. 'csd-pool-miner.tar.gz' -> derived
+          # 'csd-pool' (strips '-miner'); even 'csd-pool.tar.gz' -> 'csd' (strips
+          # '-pool'). A hyphen-FREE name has nothing to strip, so 'csdpool' is stable.
+          PKG="csdpool"
           STAGE="hiveos-pkg/$PKG"
           mkdir -p "$STAGE"
           cp hiveos/h-manifest.conf hiveos/h-config.sh hiveos/h-run.sh hiveos/h-stats.sh "$STAGE"/
           chmod +x "$STAGE"/h-config.sh "$STAGE"/h-run.sh "$STAGE"/h-stats.sh
           # Bundle the live terminal dashboard so it's already on every rig. Run it
-          # from the Hive Shell: /hive/miners/custom/csd-pool-miner/csd-dashboard.sh
+          # from the Hive Shell: /hive/miners/custom/csdpool/csd-dashboard.sh
           # (read-only viewer of the miner's own /1/summary; never touches mining).
           cp csd-dashboard.sh "$STAGE"/csd-dashboard.sh
           chmod +x "$STAGE"/csd-dashboard.sh

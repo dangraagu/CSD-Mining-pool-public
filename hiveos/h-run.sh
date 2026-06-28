@@ -72,7 +72,7 @@ cd "$(dirname "$0")" || exit 1
 
 CONF="${CUSTOM_CONFIG_FILENAME:-config.toml}"
 PORT="${CUSTOM_API_PORT:-3380}"
-LOG="${CUSTOM_LOG_BASENAME:-/var/log/miner/csd-pool-miner/csd-pool-miner}.log"
+LOG="${CUSTOM_LOG_BASENAME:-/var/log/miner/csdpool/csd-pool-miner}.log"
 mkdir -p "$(dirname "$LOG")"
 
 # Re-render the config/flags from the current flightsheet (HiveOS also calls
@@ -428,7 +428,7 @@ RELAY_BIN="$(dirname "$0")/csd-relay-node"
 RELAY_DATADIR="/var/lib/csd-relay"
 RELAY_WALLET="$RELAY_DATADIR/wallet.json"
 RELAY_BLACKLIST="$RELAY_DATADIR/blacklist.txt"
-RELAY_LOG="/var/log/miner/csd-pool-miner/csd-relay-node.log"
+RELAY_LOG="/var/log/miner/csdpool/csd-relay-node.log"
 # Required by the `node` subcommand (binary rejects its absence). The relay is a
 # follower and never mines, so an empty fanout list is correct.
 RELAY_PUSH_PEERS="$RELAY_DATADIR/push-peers.txt"

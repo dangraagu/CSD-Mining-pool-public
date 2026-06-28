@@ -10,14 +10,16 @@ Every release ships a ready-made HiveOS **Custom-miner package**, so setup is ju
 
    | Field | Value |
    |---|---|
-   | Installation URL | `https://github.com/dangraagu/CSD-Mining-pool-public/releases/latest/download/csd-pool-miner.tar.gz` |
-   | Miner name | `csd-pool-miner` |
+   | Installation URL | `https://github.com/dangraagu/CSD-Mining-pool-public/releases/latest/download/csdpool.tar.gz` |
+   | Miner name | `csdpool` |
    | Hash algorithm | *anything — not used* |
    | Wallet and worker template | `%WAL%` |
-   | Pool URL | *leave blank — ignored (the pool is built into the binary)* |
+   | Pool URL | `stratum+tcp://127.0.0.1:1` |
    | Extra config arguments | *backend flag — see step 3* |
 
-   > ⚠️ **The Miner name must be EXACTLY `csd-pool-miner`** — NOT `csd-pool-miner-hiveos`. HiveOS derives the install folder from this name, and the package's folder is `csd-pool-miner`; a mismatched name makes HiveOS look for a folder that isn't there and the rig reports **"Miner screen is not running."**
+   > ⚠️ **The Miner name must be EXACTLY `csdpool`** (HiveOS auto-fills this from the URL — leave it). HiveOS derives the install folder from the tarball filename by stripping the last `-`-separated token as a "version", so a hyphen in the name breaks it (`csd-pool-miner` → `csd-pool`, `csd-pool` → `csd`). The package is named `csdpool` (no hyphen) precisely so HiveOS derives it cleanly; a mismatched name makes the rig report **"Miner screen is not running."**
+
+   > ⚠️ **Pool URL cannot be blank** — HiveOS won't save a Custom flight sheet without one. The miner **ignores** it (the pool is compiled into the binary), so use the harmless placeholder `stratum+tcp://127.0.0.1:1` exactly as shown. Do **not** point it at a real pool.
 
 3. **Pick your backend** in *Extra config arguments*:
    - NVIDIA → `--backend cuda`
@@ -29,12 +31,12 @@ Every release ships a ready-made HiveOS **Custom-miner package**, so setup is ju
 
 ## Notes
 
-- **The Pool URL field does nothing.** The pool endpoint is compiled into the binary and can't be changed — just set the wallet and apply.
+- **The Pool URL field is ignored** (the pool is compiled into the binary) but HiveOS still requires it non-blank — use `stratum+tcp://127.0.0.1:1` as shown above and never point it at a real pool.
 - **Do not put `--pool` in Extra config arguments** — the miner will reject it and won't start.
 - **Updating is now automatic — you do not need to touch the Flight Sheet again.** `h-run.sh` self-updates the miner on this rig:
   - **At every start** it checks the latest GitHub release and, if a newer version is published, downloads the matching build, **verifies its SHA-256 against the release `SHA256SUMS`**, and atomically swaps it in *before* launching — so a rig that has been off comes back up current.
   - **While running** a background poll checks roughly every 15 minutes (`CHECK_MIN`); when a newer version verifies, it swaps the binary and bounces the miner so HiveOS relaunches on the new build.
-  - **Fail-safe:** any update failure (no network, GitHub rate-limit, SHA mismatch, partial download, disk full) is logged and the rig keeps mining on the **existing** binary — an update problem never strands or bricks a rig. Update activity is written to the miner log under `/var/log/miner/csd-pool-miner/`.
+  - **Fail-safe:** any update failure (no network, GitHub rate-limit, SHA mismatch, partial download, disk full) is logged and the rig keeps mining on the **existing** binary — an update problem never strands or bricks a rig. Update activity is written to the miner log under `/var/log/miner/csdpool/`.
   - The **Installation URL above is the non-staling `releases/latest/download/` form**, so re-running the install (or adding a new rig) always pulls the current release. You only ever need to re-apply the Flight Sheet to *reinstall the glue* (e.g. after a HiveOS image wipe), not to update the miner.
 
 ## Live terminal dashboard
@@ -42,7 +44,7 @@ Every release ships a ready-made HiveOS **Custom-miner package**, so setup is ju
 Every rig ships a **read-only terminal dashboard** next to the miner. Open the **Hive Shell** (the web terminal in the HiveOS dashboard) or SSH into the rig and run:
 
 ```sh
-/hive/miners/custom/csd-pool-miner/csd-dashboard.sh
+/hive/miners/custom/csdpool/csd-dashboard.sh
 ```
 
 It shows a live, refreshing view of **this rig's** hashrate (10s / 1m / 15m), accepted / rejected / stale shares with reject%, GPU temp + power, and reconnects / failovers. Press **`q`** or **Ctrl-C** to quit; add `--once` for a single snapshot. HiveOS runs the miner's stats endpoint on port **3380**, which is the dashboard's default, so no flags are needed.
