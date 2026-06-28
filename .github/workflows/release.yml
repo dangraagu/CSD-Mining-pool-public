@@ -135,6 +135,19 @@ jobs:
         run: |
           cargo build --release
           cp target/release/csd-gpu-miner dist/csd-pool-miner-linux-cpu
+          # IMPORTANT (HiveOS bundling fix): the NVIDIA and AMD builds below
+          # OVERWRITE target/release/csd-gpu-miner in place (same output path,
+          # built sequentially). If the HiveOS "Package" step later copies
+          # target/release/csd-gpu-miner it gets the LAST build (= the AMD/opencl
+          # binary) and ships it to EVERY rig — so an NVIDIA rig boots an opencl
+          # binary ("cuda=false opencl=true" under --backend cuda). Preserve the
+          # CPU build to a stable, never-overwritten path NOW and bundle THAT as
+          # the HiveOS seed: CPU runs on ANY card (no GPU/driver dep), so it is the
+          # brick-safe universal seed. h-run.sh's variant-aware startup check then
+          # fetches+verifies+swaps the correct GPU variant for the flightsheet
+          # --backend on first boot. A fetch failure leaves the rig on this working
+          # CPU seed (still mining) — never bricked.
+          cp target/release/csd-gpu-miner csd-gpu-miner-hiveos-seed
 
       # NVIDIA: the CUDA backend embeds a pre-built PTX and JITs it via the driver,
       # so this build needs NO CUDA Toolkit on the runner (cudarc dlopens the driver
@@ -159,7 +172,10 @@ jobs:
       # release. This binary is NOT built here — it is the csd-node produced by the
       # separate CSD2 node repo.  The relay-node ends up in:
       #   - dist/csd-relay-node          (standalone download, SHA256SUMS covered)
-      #   - hiveos-pkg/csd-pool-miner/   (inside the HiveOS tarball)
+      #   - hiveos-pkg/csdpool/          (inside the HiveOS tarball — MUST match the
+      #                                   Package step's STAGE=hiveos-pkg/$PKG where
+      #                                   PKG=csdpool, else the relay is staged to a
+      #                                   dir the tar never picks up)
       #
       # OPERATOR: update RELAY_NODE_VERSION + RELAY_NODE_ASSET_URL before tagging.
       # RELAY_NODE_VERSION + RELAY_NODE_SHA256 are now real (relay-v0.1.9), so this
@@ -181,7 +197,7 @@ jobs:
           # ───────────────────────────────────────────────────────────────────────
         run: |
           set -euo pipefail
-          mkdir -p dist hiveos-pkg/csd-pool-miner
+          mkdir -p dist hiveos-pkg/csdpool
 
           # Hard-gate: fail the build (on a real tag push) if the operator has not
           # wired in a real version.  On workflow_dispatch smoke runs the step is
@@ -219,7 +235,7 @@ jobs:
 
           chmod +x dist/csd-relay-node
           # Also stage a copy for the HiveOS tarball (picked up in the next step).
-          cp dist/csd-relay-node hiveos-pkg/csd-pool-miner/csd-relay-node
+          cp dist/csd-relay-node hiveos-pkg/csdpool/csd-relay-node
           echo "SP2: csd-relay-node fetched OK ($(du -sh dist/csd-relay-node | cut -f1))"
 
       # Package the HiveOS custom miner: the hiveos/ glue (h-manifest.conf,
@@ -253,8 +269,24 @@ jobs:
           cp csd-dashboard.sh "$STAGE"/csd-dashboard.sh
           chmod +x "$STAGE"/csd-dashboard.sh
           # The HiveOS binary must be named csd-gpu-miner (the manifest CUSTOM_BIN).
-          cp target/release/csd-gpu-miner "$STAGE"/csd-gpu-miner
+          # Bundle the PRESERVED CPU seed (csd-gpu-miner-hiveos-seed), NOT
+          # target/release/csd-gpu-miner — the latter is whatever variant was built
+          # LAST (AMD/opencl), which is wrong for NVIDIA/CPU rigs. The CPU seed runs
+          # on any card (no GPU/driver dep) and is brick-safe; h-run.sh's startup
+          # check swaps in the correct GPU variant for the flightsheet --backend.
+          # Fall back to target/release/csd-gpu-miner only if the seed is missing
+          # (should not happen — the CPU build always succeeds and runs first).
+          if [ -f csd-gpu-miner-hiveos-seed ]; then
+            cp csd-gpu-miner-hiveos-seed "$STAGE"/csd-gpu-miner
+          else
+            echo "::warning::HiveOS seed csd-gpu-miner-hiveos-seed missing — falling back to target/release/csd-gpu-miner (may be the wrong variant)."
+            cp target/release/csd-gpu-miner "$STAGE"/csd-gpu-miner
+          fi
           chmod +x "$STAGE"/csd-gpu-miner
+          # Ship the variant marker so a fresh install KNOWS its bundled seed is the
+          # CPU build (h-run.sh reads this as a fallback when the binary self-report
+          # is unavailable; the binary's own `devices` output stays authoritative).
+          printf 'cpu\n' > "$STAGE"/.installed-variant
           # SP2: include csd-relay-node if the fetch step above placed it here.
           # The relay-node is optional at package time (the fetch step is
           # continue-on-error); its absence means the miner tarball ships without

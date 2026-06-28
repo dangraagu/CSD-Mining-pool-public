@@ -94,6 +94,12 @@ REPO="dangraagu/CSD-Mining-pool-public"
 UPDATE_BIN="${CUSTOM_BIN:-$(dirname "$0")/csd-gpu-miner}"
 CHECK_MIN="${CHECK_MIN:-15}"
 MINER_PROC="csd-gpu-miner"   # argv name HiveOS sees; used to detect/kill the miner
+# Marker file recording which variant ($UPDATE_BIN actually IS (nvidia|amd|cpu).
+# Written next to the binary after every successful swap, and (best-effort) seeded
+# at install/first-run from the binary's own self-report. Lets the startup check
+# notice a variant MISMATCH (bundled opencl binary on a --backend cuda rig) and
+# correct it even when the VERSION already matches — the 15-day fleet bug.
+VARIANT_MARKER="$(dirname "$UPDATE_BIN")/.installed-variant"
 
 # Map the flightsheet --backend to the release asset variant. Default to cpu
 # (always published) when no/unknown backend is given, so the asset name is
@@ -105,6 +111,44 @@ update_variant() {
     *"--backend cpu"*)    echo "cpu" ;;
     *)                    echo "cpu" ;;
   esac
+}
+
+# Which variant the binary self-reports it was COMPILED as, mapped to the asset
+# names (nvidia|amd|cpu). Source of truth = the binary's `devices` subcommand,
+# which prints exactly "build features: cuda=<bool> opencl=<bool>" to stdout and
+# exits (network-free, no pool, no GPU required to read the line). cuda=true ->
+# nvidia; opencl=true -> amd; both false -> cpu. Empty string if the binary can't
+# report (missing / too old / unreadable), so the caller falls back to the marker.
+ua_binary_variant() {
+  [ -x "$UPDATE_BIN" ] || { echo ""; return; }
+  feats="$("$UPDATE_BIN" devices 2>/dev/null | grep -m1 'build features:')" || feats=""
+  case "$feats" in
+    *"cuda=true"*)   echo "nvidia" ;;
+    *"opencl=true"*) echo "amd" ;;
+    *"cuda=false"*"opencl=false"*) echo "cpu" ;;
+    *) echo "" ;;   # unrecognised / no line → unknown
+  esac
+}
+
+# The variant currently INSTALLED on disk. Prefer the binary's own self-report
+# (authoritative); fall back to the marker file the package/last-swap wrote; empty
+# if neither is available. The marker is a cheap, no-exec hint for the case where
+# the binary predates the `devices` self-report or can't run on this host.
+ua_installed_variant() {
+  v="$(ua_binary_variant)"
+  if [ -n "$v" ]; then echo "$v"; return; fi
+  if [ -f "$VARIANT_MARKER" ]; then
+    m="$(tr -d '[:space:]' < "$VARIANT_MARKER" 2>/dev/null)"
+    case "$m" in nvidia|amd|cpu) echo "$m"; return ;; esac
+  fi
+  echo ""
+}
+
+# Record the installed variant in the marker (best-effort; a failed write never
+# blocks mining — the binary self-report is still the source of truth on the next
+# start). Called after a successful swap.
+ua_write_variant_marker() {
+  printf '%s\n' "$1" > "$VARIANT_MARKER" 2>/dev/null || true
 }
 
 # Download $1 -> $2 atomically: fetch to a temp file, move into place only on
@@ -262,6 +306,10 @@ ua_download_verify_swap() {
 
   chmod +x "$staged" 2>/dev/null || true
   mv "$staged" "$UPDATE_BIN"   # atomic swap onto the live path, only after verify
+  # Record WHICH variant now lives on disk (the FINAL $variant — may be "cpu" if a
+  # non-cpu asset 404'd and we fell back above). Best-effort; the binary's own
+  # `devices` self-report remains the source of truth on the next start.
+  ua_write_variant_marker "$variant"
 }
 
 # Current installed version string (for the semver compare). "none" if the
@@ -277,22 +325,57 @@ ua_installed_version() {
 # (a) STARTUP update check — one-shot, BEFORE the exec. Best-effort and fully
 # fail-safe: any failure logs and returns, leaving the existing $CUSTOM_BIN in
 # place so the rig always starts mining on a known-good binary.
+#
+# VARIANT-AWARE (FIX): the swap fires on a newer VERSION *or* a variant MISMATCH.
+# A fresh HiveOS install bundles ONE prebuilt binary (the opencl/amd build, due to
+# the release-packaging bug) whose --version already equals "latest", so the
+# version gate alone NEVER corrects it and an NVIDIA rig stays stuck on opencl
+# ("cuda=false opencl=true" under --backend cuda). Detecting the installed variant
+# from the binary's own `devices` self-report (with the marker file as fallback)
+# lets us fetch+verify+swap the CORRECT variant even when the version matches.
 hive_update_check_startup() {
   latest="$(ua_latest_tag || true)"
-  [ -z "$latest" ] && { echo "[h-run] auto-update: no release tag (offline / rate-limited) — starting on the installed binary." | tee -a "$LOG"; return 0; }
   installed="$(ua_installed_version)"
-  if ua_should_update "$installed" "$latest"; then
+  want_var="$(update_variant)"
+  have_var="$(ua_installed_variant)"
+
+  # VARIANT correction is possible even when we are OFFLINE for the version check
+  # only insofar as we can reach the CDN for the asset — ua_download_verify_swap
+  # needs the network regardless. But the DECISION to try must not require a tag:
+  # a known variant mismatch is a reason to attempt the swap even if latest-version
+  # .txt is momentarily unreachable (the download/verify below is still fail-safe).
+  reason=""
+  if [ -n "$latest" ] && ua_should_update "$installed" "$latest"; then
+    reason="version"
+  elif [ -n "$have_var" ] && [ "$have_var" != "$want_var" ]; then
+    reason="variant"
+  fi
+
+  if [ -z "$reason" ]; then
+    [ -z "$latest" ] && echo "[h-run] auto-update: no release tag (offline / rate-limited) and installed variant ($have_var) matches requested ($want_var) — starting on the installed binary." | tee -a "$LOG"
+    return 0
+  fi
+
+  if [ "$reason" = "variant" ]; then
+    echo "[h-run] auto-update: WRONG-VARIANT binary detected — installed=$have_var but flightsheet requests $want_var; fetching the $want_var build (verify, then swap before launch)." | tee -a "$LOG"
+  else
     echo "[h-run] auto-update: $installed -> $latest (verify, then swap before launch)" | tee -a "$LOG"
-    ua_download_verify_swap; rc=$?
-    if [ "$rc" -eq 0 ]; then
-      echo "[h-run] auto-update: swapped in $latest; launching it." | tee -a "$LOG"
-    elif [ "$rc" -eq 2 ]; then
-      # Verified, but the on-disk binary is already byte-identical (a launcher-only
-      # version bump where --version stays stale). Nothing to swap; just launch.
-      echo "[h-run] auto-update: on-disk binary already matches $latest (launcher-only bump) — no swap needed." | tee -a "$LOG"
-    else
-      echo "[h-run] auto-update: update not applied (download/verify failed) — keeping current binary." | tee -a "$LOG"
-    fi
+  fi
+
+  ua_download_verify_swap; rc=$?
+  if [ "$rc" -eq 0 ]; then
+    echo "[h-run] auto-update: swapped in the $want_var build${latest:+ ($latest)}; launching it." | tee -a "$LOG"
+  elif [ "$rc" -eq 2 ]; then
+    # Verified, but the on-disk binary is already byte-identical to the requested
+    # asset (a launcher-only version bump where --version stays stale). Nothing to
+    # swap. If we got here via the VARIANT trigger, the installed binary actually
+    # IS the requested variant (a stale/wrong marker, or a self-report blip, made us
+    # think otherwise) — reconcile the marker to $want_var so the variant trigger
+    # stops re-firing every start.
+    echo "[h-run] auto-update: on-disk binary already matches the requested $want_var build — no swap needed." | tee -a "$LOG"
+    [ "$reason" = "variant" ] && ua_write_variant_marker "$want_var"
+  else
+    echo "[h-run] auto-update: update not applied (download/verify failed) — keeping current binary, still mining." | tee -a "$LOG"
   fi
   return 0
 }
@@ -393,8 +476,9 @@ rm -f "$UPDATE_BIN".new.* 2>/dev/null || true
 # needs the function and its whole call graph + the constants they read, so we
 # export them. Keep this export list in sync if a new ua_* helper is added.
 export -f hive_update_sidecar ua_latest_tag ua_installed_version ua_should_update \
-          ua_download_verify_swap ua_download ua_expected_sha update_variant
-export UPDATE_BIN REPO CHECK_MIN MINER_PROC LOG EXTRA_FLAGS
+          ua_download_verify_swap ua_download ua_expected_sha update_variant \
+          ua_binary_variant ua_installed_variant ua_write_variant_marker
+export UPDATE_BIN REPO CHECK_MIN MINER_PROC LOG EXTRA_FLAGS VARIANT_MARKER
 bash -c 'hive_update_sidecar' "$SIDE_MARKER" >> "$LOG" 2>&1 &
 echo "[h-run] auto-update sidecar started (PID=$!, marker=$SIDE_MARKER, poll every ${CHECK_MIN} min)." | tee -a "$LOG"
 
