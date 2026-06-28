@@ -159,6 +159,118 @@ update_variant() {
   esac
 }
 
+# ── BRICK-SAFE multi-GPU launch helpers (port of mine-all-gpus.sh:250-300) ────
+# The miner binary is one-process-one-device (`--device N`); `--gpu-id` is only an
+# include-list the LAUNCHER reads to spawn one process per card. h-run.sh exec's
+# exactly ONE process (= device 0), so a multi-GPU rig otherwise idles every card
+# but 0. These helpers plan + launch the EXTRA cards (1..N-1) in the BACKGROUND
+# right before the unchanged exec. EVERYTHING here is fail-soft: any failure (no
+# nvidia-smi, count fails, a spawn errors, cpu variant) falls through to the lone
+# exec = the 1-GPU status quo. Worst case is 1 GPU; NEVER a brick.
+
+# GPU count for the resolved variant. nvidia: count "GPU N:" lines from
+# `nvidia-smi -L`; amd: count OpenCL GPU devices from clinfo ('Device Type ...
+# GPU' — a bare 'Device Type' overcounts as clinfo also lists CPU OpenCL devices
+# and repeats per platform; mirrors mine-all-gpus.sh). Every probe is timeout-
+# guarded and `|| true` so a wedged/absent tool yields 0, not a hang/abort.
+# Echoes a non-negative integer (0 when unknown). NEVER errors out the caller.
+hive_gpu_count() {
+  n=0
+  case "$1" in
+    nvidia)
+      if command -v nvidia-smi >/dev/null 2>&1; then
+        n="$(timeout 5 nvidia-smi -L 2>/dev/null | grep -c '^GPU ' || true)"
+      fi
+      ;;
+    amd)
+      if command -v clinfo >/dev/null 2>&1; then
+        n="$(timeout 5 clinfo 2>/dev/null | grep -c 'Device Type.*GPU' || true)"
+      fi
+      ;;
+  esac
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  printf '%s' "$n"
+}
+
+# Parse a `--gpu-id <list>` (comma-separated indices) out of EXTRA_FLAGS, matching
+# csd_gpu_miner::hiveos::parse_gpu_ids semantics: comma-separated NON-NEGATIVE
+# integers, surrounding whitespace tolerated, order preserved. Echoes the
+# space-separated indices, or nothing when the flag is absent / the list is empty /
+# any entry is non-numeric (fail-soft → caller uses the full 0..N-1 set). Supports
+# both `--gpu-id 0,2` (space) and `--gpu-id=0,2` (equals) forms.
+hive_gpu_id_list() {
+  case " $EXTRA_FLAGS " in
+    *" --gpu-id "*)   raw="${EXTRA_FLAGS#*--gpu-id }" ;;
+    *" --gpu-id="*)   raw="${EXTRA_FLAGS#*--gpu-id=}" ;;
+    *)                return 0 ;;
+  esac
+  raw="${raw%% *}"                      # first whitespace-delimited token
+  [ -n "$raw" ] || return 0
+  out=""
+  oldifs="$IFS"; IFS=','
+  for part in $raw; do
+    p="$(printf '%s' "$part" | tr -d '[:space:]')"
+    case "$p" in
+      ''|*[!0-9]*) IFS="$oldifs"; return 0 ;;   # non-numeric → no filter (fail-soft)
+      *) out="$out $p" ;;
+    esac
+  done
+  IFS="$oldifs"
+  printf '%s' "${out# }"
+}
+
+# PURE planner. Emits one line per device that will be launched, given the resolved
+# variant (update_variant), EXTRA_FLAGS (may carry --gpu-id), PORT, and the GPU
+# count. Device 0 is ALWAYS the exec (and always present, even on failure);
+# devices >0 in the active set are the BACKGROUND launches:
+#     EXEC device=0 port=<PORT>
+#     BG device=<i> port=<PORT+i>
+# cpu variant, count <2 / unknown, or a --gpu-id set with no extra cards => ONLY
+# the EXEC line (the brick-safe fallback). No side effects; safe to source + call.
+hive_multi_gpu_plan() {
+  _port="${PORT:-3380}"
+  printf 'EXEC device=0 port=%s\n' "$_port"   # device 0 = the exec; ALWAYS present
+  _variant="$(update_variant)"
+  case "$_variant" in nvidia|amd) ;; *) return 0 ;; esac   # cpu/unknown → single exec
+  _count="$(hive_gpu_count "$_variant")"
+  [ "$_count" -ge 2 ] 2>/dev/null || return 0              # <2 / unknown → single exec
+  _ids="$(hive_gpu_id_list)"                               # operator include-list, if any
+  if [ -n "$_ids" ]; then
+    _set="$_ids"                                           # honour --gpu-id exactly
+  else
+    _set=""; _i=0
+    while [ "$_i" -lt "$_count" ]; do _set="$_set $_i"; _i=$((_i + 1)); done
+  fi
+  for _d in $_set; do
+    [ "$_d" = "0" ] && continue                            # device 0 is the exec
+    [ "$_d" -lt "$_count" ] 2>/dev/null || continue        # skip ids beyond the GPU count
+    printf 'BG device=%s port=%s\n' "$_d" "$((_port + _d))"
+  done
+}
+
+# Launch the EXTRA GPUs (every BG line of hive_multi_gpu_plan) in the BACKGROUND,
+# one process per card: its own --device, a distinct stats port PORT+i, and its
+# own log. FAIL-SOFT throughout (no set -e; every step tolerated) — if anything
+# here errors, the caller still reaches the unchanged single exec = 1 GPU. The
+# update sidecar stays SINGLE; we do NOT spawn one per GPU.
+hive_launch_extra_gpus() {
+  _gpulogdir="$(dirname "$LOG")"
+  mkdir -p "$_gpulogdir" 2>/dev/null || true
+  hive_multi_gpu_plan 2>/dev/null | while IFS= read -r _line; do
+    case "$_line" in
+      "BG device="*)
+        _dev="${_line#BG device=}"; _dev="${_dev%% *}"
+        _gport="${_line##*port=}"
+        # shellcheck disable=SC2086
+        nice -n 0 "$CUSTOM_BIN" --config "$CONF" --device "$_dev" \
+          --stats-port "$_gport" --stats-bind 127.0.0.1 $EXTRA_FLAGS \
+          >> "$_gpulogdir/gpu${_dev}.log" 2>&1 &
+        echo "[h-run] multi-GPU: launched device $_dev in background (stats 127.0.0.1:$_gport, PID=$!)." | tee -a "$LOG" || true
+        ;;
+    esac
+  done || true
+}
+
 # Which variant the binary self-reports it was COMPILED as, mapped to the asset
 # names (nvidia|amd|cpu). Source of truth = the binary's `devices` subcommand,
 # which prints exactly "build features: cuda=<bool> opencl=<bool>" to stdout and
@@ -613,16 +725,28 @@ fi
 RESOLVED_VARIANT="$(update_variant)"
 case "$RESOLVED_VARIANT" in
   nvidia)
-    if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi -L >/dev/null 2>&1; then
+    if ! command -v nvidia-smi >/dev/null 2>&1 || ! timeout 5 nvidia-smi -L >/dev/null 2>&1; then
       echo "[h-run] WARNING: nvidia (cuda) build selected but nvidia-smi found no GPU; the miner will auto-fall back to CPU." | tee -a "$LOG"
     fi
     ;;
   amd)
-    if ! command -v clinfo >/dev/null 2>&1 || ! clinfo 2>/dev/null | grep -q 'Device Type.*GPU'; then
+    if ! command -v clinfo >/dev/null 2>&1 || ! timeout 5 clinfo 2>/dev/null | grep -q 'Device Type.*GPU'; then
       echo "[h-run] WARNING: amd (opencl) build selected but clinfo listed no GPU; the miner will auto-fall back to CPU." | tee -a "$LOG"
     fi
     ;;
 esac
+
+# ── BRICK-SAFE multi-GPU: launch the EXTRA cards (1..N-1) in the BACKGROUND ────
+# IMMEDIATELY BEFORE the unchanged exec below (device 0). The binary is
+# one-process-one-device, so a multi-GPU rig needs one process per card. This
+# block is fully FAIL-SOFT (no set -e; hive_launch_extra_gpus tolerates every
+# error and only runs for nvidia/amd with >=2 GPUs): if ANYTHING here fails —
+# count probe absent/wedged, a spawn errors, cpu variant — we simply fall through
+# to the single exec = the 1-GPU status quo. The exec (device 0) is the
+# guaranteed-last action HiveOS tracks, so at least one GPU ALWAYS mines and the
+# rig can NEVER be bricked by this addition. Device 0 is intentionally EXCLUDED
+# here (it is the exec); the update sidecar above stays SINGLE (not per-GPU).
+hive_launch_extra_gpus || true
 
 echo "[h-run] starting csd-gpu-miner (stats on 127.0.0.1:$PORT)" | tee -a "$LOG"
 
@@ -635,6 +759,6 @@ echo "[h-run] starting csd-gpu-miner (stats on 127.0.0.1:$PORT)" | tee -a "$LOG"
 # keep /proc/comm == "csd-gpu-miner" — both the auto-update sidecar's liveness
 # probe (pgrep -x) and h-stop.sh's reaper (pkill -x) match on that exact comm.
 # shellcheck disable=SC2086
-exec "$CUSTOM_BIN" --config "$CONF" \
+exec "$CUSTOM_BIN" --config "$CONF" --device 0 \
   --stats-port "$PORT" --stats-bind 127.0.0.1 \
   $EXTRA_FLAGS

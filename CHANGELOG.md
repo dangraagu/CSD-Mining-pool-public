@@ -6,6 +6,17 @@ HiveOS + Windows: auto-detect the GPU and fetch the matching build when `--backe
 is omitted or `auto`. No pool, payout, or csd consensus change. (Binary logic
 unchanged; version bumped so the auto-updater converges on the new tag.)
 
+### Added
+- **Multi-GPU HiveOS rigs now mine every card.** The miner is one-process-per-GPU,
+  but `h-run.sh` only launched one process (one card). It now spawns one background
+  process per extra GPU (each its own `--device i` + stats port) immediately before
+  the unchanged device-0 `exec`. Brick-safe by construction: the device-0 `exec` is
+  the guaranteed last action, and the multi-GPU launch is fully fail-soft (timeout-
+  guarded probes, no error/exit path) — any failure (no `nvidia-smi`, wedged driver,
+  spawn error, CPU variant, <2 GPUs) falls back to the single-GPU start = the prior
+  behaviour, never a brick. Honours an operator `--gpu-id` include-list; CPU and
+  single-GPU rigs are unaffected. `h-stop.sh` already reaps all per-GPU processes.
+
 ### Fixed
 - **"Connected but 0 H/s" on HiveOS when `--backend` was omitted/`auto`/`--backend=cuda`.**
   `h-run.sh`'s `update_variant()` matched only the space-form `--backend cuda|opencl|cpu`,
