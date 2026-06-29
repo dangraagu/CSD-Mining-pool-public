@@ -15,7 +15,7 @@ Every release ships a ready-made HiveOS **Custom-miner package**, so setup is ju
    | Hash algorithm | *anything — not used* |
    | Wallet and worker template | *leave blank* — HiveOS does **not** pass this field for a coinless miner (CSD); set your address with `--address` in *Extra config arguments* (step 3) |
    | Pool URL | `stratum+tcp://127.0.0.1:1` |
-   | Extra config arguments | *your `--address <40-hex addr20>` — see step 3 (backend is optional/auto-detected)* |
+   | Extra config arguments | *`--backend cuda --address <40-hex addr20>` — set the backend explicitly; see step 3* |
 
    > ⚠️ **The Miner name must be EXACTLY `csdpool`** (HiveOS auto-fills this from the URL — leave it). HiveOS derives the install folder from the tarball filename by stripping the last `-`-separated token as a "version", so a hyphen in the name breaks it (`csd-pool-miner` → `csd-pool`, `csd-pool` → `csd`). The package is named `csdpool` (no hyphen) precisely so HiveOS derives it cleanly; a mismatched name makes the rig report **"Miner screen is not running."**
 
@@ -23,10 +23,11 @@ Every release ships a ready-made HiveOS **Custom-miner package**, so setup is ju
 
    > ⚠️ **Set your CSD address with `--address <addr>` in *Extra config arguments* — the "Wallet and worker template" field does NOT work for CSD.** HiveOS only passes that field for a HiveOS-known coin; CSD isn't one, so it stays empty and the miner exits with *"--address must be 40 hex chars … got 0 chars"*. Put the bare 40-hex `addr20` after `--address` (a `0x`/`0X` prefix and a `.worker` suffix are both fine and get stripped).
 
-3. **Set your address** in *Extra config arguments* (backend is optional), e.g.
-   `--address <your 40-hex CSD addr20>` (paste YOUR own address, not the example):
-   - **Address (required):** `--address <your 40-hex addr20>`
-   - **Backend (OPTIONAL — auto-detected):** the rig now detects its own GPU (NVIDIA/AMD/CPU) and fetches the matching build automatically, so you do **not** need `--backend` at all. Name it only to **override** the auto-detect: NVIDIA → `--backend cuda` · AMD → `--backend opencl` · CPU → `--backend cpu`. (Optionally add `--gpu-id 0,1` to pick specific cards.)
+3. **Set your backend AND address** in *Extra config arguments*, both on one line, e.g.
+   `--backend cuda --address <your 40-hex CSD addr20>` (paste YOUR own address, not the example):
+   - **Backend — SET IT EXPLICITLY (recommended on HiveOS):** NVIDIA → `--backend cuda` · AMD → `--backend opencl` · CPU → `--backend cpu`. You *can* omit it to auto-detect the GPU, but on HiveOS the GPU probe can occasionally come up empty at launch and fall back to the **CPU build, which mines nothing** ("online but 0 H/s"). Naming `--backend` explicitly is deterministic — do that.
+   - **Address (required):** `--address <your 40-hex addr20>` (a `0x`/`0X` prefix and a `.worker` suffix are both stripped).
+   - *(add `--gpu-id 0,1` to pick specific cards.)*
 
 4. **Apply** the Flight Sheet to your rig. Done — hashrate and accepted/rejected shares show on the HiveOS dashboard.
 
