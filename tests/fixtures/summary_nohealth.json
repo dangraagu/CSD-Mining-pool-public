@@ -1,9 +1,0 @@
-{
-  "id": "csd-pool-miner",
-  "worker_id": "0011223344556677889900aabbccddeeff001122",
-  "version": "0.1.16",
-  "uptime": 305,
-  "hashrate": { "total": [540000000, 0, 0], "highest": 560000000 },
-  "results": { "shares_good": 7, "shares_total": 7, "shares_rejected": 0, "shares_stale": 0 },
-  "connection": { "pool": "pool.yamaduo.no:3333", "uptime": 305, "reconnects": 1, "failovers": 0 }
-}
