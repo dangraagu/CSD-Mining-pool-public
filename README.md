@@ -211,6 +211,9 @@ restart the miner on the new build:
   background ~15-min poll, verifies, swaps, and bounces the miner so HiveOS
   relaunches on the new binary — no Flight Sheet change needed. See
   [docs/HIVEOS.md](docs/HIVEOS.md).
+- **systemd (native Linux service)** — run the miner 24/7 under `systemd` with
+  auto-restart and the same fail-closed auto-update timer. See
+  [`deploy/systemd/`](deploy/systemd/) ([README](deploy/systemd/README.md)).
 
 **Fail-safe is the rule everywhere:** any update failure (no network, GitHub
 rate-limit, SHA mismatch, partial download, disk full) is logged and the rig
