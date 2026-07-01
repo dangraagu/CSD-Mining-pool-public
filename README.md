@@ -184,9 +184,12 @@ affects mining.
 A HiveOS **Custom-miner package** ships with each release
 (`csdpool.tar.gz` — hyphen-free name so HiveOS's filename parser derives it cleanly;
 the glue is in the [`hiveos/`](hiveos/) dir).
-Add it as a Custom miner (miner name `csdpool`) with your addr20 as the wallet; it reports hashrate and
-accepted/rejected shares to the HiveOS dashboard (by scraping the miner's own
-stats endpoint, so the kH/s is always correct).
+Add it as a Custom miner (miner name `csdpool`) and set your addr20 with
+`--address <addr>` in *Extra config arguments* — the HiveOS "Wallet and worker
+template" field does **not** work for CSD (HiveOS only passes it for coins it
+knows). It reports hashrate and accepted/rejected shares to the HiveOS
+dashboard (by scraping the miner's own stats endpoint, so the kH/s is always
+correct).
 
 **Step-by-step setup: [docs/HIVEOS.md](docs/HIVEOS.md).**
 
