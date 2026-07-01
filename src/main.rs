@@ -508,8 +508,9 @@ fn build_thermal_cfg(cli: &Cli) -> thermal::ThermalCfg {
 ///   1. reads a [`crate::nvml::TelemetrySample`] (temp/power),
 ///   2. pushes it to the stats handle (if `--stats-port` is on) so `/1/summary`
 ///      + HiveOS expose `gpu_temp_c`/`gpu_power_w`, and
-///   3. drives the shared [`ThermalGate`] via [`thermal::thermal_tick`] using the
-///      sample's temperature, so the mining loop pauses/resumes GPU launches.
+///   3. drives the shared [`ThermalGate`] via [`thermal::thermal_tick_with_deadman`]
+///      using the sample's temperature, so the mining loop pauses/resumes GPU
+///      launches (the dead-man bounds a continuous pause with a watchdog check).
 ///
 /// Returns `None` (spawns nothing) when there is NOTHING to do: no thermal limit
 /// AND no stats server AND telemetry is disabled — so the default build with no
