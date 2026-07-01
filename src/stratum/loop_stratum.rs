@@ -663,7 +663,7 @@ pub fn run_stratum<B: MiningBackend + Recoverable + Sync, W: WorkSource + Sync>(
 /// hung-GPU exit(17)). A never-paused gate (the default build, or no
 /// `--temp-limit`) makes this byte-identical to
 /// [`run_stratum_with_gpu_watchdog`]. The gate is driven by the caller's thermal
-/// poller (see [`crate::thermal::spawn_thermal_poller`]).
+/// poller (see `spawn_telemetry` in `main.rs`).
 pub fn run_stratum_with_gpu_watchdog<B: MiningBackend + Recoverable + Sync, W: WorkSource + Sync>(
     backend: &B,
     client: &W,

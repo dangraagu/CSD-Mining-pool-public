@@ -169,12 +169,6 @@ mod imp {
             let power_w = dev.power_usage().ok().map(|mw| mw as f64 / 1000.0);
             TelemetrySample { temp_c, power_w }
         }
-
-        /// Just the temperature (°C), or `None`. Convenience for the thermal
-        /// poller, which only needs temperature.
-        pub fn temperature_c(&self) -> Option<f64> {
-            self.sample().temp_c
-        }
     }
 }
 
@@ -206,10 +200,6 @@ mod imp {
         pub fn sample(&self) -> TelemetrySample {
             TelemetrySample::none()
         }
-        /// Always `None`.
-        pub fn temperature_c(&self) -> Option<f64> {
-            None
-        }
     }
 }
 
@@ -233,7 +223,6 @@ mod tests {
         let t = GpuTelemetry::disabled();
         assert!(!t.is_enabled());
         assert_eq!(t.sample(), TelemetrySample::none());
-        assert_eq!(t.temperature_c(), None);
     }
 
     #[cfg(not(feature = "nvml"))]
@@ -242,7 +231,6 @@ mod tests {
         // Without the feature, even init() yields a disabled, all-None handle.
         let t = GpuTelemetry::init(0, Some(200.0));
         assert!(!t.is_enabled());
-        assert_eq!(t.temperature_c(), None);
     }
 
     #[cfg(feature = "nvml")]

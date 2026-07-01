@@ -20,7 +20,6 @@
 //! the stall watchdog stands down for the duration (see `loop_stratum`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 /// Tunables for the temperature-limit throttle. Defaults are conservative: the
 /// throttle is OFF unless the operator opts in with a limit, and the resume
@@ -403,76 +402,6 @@ pub fn thermal_tick_with_deadman(
     (outcome.apply_state, changed, outcome.forced_open)
 }
 
-/// Spawn the thermal-poll thread: every `poll`, read the GPU temperature via
-/// `sample` and update `gate`, until `stop` is set. Sleeps in small slices so it
-/// honours `stop` promptly. No-op (returns an immediately-joinable thread) when
-/// `cfg.enabled` is false. `sample` returns `Some(temp_c)` or `None` if
-/// telemetry is unavailable; the caller wires it to NVML (feature = "nvml") or a
-/// stub. The caller may detach the handle — the thread owns its `Arc`s.
-pub fn spawn_thermal_poller<F>(
-    gate: Arc<ThermalGate>,
-    cfg: ThermalCfg,
-    poll: std::time::Duration,
-    sample: F,
-    stop: Arc<AtomicBool>,
-) -> std::thread::JoinHandle<()>
-where
-    F: Fn() -> Option<f64> + Send + 'static,
-{
-    std::thread::Builder::new()
-        .name("thermal-poller".to_string())
-        .spawn(move || {
-            if !cfg.enabled {
-                return;
-            }
-            tracing::info!(
-                "thermal: armed (limit={:.0}°C, resume={:.0}°C, poll={:?})",
-                cfg.limit_c,
-                cfg.resume_c,
-                poll,
-            );
-            let slice = std::time::Duration::from_millis(200).min(poll);
-            let mut waited = std::time::Duration::ZERO;
-            // Max-pause dead-man: bounds a CONTINUOUS pause so a stuck-hot hung GPU
-            // still gets a watchdog check. Inert unless the gate actually pauses.
-            let mut deadman = Deadman::new();
-            // Evaluate once up front so a hot start pauses promptly. (No elapsed
-            // time has passed, so the dead-man cannot trip on this first sample.)
-            {
-                let (_s, _c, _f) =
-                    thermal_tick_with_deadman(&gate, &mut deadman, sample(), cfg, std::time::Duration::ZERO);
-            }
-            while !stop.load(Ordering::Relaxed) {
-                if waited >= poll {
-                    waited = std::time::Duration::ZERO;
-                    let (state, changed, forced_open) =
-                        thermal_tick_with_deadman(&gate, &mut deadman, sample(), cfg, poll);
-                    if forced_open {
-                        tracing::warn!(
-                            "thermal: gate paused >{}s — forcing a watchdog check in case the GPU is hung, not just hot (resuming launches for ~{}s; a healthy throttling card will simply re-pause)",
-                            cfg.max_pause_secs, FORCE_RESUME_WINDOW_SECS,
-                        );
-                    }
-                    if changed {
-                        match state {
-                            ThermalState::Paused => tracing::warn!(
-                                "thermal: PAUSING GPU launches — temperature above limit {:.0}°C (will resume at/below {:.0}°C)",
-                                cfg.limit_c, cfg.resume_c,
-                            ),
-                            ThermalState::Running => tracing::info!(
-                                "thermal: RESUMING GPU launches — temperature back at/below {:.0}°C",
-                                cfg.resume_c,
-                            ),
-                        }
-                    }
-                }
-                std::thread::sleep(slice);
-                waited += slice;
-            }
-        })
-        .expect("spawning thermal-poller thread")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -651,43 +580,6 @@ mod tests {
         assert!(g.apply(ThermalState::Paused), "running->paused changes");
         assert!(!g.apply(ThermalState::Paused), "paused->paused no change");
         assert!(g.apply(ThermalState::Running), "paused->running changes");
-    }
-
-    // --- spawn_thermal_poller driver ---
-
-    #[test]
-    fn spawned_disabled_poller_exits_immediately() {
-        let g = Arc::new(ThermalGate::new());
-        let off = ThermalCfg { enabled: false, ..cfg() };
-        let stop = Arc::new(AtomicBool::new(false));
-        let h = spawn_thermal_poller(
-            g.clone(),
-            off,
-            std::time::Duration::from_millis(5),
-            || Some(120.0),
-            stop,
-        );
-        h.join().unwrap(); // returns without needing `stop`
-        assert!(!g.is_paused(), "disabled poller never pauses");
-    }
-
-    #[test]
-    fn spawned_poller_pauses_on_hot_sample_then_stops() {
-        let g = Arc::new(ThermalGate::new());
-        let stop = Arc::new(AtomicBool::new(false));
-        // Always reads a temperature above the limit ⇒ the poller must pause.
-        let h = spawn_thermal_poller(
-            g.clone(),
-            cfg(),
-            std::time::Duration::from_millis(5),
-            || Some(95.0),
-            Arc::clone(&stop),
-        );
-        // The up-front evaluation pauses immediately; give the thread a moment.
-        std::thread::sleep(std::time::Duration::from_millis(40));
-        assert!(g.is_paused(), "poller must pause on a hot sample");
-        stop.store(true, Ordering::Relaxed);
-        h.join().unwrap();
     }
 
     // --- max-pause dead-man (the watchdog-recovery backstop) ---
@@ -873,32 +765,5 @@ mod tests {
         let off = build_thermal_cfg(None, None, Some(42));
         assert!(!off.enabled);
         assert_eq!(off.max_pause_secs, DEFAULT_MAX_PAUSE_SECS);
-    }
-
-    #[test]
-    fn spawned_poller_resumes_when_cooled() {
-        use std::sync::atomic::AtomicU64;
-        let g = Arc::new(ThermalGate::new());
-        let stop = Arc::new(AtomicBool::new(false));
-        // First few samples hot (pause), then cold (resume). A shared counter
-        // drives the transition deterministically without real temperatures.
-        let n = Arc::new(AtomicU64::new(0));
-        let n2 = n.clone();
-        let h = spawn_thermal_poller(
-            g.clone(),
-            cfg(),
-            std::time::Duration::from_millis(5),
-            move || {
-                let i = n2.fetch_add(1, Ordering::Relaxed);
-                Some(if i < 3 { 95.0 } else { 60.0 })
-            },
-            Arc::clone(&stop),
-        );
-        // Wait long enough for several polls: pause then resume.
-        std::thread::sleep(std::time::Duration::from_millis(120));
-        stop.store(true, Ordering::Relaxed);
-        h.join().unwrap();
-        assert!(!g.is_paused(), "poller must resume after cooling below resume");
-        assert!(n.load(Ordering::Relaxed) >= 4, "poller sampled several times");
     }
 }
