@@ -106,9 +106,6 @@ struct PipeRes {
     found_nonce: Buffer<cl_uint>,
     found_flag: Buffer<cl_uint>,
     found_hash: Buffer<cl_uint>,
-    /// Nonce offset for the launch currently in-flight on this queue
-    /// (only meaningful while `in_flight` is true).
-    pending_start: u32,
     in_flight: bool,
 }
 
@@ -140,7 +137,6 @@ impl PipeRes {
             found_nonce,
             found_flag,
             found_hash,
-            pending_start: 0,
             in_flight: false,
         })
     }
@@ -280,7 +276,6 @@ impl MiningBackend for OpenclBackend {
                                 return None;
                             }
                         }
-                        pipe.pending_start = start_u32;
                         pipe.in_flight = true;
                         next_start = next_start.saturating_add(launch_size);
                         true
