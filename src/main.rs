@@ -1490,7 +1490,10 @@ fn ctrlc_lite<F: Fn() + Send + 'static>(handler: F) {
 
 #[cfg(test)]
 mod tests {
-    use super::{suggest_diff_enabled, validate_address, Cli};
+    use super::{
+        build_gpu_watchdog_cfg, build_mining_config, num_cpus_default, suggest_diff_enabled,
+        validate_address, Cli,
+    };
     use clap::Parser;
     use std::sync::Mutex;
 
@@ -1633,5 +1636,159 @@ mod tests {
             vec![0, 2]
         );
         assert!(csd_gpu_miner::hiveos::parse_gpu_ids("0,x").is_err());
+    }
+
+    // --- backend→config mapping (build_mining_config / build_gpu_watchdog_cfg) ---
+    // Pins the safety-relevant CLI→config mapping so the supervised dedup of
+    // drive()'s six launch tails can't silently swap a bool (e.g. a GPU watchdog
+    // wired onto a CPU rig, or a second CPU pool contending inside the CPU loop).
+    // Call-site truth being characterized (main.rs drive()):
+    //   CPU arms pass (backend_is_cpu=true,  watchdog_enabled=false)
+    //   GPU arms pass (backend_is_cpu=false, watchdog_enabled=true)
+
+    #[test]
+    fn build_mining_config_cpu_backend_always_zeroes_dual_pool() {
+        // The CPU backend saturates its own hashing threads, so the in-loop dual
+        // pool is deliberately zeroed regardless of --cpu-threads / --cpu-share.
+        let cli = Cli::try_parse_from([
+            "csd-pool-miner",
+            "--address",
+            &"a".repeat(40),
+            "--cpu-threads",
+            "12",
+            "--cpu-share",
+            "0.9",
+        ])
+        .unwrap();
+        let cfg = build_mining_config(&cli, true);
+        assert_eq!(cfg.cpu_threads, 0, "CPU backend must zero the dual pool threads");
+        assert_eq!(cfg.cpu_share, 0.0, "CPU backend must zero the dual pool share");
+
+        // Even the defaults path (no explicit cpu flags) zeroes under the CPU arm.
+        let cli_default =
+            Cli::try_parse_from(["csd-pool-miner", "--address", &"a".repeat(40)]).unwrap();
+        let cfg_default = build_mining_config(&cli_default, true);
+        assert_eq!(cfg_default.cpu_threads, 0);
+        assert_eq!(cfg_default.cpu_share, 0.0);
+    }
+
+    #[test]
+    fn build_mining_config_gpu_backend_carries_clamped_cli_values() {
+        // 2 threads is <= any real core count, so it passes through unchanged;
+        // 0.25 is in-range, so it survives the clamp verbatim. This pins the
+        // "carry the operator's dual-mining knobs" path for the GPU arms.
+        let cli = Cli::try_parse_from([
+            "csd-pool-miner",
+            "--address",
+            &"a".repeat(40),
+            "--cpu-threads",
+            "2",
+            "--cpu-share",
+            "0.25",
+        ])
+        .unwrap();
+        let cfg = build_mining_config(&cli, false);
+        assert_eq!(cfg.cpu_threads, 2, "in-range threads pass through under a GPU backend");
+        assert_eq!(cfg.cpu_share, 0.25, "in-range share passes through under a GPU backend");
+
+        // cpu_threads is clamped to the machine's core count (num_cpus_default),
+        // asserted via the exact formula rather than a hardcoded core count so the
+        // test is machine-independent.
+        let cli_big = Cli::try_parse_from([
+            "csd-pool-miner",
+            "--address",
+            &"a".repeat(40),
+            "--cpu-threads",
+            "100000",
+        ])
+        .unwrap();
+        let cfg_big = build_mining_config(&cli_big, false);
+        assert_eq!(cfg_big.cpu_threads, cli_big.cpu_threads.min(num_cpus_default()));
+        assert!(cfg_big.cpu_threads <= num_cpus_default());
+
+        // cpu_share is clamped to 0.0..=1.0. `=`-form avoids clap reading the
+        // leading '-' of a negative value as a flag.
+        let cli_hi = Cli::try_parse_from([
+            "csd-pool-miner",
+            "--address",
+            &"a".repeat(40),
+            "--cpu-share",
+            "2.0",
+        ])
+        .unwrap();
+        assert_eq!(build_mining_config(&cli_hi, false).cpu_share, 1.0, "share clamps up-bound to 1.0");
+
+        let cli_lo = Cli::try_parse_from([
+            "csd-pool-miner",
+            "--address",
+            &"a".repeat(40),
+            "--cpu-share=-0.5",
+        ])
+        .unwrap();
+        assert_eq!(build_mining_config(&cli_lo, false).cpu_share, 0.0, "share clamps low-bound to 0.0");
+    }
+
+    #[test]
+    fn build_gpu_watchdog_cfg_disabled_arm_is_always_off() {
+        // The CPU arm passes enabled=false; the watchdog must be off regardless of
+        // --no-gpu-watchdog (a CPU backend has no GPU to watch).
+        let cli = Cli::try_parse_from(["csd-pool-miner", "--address", &"a".repeat(40)]).unwrap();
+        assert!(!build_gpu_watchdog_cfg(&cli, false).enabled);
+
+        let cli_nowd = Cli::try_parse_from([
+            "csd-pool-miner",
+            "--address",
+            &"a".repeat(40),
+            "--no-gpu-watchdog",
+        ])
+        .unwrap();
+        assert!(!build_gpu_watchdog_cfg(&cli_nowd, false).enabled);
+    }
+
+    #[test]
+    fn build_gpu_watchdog_cfg_enabled_arm_honors_flag_and_maps_knobs() {
+        use std::time::Duration;
+
+        // GPU arm passes enabled=true; the master switch is then !--no-gpu-watchdog.
+        let cli = Cli::try_parse_from(["csd-pool-miner", "--address", &"a".repeat(40)]).unwrap();
+        let cfg = build_gpu_watchdog_cfg(&cli, true);
+        assert!(cfg.enabled, "GPU arm + no --no-gpu-watchdog ⇒ enabled");
+        // Defaults map straight from the CLI defaults.
+        assert_eq!(cfg.floor_ghs, 0.001);
+        assert_eq!(cfg.dwell_samples, 4);
+        assert_eq!(cfg.recover_window, Duration::from_secs(60));
+        assert_eq!(cfg.max_recoveries, 3);
+
+        // --no-gpu-watchdog forces enabled=false even on the GPU arm.
+        let cli_off = Cli::try_parse_from([
+            "csd-pool-miner",
+            "--address",
+            &"a".repeat(40),
+            "--no-gpu-watchdog",
+        ])
+        .unwrap();
+        assert!(!build_gpu_watchdog_cfg(&cli_off, true).enabled);
+
+        // The tuning knobs map from their flags (floor/dwell/recover-window/max).
+        let cli_tuned = Cli::try_parse_from([
+            "csd-pool-miner",
+            "--address",
+            &"a".repeat(40),
+            "--gpu-floor",
+            "0.5",
+            "--gpu-watchdog-dwell",
+            "7",
+            "--gpu-watchdog-recover-secs",
+            "120",
+            "--gpu-watchdog-max-recoveries",
+            "9",
+        ])
+        .unwrap();
+        let cfg_tuned = build_gpu_watchdog_cfg(&cli_tuned, true);
+        assert!(cfg_tuned.enabled);
+        assert_eq!(cfg_tuned.floor_ghs, 0.5);
+        assert_eq!(cfg_tuned.dwell_samples, 7);
+        assert_eq!(cfg_tuned.recover_window, Duration::from_secs(120));
+        assert_eq!(cfg_tuned.max_recoveries, 9);
     }
 }
