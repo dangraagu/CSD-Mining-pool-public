@@ -2,6 +2,13 @@
 
 ## v0.2.0 (unreleased) — the refactor release
 
+- launcher auto-restart on self-update — mine-auto.sh now re-execs the refreshed
+  launcher (staged handoff, fail-safe, no-brick) so a launcher/script update takes
+  effect without a manual restart (fixes the observed update-but-run-old bug). The
+  on-disk swap stays exec-free; a separate, multiply-guarded `reexec_new_launcher`
+  step applies it only on a real byte change (rc=0) — every guard (real-file only,
+  swap-time SHA re-verify, `bash -n`, bounded generation cap, execfail recovery)
+  fails safe to "keep running the old in-memory launcher, miners keep mining". [M4]
 - GPU device errors now surface (`hash_range` → `Err(DeviceError)`) and trigger
   in-process recovery + the GPU watchdog (heartbeat starved, no phantom hashrate
   from faulted sweeps) — was: silently mapped to the same `None` as a clean empty
