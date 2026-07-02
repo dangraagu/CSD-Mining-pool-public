@@ -2,6 +2,46 @@
 
 ## v0.2.0 (unreleased) — the refactor release
 
+### ⚠️ Behavior changes (operator-visible)
+
+- **No silent CPU fallback (default backend is now `cuda` on NVIDIA builds).**
+  Previously `--backend auto` could quietly degrade to CPU mining (kH/s) when the
+  GPU/driver was broken or absent — invisible hashrate bleed. Now the miner
+  HARD-ERRORS at startup instead and mines nothing until the GPU is fixed.
+  Deliberate CPU mining still works: pass `--backend cpu` (explicit) or
+  `--allow-cpu-fallback` (permits the auto→CPU descent). Healthy GPU rigs are
+  unaffected. HiveOS `h-run.sh` driver-check warnings updated to match.
+- **Auto-tune runs at every session start (default ON).** The full geometry sweep
+  (~10 candidates × 5 s ≈ 50 s, no shares submitted during it) now runs before
+  mining on every start, so each rig always mines on its measured-best geometry —
+  worth ~+7% on large cards vs the old fixed default (e.g. RTX 5070 Ti:
+  560×256×4096 ≈ 4.06 GH/s → 2048×256×1024+ ≈ 4.4–4.6 GH/s). Opt out with
+  `--no-auto-tune`, or pin `--blocks/--threads-per-block/--nonces-per-thread`
+  explicitly (an explicit geometry also suppresses the sweep). If a sweep fails,
+  the miner falls back to the last-known-good cached geometry, then the shipped
+  default — never a crash, never CPU.
+
+### Performance
+
+- **Multi-arch CUDA fatbin: native Blackwell (sm_120) SASS + universal
+  `compute_75` PTX fallback.** The embedded kernel is now a fatbin containing
+  exactly two images: a native `sm_120` cubin (`-maxrregcount=128`, ~+3–6% on
+  RTX 50-series over the JIT path) and the byte-identical, production-proven
+  `compute_75` PTX pinned at `.version 6.3`. The CUDA driver picks the native
+  image on Blackwell and JITs the PTX everywhere else — **every pre-Blackwell
+  card (e.g. RTX 2080) runs the exact same kernel image as v0.1.x**, and future
+  >sm_120 cards JIT the PTX too. No PTX with `.version > 6.3` is embedded, so
+  the old-driver `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` → silent-CPU trap cannot
+  fire. Bit-exact gated: `selftest` proves GPU==CPU sha256d on BOTH images
+  (native sm_120 and forced `compute_75` JIT) before any release. Built by
+  `scripts/build-fatbin.bat`; the fatbin is a committed artifact so CI/release
+  builds embed the exact verified bytes (no nvcc needed at CI time).
+  Residual note: the `compute_75` fallback is bit-exact-proven via forced JIT on
+  Blackwell (CUDA 13.2 driver); a live accepted-share run on physical Turing
+  hardware with an older driver has not yet been observed on this build.
+- Auto-tune candidate set gains large-card geometries `4096×256×512`
+  (5070 Ti winner, 4.60 GH/s) alongside `2048×256×1024`.
+
 - launcher auto-restart on self-update — mine-auto.sh now re-execs the refreshed
   launcher (staged handoff, fail-safe, no-brick) so a launcher/script update takes
   effect without a manual restart (fixes the observed update-but-run-old bug). The
