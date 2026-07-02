@@ -157,17 +157,45 @@ jobs:
       - name: Install Rust (stable)
         run: rustup toolchain install stable --profile minimal --no-self-update
 
+      # GLIBC PORTABILITY (v0.2.1 P0 fix): the linux binaries MUST run on stock
+      # HiveOS images, which ship glibc 2.27 (Ubuntu 18.04 base) / 2.31 (20.04).
+      # A plain `cargo build` on this runner links against the RUNNER's glibc
+      # (ubuntu-24.04 = 2.39) and the resulting binary hard-crashes on every
+      # stock HiveOS rig with "version 'GLIBC_2.39' not found" (exit 1, HiveOS
+      # relaunch loop) — this is exactly what broke the fleet on v0.2.0.
+      # cargo-zigbuild uses zig as the C compiler/linker, which can target an
+      # arbitrary glibc version; `--target x86_64-unknown-linux-gnu.2.27` pins
+      # the floor at 2.27 regardless of what glibc the runner image ships, so
+      # future runner migrations (24.04 -> 26.04 -> ...) can never re-break the
+      # fleet. The "glibc floor gate" step below fail-closes the release if any
+      # produced binary still requires a newer glibc.
+      # The pip package bundles the zig toolchain (ziglang wheel) — one install,
+      # no separate zig download. Output path note: a --target build lands in
+      # target/x86_64-unknown-linux-gnu/release/ (zigbuild strips the .2.27
+      # suffix for the directory), NOT target/release/.
+      - name: Install cargo-zigbuild + zig (glibc-2.27-portable linux builds)
+        run: |
+          set -euo pipefail
+          # Plain install first; --break-system-packages fallback covers a
+          # PEP-668 "externally managed" python (harmless where not needed).
+          pip3 install cargo-zigbuild || pip3 install --break-system-packages cargo-zigbuild
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          cargo-zigbuild --version
+          python3 -m ziglang version
+          rustup target add x86_64-unknown-linux-gnu
+
       - name: Prepare dist folder
         run: mkdir -p dist
 
       - name: Build CPU (always works, no GPU deps)
         run: |
-          cargo build --release
-          cp target/release/csd-gpu-miner dist/csd-pool-miner-linux-cpu
+          cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.27
+          cp target/x86_64-unknown-linux-gnu/release/csd-gpu-miner dist/csd-pool-miner-linux-cpu
           # IMPORTANT (HiveOS bundling fix): the NVIDIA and AMD builds below
-          # OVERWRITE target/release/csd-gpu-miner in place (same output path,
-          # built sequentially). If the HiveOS "Package" step later copies
-          # target/release/csd-gpu-miner it gets the LAST build (= the AMD/opencl
+          # OVERWRITE target/x86_64-unknown-linux-gnu/release/csd-gpu-miner in
+          # place (same output path, built sequentially). If the HiveOS "Package"
+          # step later copies that path it gets the LAST build (= the AMD/opencl
           # binary) and ships it to EVERY rig — so an NVIDIA rig boots an opencl
           # binary ("cuda=false opencl=true" under --backend cuda). Preserve the
           # CPU build to a stable, never-overwritten path NOW and bundle THAT as
@@ -176,7 +204,7 @@ jobs:
           # fetches+verifies+swaps the correct GPU variant for the flightsheet
           # --backend on first boot. A fetch failure leaves the rig on this working
           # CPU seed (still mining) — never bricked.
-          cp target/release/csd-gpu-miner csd-gpu-miner-hiveos-seed
+          cp target/x86_64-unknown-linux-gnu/release/csd-gpu-miner csd-gpu-miner-hiveos-seed
 
       # NVIDIA: the CUDA backend embeds a pre-built PTX and JITs it via the driver,
       # so this build needs NO CUDA Toolkit on the runner (cudarc dlopens the driver
@@ -184,18 +212,92 @@ jobs:
       - name: Build NVIDIA (cuda + nvml telemetry)
         continue-on-error: true
         run: |
-          cargo build --release --features cuda,nvml
-          cp target/release/csd-gpu-miner dist/csd-pool-miner-linux-nvidia
+          cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.27 --features cuda,nvml
+          cp target/x86_64-unknown-linux-gnu/release/csd-gpu-miner dist/csd-pool-miner-linux-nvidia
 
       - name: Install OpenCL loader + headers (for the AMD build)
         continue-on-error: true
         run: sudo apt-get update && sudo apt-get install -y ocl-icd-opencl-dev
 
+      # AMD/OpenCL under zigbuild: opencl3 -> cl3 -> opencl-sys emits
+      # `rustc-link-lib=OpenCL`, i.e. libOpenCL is linked at BUILD time (unlike
+      # cudarc/nvml, which dlopen at runtime). zig's linker does not search the
+      # host's /usr/lib/x86_64-linux-gnu (deliberately — that dir also holds the
+      # runner's glibc-2.39 linker scripts, exactly what we must NOT link), so
+      # stage ONLY the ICD loader stub (libOpenCL.so*) into a clean dir and -L
+      # that. The stub is just the dispatch loader — the binary records a
+      # DT_NEEDED on libOpenCL.so.1 and resolves the rig's OWN loader/driver at
+      # runtime, so linking the runner's stub is exactly what the old
+      # non-zigbuild step did, minus the glibc contamination.
+      # RUSTFLAGS NOTE: the env var REPLACES .cargo/config.toml [build]
+      # rustflags (cargo precedence — they do not merge), so the three
+      # remap-path-prefix scrub flags from that file are repeated here to keep
+      # the AMD build's panic-metadata scrub identical to the other variants'
+      # (no-ops on the runner's /home/runner paths, load-bearing for local
+      # builds; the same prefixes are already committed in .cargo/config.toml).
+      # --allow-shlib-undefined NOTE: the runner's libOpenCL.so stub is itself
+      # built against the RUNNER's glibc (references e.g. dlclose@GLIBC_2.34),
+      # and zig's lld links with --no-allow-shlib-undefined by default, so
+      # targeting 2.27 while linking a 2.39-vintage stub hard-errors on the
+      # STUB's own internal references. Those are the stub's runtime deps —
+      # on a rig, the rig's own libOpenCL.so.1 resolves against the rig's own
+      # glibc (self-consistent pairing), never against ours. The flag only
+      # relaxes undefined-symbol checking for symbols inside shared libs; OUR
+      # binary's own undefined symbols still fail the link, and the glibc
+      # floor gate below still proves OUR binary's max GLIBC need <= 2.27.
       - name: Build AMD (opencl)
         continue-on-error: true
         run: |
-          cargo build --release --features opencl
-          cp target/release/csd-gpu-miner dist/csd-pool-miner-linux-amd
+          mkdir -p ocl-stub
+          cp -a /usr/lib/x86_64-linux-gnu/libOpenCL.so* ocl-stub/
+          RUSTFLAGS="--remap-path-prefix=C:\Users\bahs_admin=/build --remap-path-prefix=/c/Users/bahs_admin=/build --remap-path-prefix=/mnt/c/Users/bahs_admin=/build -L native=$PWD/ocl-stub -C link-arg=-Wl,--allow-shlib-undefined" \
+            cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.27 --features opencl
+          cp target/x86_64-unknown-linux-gnu/release/csd-gpu-miner dist/csd-pool-miner-linux-amd
+
+      # GLIBC FLOOR GATE (v0.2.1, permanent): fail-closed proof that every linux
+      # miner binary built above runs on stock HiveOS (glibc >= 2.27). objdump -T
+      # lists every versioned glibc symbol the binary needs; the max of those is
+      # the OLDEST glibc the binary can run on. If ANY binary needs > 2.27 the
+      # release is BLOCKED — this is what prevents a repeat of v0.2.0, where
+      # runner-glibc-2.39 binaries shipped and crash-looped the whole HiveOS
+      # fleet ("version 'GLIBC_2.39' not found"). The gate is independent of HOW
+      # the binaries are built, so a future runner migration or a zigbuild
+      # regression cannot silently ship an incompatible binary again.
+      # DELIBERATELY EXEMPT: dist/csd-relay-node — it is a prebuilt pinned asset
+      # fetched below (not built here) and its glibc floor is a known separate
+      # pre-existing issue; gating it here would only block miner hotfixes.
+      - name: glibc floor gate (fail-closed, all linux miner binaries)
+        run: |
+          set -euo pipefail
+          FLOOR="2.27"
+          shopt -s nullglob
+          files=(dist/csd-pool-miner-linux-*)
+          # The HiveOS seed is byte-identical to the CPU binary, but gate it
+          # explicitly too — it is the binary every fresh HiveOS install boots.
+          if [ -f csd-gpu-miner-hiveos-seed ]; then
+            files+=(csd-gpu-miner-hiveos-seed)
+          fi
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::glibc floor gate: no dist/csd-pool-miner-linux-* binaries found — refusing to pass an empty gate (fail-closed)."
+            exit 1
+          fi
+          fail=0
+          for f in "${files[@]}"; do
+            max="$(objdump -T "$f" | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -1)"
+            if [ -z "$max" ]; then
+              echo "::error::glibc floor gate: could not extract any GLIBC_* version need from $f — failing closed."
+              fail=1
+              continue
+            fi
+            highest="$(printf '%s\nGLIBC_%s\n' "$max" "$FLOOR" | sort -V | tail -1)"
+            if [ "$highest" != "GLIBC_$FLOOR" ]; then
+              echo "::error::glibc floor gate: $f requires $max (> GLIBC_$FLOOR) — would crash-loop on stock HiveOS (glibc 2.27/2.31). Build it with cargo zigbuild --target x86_64-unknown-linux-gnu.2.27."
+              fail=1
+            else
+              echo "glibc floor gate OK: $f (max GLIBC need: $max <= $FLOOR)"
+            fi
+          done
+          exit "$fail"
 
       # SP2: Fetch the pre-built csd-relay-node Linux binary from the pinned csd2
       # release. This binary is NOT built here — it is the csd-node produced by the
@@ -299,17 +401,18 @@ jobs:
           chmod +x "$STAGE"/csd-dashboard.sh
           # The HiveOS binary must be named csd-gpu-miner (the manifest CUSTOM_BIN).
           # Bundle the PRESERVED CPU seed (csd-gpu-miner-hiveos-seed), NOT
-          # target/release/csd-gpu-miner — the latter is whatever variant was built
-          # LAST (AMD/opencl), which is wrong for NVIDIA/CPU rigs. The CPU seed runs
-          # on any card (no GPU/driver dep) and is brick-safe; h-run.sh's startup
-          # check swaps in the correct GPU variant for the flightsheet --backend.
-          # Fall back to target/release/csd-gpu-miner only if the seed is missing
-          # (should not happen — the CPU build always succeeds and runs first).
+          # target/x86_64-unknown-linux-gnu/release/csd-gpu-miner — the latter is
+          # whatever variant was built LAST (AMD/opencl), which is wrong for
+          # NVIDIA/CPU rigs. The CPU seed runs on any card (no GPU/driver dep) and
+          # is brick-safe; h-run.sh's startup check swaps in the correct GPU
+          # variant for the flightsheet --backend. Fall back to the target-dir
+          # binary only if the seed is missing (should not happen — the CPU build
+          # always succeeds and runs first).
           if [ -f csd-gpu-miner-hiveos-seed ]; then
             cp csd-gpu-miner-hiveos-seed "$STAGE"/csd-gpu-miner
           else
-            echo "::warning::HiveOS seed csd-gpu-miner-hiveos-seed missing — falling back to target/release/csd-gpu-miner (may be the wrong variant)."
-            cp target/release/csd-gpu-miner "$STAGE"/csd-gpu-miner
+            echo "::warning::HiveOS seed csd-gpu-miner-hiveos-seed missing — falling back to target/x86_64-unknown-linux-gnu/release/csd-gpu-miner (may be the wrong variant)."
+            cp target/x86_64-unknown-linux-gnu/release/csd-gpu-miner "$STAGE"/csd-gpu-miner
           fi
           chmod +x "$STAGE"/csd-gpu-miner
           # Ship the variant marker so a fresh install KNOWS its bundled seed is the
