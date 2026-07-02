@@ -65,6 +65,16 @@
 #     so h-stats.sh can scrape /1/summary on localhost only (never exposed).
 # Everything else (address via --config, --backend, --gpu-id, …) comes from
 # h-config.sh's output. The pool endpoint is compiled in and not configurable.
+#
+# GLUE SELF-UPDATE — DELIBERATELY ABSENT (v0.2.0 decision, do not "fix"):
+# the sidecar swaps only the miner BINARY; it does NOT refresh this script or
+# the h-config/h-stats/h-stop set. Reasons: (1) the sidecar runs on function
+# copies exported from the OLD h-run.sh, so a lone h-run swap can version-skew
+# the package-managed glue set; (2) the exec-rename hazard above makes
+# self-replacement risky with no supervisor to catch a bad script. The
+# documented glue-update channel stays "re-apply the flight sheet"; binary
+# features (e.g. the worker-name suffix + subscribe UA) reach HiveOS rigs via
+# the verified sidecar binary swap + slot relaunch.
 
 cd "$(dirname "$0")" || exit 1
 # shellcheck source=/dev/null
