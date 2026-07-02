@@ -61,6 +61,25 @@ pub struct Cli {
     #[arg(long)]
     address: Option<String>,
 
+    /// Optional rig/worker name for per-rig visibility on the pool dashboard.
+    /// Appended to the payout address as the Stratum username
+    /// ("<address>.<worker>") in `mining.authorize` and every `mining.submit`.
+    /// DISPLAY-ONLY: the pool credits the payout address exactly as if it were
+    /// bare — the rig name never affects PPLNS/payouts. Sanitized to
+    /// [A-Za-z0-9_-], max 24 chars (anything after a '.' is dropped).
+    /// Precedence when unset: env `CSD_WORKER` > env `WORKER_NAME` (HiveOS) >
+    /// this machine's hostname; if nothing resolves, the bare address is used
+    /// (identical to older miners). See also `--no-worker`.
+    #[arg(long)]
+    worker: Option<String>,
+
+    /// Disable the rig-name suffix entirely (also via env `CSD_NO_WORKER=1`):
+    /// authorize as the BARE payout address, exactly like pre-0.2.0 miners.
+    /// Use this against a pool bridge that predates rig-name support (an old
+    /// bridge rejects a dotted username at authorize).
+    #[arg(long, default_value_t = false)]
+    no_worker: bool,
+
     /// Telemetry: serve an xmrig-compatible `/1/summary` JSON endpoint on this
     /// port (plus `/healthz`) for dashboards/monitoring. Omitted ⇒ no server.
     #[arg(long)]
@@ -330,6 +349,109 @@ fn validate_address(addr: &str) -> Result<String> {
         bail!("--address must be lowercase hex (0-9, a-f); got {addr:?}");
     }
     Ok(body.to_string())
+}
+
+/// Maximum length (chars) of a sanitized rig/worker name. Keeps the Stratum
+/// username bounded; matches the pool-side display cap.
+const RIG_NAME_MAX: usize = 24;
+
+/// Sanitize a raw rig/worker-name candidate into a pool-safe rig label:
+/// trim whitespace, keep only the part BEFORE the first `.` (so a FQDN
+/// hostname like `rig1.local` becomes `rig1` and the label can never inject an
+/// extra Stratum-username separator), drop every char outside `[A-Za-z0-9_-]`,
+/// and truncate to [`RIG_NAME_MAX`]. Returns `None` when nothing valid
+/// survives — the caller then falls back to the bare payout address (today's
+/// exact wire behavior), so a weird hostname can NEVER break authorize.
+/// Pure (no I/O) and unit-tested.
+fn sanitize_rig(raw: &str) -> Option<String> {
+    let first = raw.trim().split('.').next().unwrap_or("");
+    let cleaned: String = first
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+        .take(RIG_NAME_MAX)
+        .collect();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+/// Pure precedence resolver: the first candidate (in order) that sanitizes to
+/// a valid rig label wins; an absent or unsalvageable candidate falls through
+/// to the next. `None` when no candidate survives.
+fn resolve_rig_from(candidates: &[Option<&str>]) -> Option<String> {
+    candidates.iter().find_map(|c| c.and_then(sanitize_rig))
+}
+
+/// I/O wrapper around [`resolve_rig_from`]: resolve the rig name with
+/// precedence `--worker` flag > env `CSD_WORKER` > env `WORKER_NAME` (HiveOS)
+/// > this machine's hostname. Every candidate goes through [`sanitize_rig`];
+/// `None` (no rig anywhere) means "authorize as the bare address".
+fn resolve_rig(flag: Option<&str>) -> Option<String> {
+    let csd_worker = std::env::var("CSD_WORKER").ok();
+    let hive_worker = std::env::var("WORKER_NAME").ok();
+    let host = hostname_fallback();
+    resolve_rig_from(&[
+        flag,
+        csd_worker.as_deref(),
+        hive_worker.as_deref(),
+        host.as_deref(),
+    ])
+}
+
+/// Best-effort, dependency-free hostname lookup, FAIL-SAFE to `None` (which
+/// downstream means "no rig suffix", never an error): env `COMPUTERNAME`
+/// (Windows) / `HOSTNAME`, else `/etc/hostname`, else the `hostname` command.
+fn hostname_fallback() -> Option<String> {
+    for var in ["COMPUTERNAME", "HOSTNAME"] {
+        if let Ok(v) = std::env::var(var) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    if let Ok(s) = std::fs::read_to_string("/etc/hostname") {
+        let s = s.trim();
+        if !s.is_empty() {
+            return Some(s.to_string());
+        }
+    }
+    if let Ok(out) = std::process::Command::new("hostname").output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+/// Build the Stratum username the pool sees: `"<address>.<rig>"`, or the bare
+/// address when no rig resolved. PAYOUT INVARIANT (display-only rig): the part
+/// before the first `.` is ALWAYS the validated payout address, byte-identical
+/// — the pool strips the suffix before any money-path key, so `<addr>.<rig>`
+/// credits exactly like a bare `<addr>`. Pure and unit-tested.
+fn stratum_username(address: &str, rig: Option<&str>) -> String {
+    match rig {
+        Some(r) => format!("{address}.{r}"),
+        None => address.to_string(),
+    }
+}
+
+/// Is the rig-name suffix enabled? ON by default; disabled by `--no-worker` OR
+/// the env var `CSD_NO_WORKER=1`. Mirrors [`suggest_diff_enabled`] so the
+/// kill-switch precedence is obvious and unit-testable.
+fn worker_suffix_enabled(cli: &Cli) -> bool {
+    if cli.no_worker {
+        return false;
+    }
+    !matches!(
+        std::env::var("CSD_NO_WORKER").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes")
+    )
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -737,6 +859,11 @@ fn merge_config(cli: &mut Cli, matches: &clap::ArgMatches, file: config_file::Fi
     if cli.address.is_none() {
         cli.address = file.address;
     }
+    // `worker` has no clap default (like `address`), so the file value fills it
+    // only when the flag is absent.
+    if cli.worker.is_none() {
+        cli.worker = file.worker;
+    }
     if !explicit("backend") {
         if let Some(s) = file.backend.as_deref() {
             match parse_backend(s) {
@@ -1020,16 +1147,41 @@ fn run_mining(
         });
     }
 
+    // Resolve the optional rig/worker name and build the Stratum username the
+    // pool sees. This is the SINGLE injection point: the same string flows into
+    // the authorize handshake, every mining.submit (via `worker_addr()`), every
+    // reconnect re-handshake, and the stats `worker_id` — so rig identity can
+    // never diverge between them. The rig label is DISPLAY-ONLY: `address`
+    // (the validated bare payout address) is what the pool credits.
+    //
+    // ⚠ DEPLOY ORDER (BRIDGE-FIRST): a pool bridge that predates rig-name
+    // support validates the WHOLE authorize username as a 40-hex address and
+    // REJECTS "<addr>.<rig>" (error 24) — the miner would then never mine. The
+    // rig-suffix-aware bridge MUST be deployed before this miner is released
+    // to the fleet. Per-rig off-switch: `--no-worker` / `CSD_NO_WORKER=1`.
+    let rig = if worker_suffix_enabled(cli) {
+        resolve_rig(cli.worker.as_deref())
+    } else {
+        tracing::info!(
+            "worker: rig-name suffix disabled (--no-worker / CSD_NO_WORKER=1); authorizing as the bare address"
+        );
+        None
+    };
+    let stratum_user = stratum_username(&address, rig.as_deref());
+
     // The pool endpoint is compiled in and cannot be overridden: the shipped
     // binary always mines to the official pool. `connect_failover` still takes a
     // list, so we hand it the single baked-in endpoint.
     let endpoints = vec![endpoint::pool_endpoint()];
     let endpoint = endpoints[0].clone();
-    tracing::info!("csd-pool-miner: connecting to pool {endpoint} as address {address}");
+    tracing::info!(
+        "csd-pool-miner: connecting to pool {endpoint} as address {address} (worker: {})",
+        rig.as_deref().unwrap_or("<none — bare address>")
+    );
     // Hand the full ordered list to the client so the reader's reconnect path can
     // fail over to a backup pool (and fail back to the primary). With one
     // endpoint this is the same single-pool, no-failover behavior as before.
-    let mut client = StratumClient::connect_failover(&endpoints, &address)
+    let mut client = StratumClient::connect_failover(&endpoints, &stratum_user)
         .map_err(|e| anyhow::anyhow!("failed to connect to pool {endpoint}: {e}"))?;
 
     // G6: wire the Discord notifier into the pool client (the 30s heartbeat posts
@@ -1051,8 +1203,12 @@ fn run_mining(
     } else {
         None
     };
+    // The stats `worker_id` mirrors the Stratum username (address.rig when a
+    // rig resolved), so dashboards see the same identity the pool sees. The
+    // HiveOS h-stats mapping does not key on worker_id, and csd-dashboard only
+    // displays it.
     let _stats_server = match &stats_handle {
-        Some(handle) => Some(spawn_stats(handle.clone(), &address, cli, &stop)?),
+        Some(handle) => Some(spawn_stats(handle.clone(), &stratum_user, cli, &stop)?),
         None => None,
     };
 
@@ -1491,8 +1647,9 @@ fn ctrlc_lite<F: Fn() + Send + 'static>(handler: F) {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_gpu_watchdog_cfg, build_mining_config, num_cpus_default, suggest_diff_enabled,
-        validate_address, Cli,
+        build_gpu_watchdog_cfg, build_mining_config, num_cpus_default, resolve_rig_from,
+        sanitize_rig, stratum_username, suggest_diff_enabled, validate_address,
+        worker_suffix_enabled, Cli,
     };
     use clap::Parser;
     use std::sync::Mutex;
@@ -1569,6 +1726,198 @@ mod tests {
             Some(v) => std::env::set_var("CSD_NO_SUGGEST_DIFF", v),
             None => std::env::remove_var("CSD_NO_SUGGEST_DIFF"),
         }
+    }
+
+    // --- worker/rig name (mining.authorize "<address>.<rig>") ----------------
+
+    #[test]
+    fn sanitize_rig_keeps_simple_names_verbatim() {
+        assert_eq!(sanitize_rig("rig1").as_deref(), Some("rig1"));
+        assert_eq!(sanitize_rig("GPU-box_02").as_deref(), Some("GPU-box_02"));
+    }
+
+    #[test]
+    fn sanitize_rig_takes_part_before_first_dot() {
+        // A FQDN-ish hostname must never inject extra '.' separators into the
+        // Stratum username (the pool splits the payout address on the FIRST
+        // '.', so the rig label itself must be dot-free).
+        assert_eq!(sanitize_rig("rig1.local").as_deref(), Some("rig1"));
+        assert_eq!(sanitize_rig("a.b.c").as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn sanitize_rig_filters_to_allowed_charset() {
+        // Anything outside [A-Za-z0-9_-] is dropped, never substituted.
+        assert_eq!(sanitize_rig("my rig!#7").as_deref(), Some("myrig7"));
+        assert_eq!(sanitize_rig("kjøkken-rig").as_deref(), Some("kjkken-rig"));
+        // Whitespace is trimmed before the first-dot split.
+        assert_eq!(sanitize_rig("  rig2  ").as_deref(), Some("rig2"));
+    }
+
+    #[test]
+    fn sanitize_rig_truncates_to_24_chars() {
+        let long = "a".repeat(40);
+        let got = sanitize_rig(&long).unwrap();
+        assert_eq!(got.len(), 24);
+        assert_eq!(got, "a".repeat(24));
+    }
+
+    #[test]
+    fn sanitize_rig_nothing_valid_is_none() {
+        // An authorize-breaking candidate must resolve to None (bare-address
+        // fallback = today's exact behavior), never to an empty/garbage label.
+        assert_eq!(sanitize_rig(""), None);
+        assert_eq!(sanitize_rig("   "), None);
+        assert_eq!(sanitize_rig("..."), None);
+        assert_eq!(sanitize_rig(".rig"), None); // empty before the first dot
+        assert_eq!(sanitize_rig("!!!"), None);
+    }
+
+    #[test]
+    fn resolve_rig_from_first_valid_candidate_wins() {
+        // Precedence list is ordered: --worker flag > CSD_WORKER > WORKER_NAME
+        // > hostname. The first candidate that SANITIZES to something wins.
+        assert_eq!(
+            resolve_rig_from(&[Some("flagrig"), Some("envrig"), Some("host")]).as_deref(),
+            Some("flagrig")
+        );
+        // An all-invalid candidate falls through to the next one.
+        assert_eq!(
+            resolve_rig_from(&[Some("..."), Some("envrig")]).as_deref(),
+            Some("envrig")
+        );
+        // Absent candidates are skipped.
+        assert_eq!(
+            resolve_rig_from(&[None, None, Some("host.domain")]).as_deref(),
+            Some("host")
+        );
+        // Nothing valid anywhere -> None (bare address).
+        assert_eq!(resolve_rig_from(&[None, Some("!!!"), None]), None);
+        assert_eq!(resolve_rig_from(&[]), None);
+    }
+
+    #[test]
+    fn stratum_username_appends_rig_after_a_dot() {
+        let addr = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            stratum_username(addr, Some("rig1")),
+            format!("{addr}.rig1")
+        );
+    }
+
+    #[test]
+    fn stratum_username_without_rig_is_byte_identical_to_address() {
+        // MONEY-PATH INVARIANT: with no rig the username IS the bare validated
+        // payout address, byte-identical — exactly what pre-0.2.0 miners send.
+        let addr = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(stratum_username(addr, None), addr);
+    }
+
+    #[test]
+    fn stratum_username_payout_address_recoverable_before_first_dot() {
+        // MONEY-PATH INVARIANT: whatever rig label is appended, splitting the
+        // username on the FIRST '.' must recover the payout address
+        // byte-identically — "<addr>.<rig>" must credit exactly like "<addr>".
+        let addr = "0123456789abcdef0123456789abcdef01234567";
+        for rig in [None, Some("rig1"), Some("a-b_C9")] {
+            let user = stratum_username(addr, rig);
+            assert_eq!(user.split('.').next().unwrap(), addr);
+        }
+        // And a sanitized rig can never smuggle a '.' in (sanitize_rig strips
+        // at the first dot), so the split is unambiguous.
+        assert!(!sanitize_rig("rig.local").unwrap().contains('.'));
+    }
+
+    #[test]
+    fn worker_flags_parse_with_sane_defaults() {
+        // Default run: no --worker (rig resolution falls to env/hostname),
+        // suffix enabled (kill-switch off).
+        let cli = Cli::try_parse_from(["csd-pool-miner", "--address", &"a".repeat(40)]).unwrap();
+        assert_eq!(cli.worker, None);
+        assert!(!cli.no_worker, "rig-name suffix is ON by default");
+
+        // --worker names the rig; --no-worker flips the kill switch.
+        let cli = Cli::try_parse_from([
+            "csd-pool-miner",
+            "--address",
+            &"a".repeat(40),
+            "--worker",
+            "rig1",
+            "--no-worker",
+        ])
+        .unwrap();
+        assert_eq!(cli.worker.as_deref(), Some("rig1"));
+        assert!(cli.no_worker);
+    }
+
+    #[test]
+    fn worker_suffix_enabled_default_on_flag_off() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("CSD_NO_WORKER");
+        let cli = Cli::try_parse_from(["csd-pool-miner", "--address", &"a".repeat(40)]).unwrap();
+        assert!(worker_suffix_enabled(&cli), "default must be ENABLED");
+
+        let cli = Cli::try_parse_from([
+            "csd-pool-miner",
+            "--address",
+            &"a".repeat(40),
+            "--no-worker",
+        ])
+        .unwrap();
+        assert!(!worker_suffix_enabled(&cli), "--no-worker must disable");
+    }
+
+    #[test]
+    fn worker_suffix_enabled_env_kill_switch() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("CSD_NO_WORKER").ok();
+        let cli = Cli::try_parse_from(["csd-pool-miner", "--address", &"a".repeat(40)]).unwrap();
+
+        std::env::set_var("CSD_NO_WORKER", "1");
+        assert!(!worker_suffix_enabled(&cli), "env=1 must disable");
+
+        std::env::set_var("CSD_NO_WORKER", "0");
+        assert!(worker_suffix_enabled(&cli), "env=0 must NOT disable");
+
+        std::env::remove_var("CSD_NO_WORKER");
+        assert!(worker_suffix_enabled(&cli), "no env var => enabled");
+
+        match prev {
+            Some(v) => std::env::set_var("CSD_NO_WORKER", v),
+            None => std::env::remove_var("CSD_NO_WORKER"),
+        }
+    }
+
+    #[test]
+    fn merge_config_worker_file_fills_only_when_flag_absent() {
+        use clap::{CommandFactory, FromArgMatches};
+
+        // No --worker on the CLI -> the config-file value fills it.
+        let matches = Cli::command()
+            .get_matches_from(["csd-pool-miner", "--address", &"a".repeat(40)]);
+        let mut cli = Cli::from_arg_matches(&matches).unwrap();
+        let file = super::config_file::FileConfig {
+            worker: Some("filerig".to_string()),
+            ..Default::default()
+        };
+        super::merge_config(&mut cli, &matches, file);
+        assert_eq!(cli.worker.as_deref(), Some("filerig"));
+
+        // --worker on the CLI wins over the config file (CLI > file > default).
+        let matches = Cli::command().get_matches_from([
+            "csd-pool-miner",
+            "--address",
+            &"a".repeat(40),
+            "--worker",
+            "flagrig",
+        ]);
+        let mut cli = Cli::from_arg_matches(&matches).unwrap();
+        let file = super::config_file::FileConfig {
+            worker: Some("filerig".to_string()),
+            ..Default::default()
+        };
+        super::merge_config(&mut cli, &matches, file);
+        assert_eq!(cli.worker.as_deref(), Some("flagrig"));
     }
 
     #[test]

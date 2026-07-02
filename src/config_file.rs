@@ -22,6 +22,10 @@ use serde::Deserialize;
 pub struct FileConfig {
     /// addr20 payout address (40 lowercase hex, optional `0x` prefix).
     pub address: Option<String>,
+    /// Optional rig/worker name (display-only; appended to the address as the
+    /// pool worker name "<address>.<worker>"). Sanitized by the binary to
+    /// [A-Za-z0-9_-], max 24 chars.
+    pub worker: Option<String>,
     /// "auto" | "cpu" | "opencl" | "cuda".
     pub backend: Option<String>,
     /// CPU-backend hashing threads (unset = all cores minus `reserve`).
@@ -123,6 +127,7 @@ mod tests {
     fn parses_a_full_config() {
         let s = r#"
             address = "192cf2af290bbcb05d7f389b4f83b56347de2cfa"
+            worker = "rig1"
             backend = "cuda"
             cpu_threads = 0
             cpu_share = 0.25
@@ -130,6 +135,7 @@ mod tests {
         "#;
         let c: FileConfig = toml::from_str(s).unwrap();
         assert_eq!(c.address.as_deref(), Some("192cf2af290bbcb05d7f389b4f83b56347de2cfa"));
+        assert_eq!(c.worker.as_deref(), Some("rig1"));
         assert_eq!(c.backend.as_deref(), Some("cuda"));
         assert_eq!(c.cpu_threads, Some(0));
         assert_eq!(c.cpu_share, Some(0.25));
@@ -143,6 +149,7 @@ mod tests {
     fn empty_config_is_all_none() {
         let c: FileConfig = toml::from_str("").unwrap();
         assert!(c.address.is_none() && c.cpu_threads.is_none() && c.backend.is_none());
+        assert!(c.worker.is_none());
     }
 
     #[test]

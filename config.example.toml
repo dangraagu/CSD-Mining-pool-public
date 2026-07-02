@@ -14,6 +14,13 @@
 # and you can start the miner with no --address flag.
 #address = "your40charhexaddr20goeshere0000000000000"
 
+# Optional rig/worker name, shown per-rig on the pool dashboard. Appended to the
+# address as the pool worker name ("<address>.<worker>"). DISPLAY-ONLY — payouts
+# always go to the bare address. Allowed chars A-Za-z0-9_- (max 24). If unset,
+# the miner falls back to env CSD_WORKER, then WORKER_NAME, then this machine's
+# hostname; disable entirely with --no-worker / CSD_NO_WORKER=1.
+#worker = "rig1"
+
 # Backend: "auto" (default: cuda -> opencl -> cpu), "cpu", "opencl", or "cuda".
 #backend = "auto"
 

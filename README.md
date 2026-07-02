@@ -127,6 +127,22 @@ Auto-detect is the default. To force one:
 "$MINER" selftest        # cross-check every backend vs the reference CPU hasher + probe pool reachability
 ```
 
+### Rig / worker name (per-rig dashboard stats)
+
+Give each rig a name and the pool dashboard shows it per-rig instead of lumping
+every machine under one address:
+
+```sh
+"$MINER" --address <YOUR_ADDR20> --worker rig1
+```
+
+The name is sent as the Stratum worker (`<address>.rig1`) — **display-only,
+payouts always go to the bare address**. Allowed chars `A-Za-z0-9_-`, max 24
+(anything else is dropped; a `.suffix` is cut). If you don't pass `--worker`,
+the miner falls back to env `CSD_WORKER`, then `WORKER_NAME` (HiveOS), then
+this machine's hostname. Turn the suffix off entirely (authorize as the bare
+address, like older miners) with `--no-worker` or `CSD_NO_WORKER=1`.
+
 ## Monitoring (stats endpoint + Discord)
 
 Expose an **xmrig-`/1/summary`-compatible** JSON endpoint for dashboards
@@ -253,6 +269,8 @@ minimal example:
 
 ```toml
 address = "your40charhexaddr20goeshere0000000000000"
+# Optional rig name for per-rig dashboard stats (display-only; see --worker).
+worker = "rig1"
 # CPU threads to mine ALONGSIDE the GPU (dual mining). 0 = GPU-only.
 cpu_threads = 0
 ```
