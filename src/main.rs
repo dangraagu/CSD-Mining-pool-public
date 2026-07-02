@@ -106,9 +106,22 @@ pub struct Cli {
     #[arg(long)]
     discord_solutions_only: bool,
 
-    /// Backend to use.
-    #[arg(long, default_value = "auto")]
-    backend: BackendChoice,
+    /// Backend to use. Defaults to `cuda` (not `auto`): the shipped fleet
+    /// command targets a GPU, and a GPU that fails to init must HARD-ERROR
+    /// (non-zero exit, clear log) rather than silently degrade to CPU — a
+    /// silent CPU fallback bleeds fleet hashrate invisibly. Use `--backend auto`
+    /// (optionally with `--allow-cpu-fallback`) to opt into probing, or
+    /// `--backend cpu` to force CPU explicitly.
+    #[arg(long, default_value = "cuda")]
+    pub backend: BackendChoice,
+
+    /// Allow silent fallback to the CPU backend when no GPU backend initializes
+    /// (`--backend auto` only). OFF by default: a GPU that fails to load
+    /// HARD-ERRORS instead of quietly CPU-mining (which bleeds fleet hashrate
+    /// invisibly). `--backend cpu` (explicit) is unaffected — that is a
+    /// deliberate operator choice, never "silent".
+    #[arg(long, default_value_t = false)]
+    pub allow_cpu_fallback: bool,
 
     /// Total CPU threads to use for hashing in the CPU backend (or
     /// fallback). Defaults to all logical cores minus `--reserve`.
@@ -144,8 +157,21 @@ pub struct Cli {
     /// `--blocks/--threads-per-block/--nonces-per-thread` are ignored for the
     /// GPU when this runs (it picks them). Adds the tune time to startup
     /// (≈ candidates × `--auto-tune-secs`).
+    ///
+    /// v0.2.0: ON by DEFAULT — the sweep runs at EVERY mining-session start so
+    /// each rig re-picks the fastest geometry for its current card/clocks. The
+    /// ~50s zero-share startup window is accepted. Suppress with
+    /// `--no-auto-tune`, or by pinning an explicit
+    /// `--blocks/--threads-per-block/--nonces-per-thread`.
+    #[arg(long, default_value_t = true)]
+    pub auto_tune: bool,
+
+    /// Skip the startup geometry sweep; use the cached-for-this-card geometry
+    /// if present, else the shipped default (or explicit `--blocks/...` if
+    /// given). For debugging / pinned geometry. Overrides the default-on
+    /// auto-tune (`--no-auto-tune` wins over the default `--auto-tune`).
     #[arg(long, default_value_t = false)]
-    auto_tune: bool,
+    pub no_auto_tune: bool,
 
     /// Auto-tune: seconds to benchmark EACH candidate geometry (and the per-run
     /// duration of the `bench` subcommand). Longer = steadier numbers, slower
@@ -310,7 +336,7 @@ pub struct Cli {
     /// explicitly. A persisted auto-tune geometry is only auto-reused when this
     /// is false, so an explicit geometry override always wins over the cache.
     #[arg(skip)]
-    geometry_set_explicitly: bool,
+    pub geometry_set_explicitly: bool,
 
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -328,6 +354,41 @@ impl Cli {
             self.run_as_service,
         )
     }
+
+    /// Effective auto-tune decision. The startup geometry sweep runs by DEFAULT
+    /// every start (v0.2.0), UNLESS suppressed by `--no-auto-tune` OR an
+    /// explicit pinned geometry (`--blocks/--threads-per-block/
+    /// --nonces-per-thread`, recorded in `geometry_set_explicitly` by `main()`).
+    ///
+    /// Pure → unit-tested at the CLI surface without a GPU. `--no-auto-tune`
+    /// wins over the default-on `--auto-tune`; a pinned geometry is a
+    /// first-class escape hatch (the operator asked for a specific launch shape,
+    /// so honour it rather than re-sweeping).
+    pub fn should_auto_tune(&self) -> bool {
+        self.auto_tune && !self.no_auto_tune && !self.geometry_set_explicitly
+    }
+}
+
+/// Geometry to use after the startup sweep FAILS: prefer the last-known-good
+/// CACHED geometry for this card if one is present, else the shipped DEFAULT.
+/// Pure (no GPU, no I/O) so it is unit-tested with plain values, same
+/// discipline as [`csd_gpu_miner::backends::autotune::pick_best`]. Never yields
+/// a zero geometry and never panics — the caller has already loaded the cache
+/// (or `None`) and passes the default explicitly.
+pub fn geometry_after_failed_sweep(
+    cached: Option<(u32, u32, u32)>,
+    default: (u32, u32, u32),
+) -> (u32, u32, u32) {
+    cached.unwrap_or(default)
+}
+
+/// May the `--backend auto` path descend to the CPU backend after every GPU
+/// backend failed to init? ONLY when the operator explicitly opted in with
+/// `--allow-cpu-fallback`. Default (false) ⇒ the auto path HARD-ERRORS instead
+/// of silently CPU-mining (a silent CPU fallback bleeds fleet hashrate
+/// invisibly). Pure → unit-tested without a GPU.
+pub fn auto_may_fall_back_to_cpu(allow_cpu_fallback: bool) -> bool {
+    allow_cpu_fallback
 }
 
 /// Validate an addr20 payout address and return its canonical 40-lowercase-hex
@@ -543,7 +604,7 @@ enum Cmd {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
-enum BackendChoice {
+pub enum BackendChoice {
     Auto,
     Cpu,
     Opencl,
@@ -740,7 +801,7 @@ fn resolve_cuda_geometry(cli: &Cli) -> (u32, u32, u32) {
     use csd_gpu_miner::backends::autotune;
     use csd_gpu_miner::backends::cuda;
 
-    if cli.auto_tune {
+    if cli.should_auto_tune() {
         match cuda::auto_tune(cli.device, std::time::Duration::from_secs(cli.auto_tune_secs)) {
             Ok(r) => {
                 tracing::info!(
@@ -751,11 +812,28 @@ fn resolve_cuda_geometry(cli: &Cli) -> (u32, u32, u32) {
                 return (r.best.blocks, r.best.threads_per_block, r.best.nonces_per_thread);
             }
             Err(e) => {
-                tracing::warn!(
-                    "auto-tune failed ({e}); falling back to geometry {}x{}x{}",
-                    cli.blocks, cli.threads_per_block, cli.nonces_per_thread,
-                );
-                return (cli.blocks, cli.threads_per_block, cli.nonces_per_thread);
+                // Sweep failed: fall back to the last-known-good CACHED geometry
+                // for THIS card if one exists, else the shipped default. Never
+                // crash. (auto-tune-every-start means a transient sweep failure
+                // must not take the rig down — it degrades to the previously
+                // measured winner, then the default.)
+                let dev_name = cudarc::driver::CudaContext::new(cli.device)
+                    .and_then(|ctx| ctx.name())
+                    .unwrap_or_default();
+                let cached = autotune::load_cached_for_device(cli.device, &dev_name);
+                let default = (cli.blocks, cli.threads_per_block, cli.nonces_per_thread);
+                let (b, t, n) = geometry_after_failed_sweep(cached, default);
+                if cached.is_some() {
+                    tracing::warn!(
+                        "auto-tune failed ({e}); using last-known-good cached geometry {b}x{t}x{n} for device {} ({dev_name})",
+                        cli.device,
+                    );
+                } else {
+                    tracing::warn!(
+                        "auto-tune failed ({e}) and no cached geometry; falling back to default {b}x{t}x{n}",
+                    );
+                }
+                return (b, t, n);
             }
         }
     }
@@ -1429,10 +1507,22 @@ fn drive<W: csd_gpu_miner::stratum::loop_stratum::WorkSource + Sync>(
                 tracing::warn!("auto: OpenCL not compiled in");
             }
 
+            // No GPU backend initialized. A silent descent to CPU here would
+            // bleed fleet hashrate invisibly on a GPU-intended rig, so it is
+            // OPT-IN only: without `--allow-cpu-fallback` we HARD-ERROR
+            // (non-zero exit + clear log) and refuse to mine. `--backend cpu`
+            // (explicit) and `--backend auto --allow-cpu-fallback` remain the
+            // documented, deliberate CPU paths.
+            if !auto_may_fall_back_to_cpu(cli.allow_cpu_fallback) {
+                bail!(
+                    "backend=auto: no GPU backend initialized (CUDA/OpenCL failed or not compiled in) and --allow-cpu-fallback was not set; refusing to silently CPU-mine (that bleeds fleet hashrate invisibly). Fix the GPU/driver, run `csd-gpu-miner devices` to diagnose, pick `--backend cpu` to force CPU, or pass `--allow-cpu-fallback`."
+                );
+            }
+
             let n = cpu_hashing_threads(cli);
             let b = CpuBackend::new(n);
             tracing::warn!(
-                "auto: SELECTED cpu (no GPU backend usable). hashing_threads={} reserved={}",
+                "auto: SELECTED cpu (no GPU backend usable, --allow-cpu-fallback set). hashing_threads={} reserved={}",
                 b.threads,
                 cli.reserve
             );

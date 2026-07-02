@@ -66,7 +66,8 @@ pub fn candidate_geometries() -> Vec<(u32, u32, u32)> {
         (512, 256, 2048),
         (560, 256, 4096), // shipped default
         (1024, 256, 2048),
-        (2048, 256, 1024),
+        (2048, 256, 1024), // A/B winner on the 5070 Ti (native sm_120)
+        (4096, 256, 512),  // deep-block variant (v0.2.0)
         (1024, 512, 1024),
     ]
 }
@@ -376,6 +377,21 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), c.len(), "candidate geometries must be distinct");
+    }
+
+    #[test]
+    fn candidates_include_4096x256x512() {
+        // v0.2.0 adds the deep-block geometry alongside the proven winner
+        // 2048x256x1024; both must be in the swept set.
+        let c = candidate_geometries();
+        assert!(
+            c.contains(&(4096, 256, 512)),
+            "candidate set must include 4096x256x512"
+        );
+        assert!(
+            c.contains(&(2048, 256, 1024)),
+            "candidate set must include the A/B winner 2048x256x1024"
+        );
     }
 
     // --- CachedGeometry round-trip ----------------------------------------
