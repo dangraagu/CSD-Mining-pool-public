@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Original invocation argv, captured BEFORE anything consumes $1, so the
+# staged-launcher handoff (reexec_new_launcher) can exec the refreshed launcher
+# with the exact same arguments this run was started with.
+ORIG_ARGS=("$@")
+
 # --- What this is -------------------------------------------------------
 # Opt-in CSD miner launcher: mines on THIS machine, to YOUR own payout
 # address, only while you choose to run it. Not silent or hidden, and does
@@ -438,13 +443,20 @@ start_relay() {
 
 # Absolute path of THIS launcher script, captured before any cd, so the launcher
 # self-update writes back to the right file even if $0 was relative. mine-auto.sh
-# never cd's, but we resolve defensively.
-SELF_PATH="$0"
+# never cd's, but we resolve defensively. `${BASH_SOURCE[0]:-$0}` (the v0.1.15
+# FIX-1 pattern): under a piped run (curl|bash) BASH_SOURCE is empty and $0 is
+# "bash" — the fallback keeps `set -u` from aborting, and reexec_new_launcher's
+# real-file guard then correctly refuses a re-exec for such runs.
+SELF_PATH="${BASH_SOURCE[0]:-$0}"
 case "$SELF_PATH" in
   /*) : ;;                                  # already absolute
   *)  SELF_PATH="$(pwd)/$SELF_PATH" ;;      # make relative invocation absolute
 esac
 SELF_NAME="mine-auto.sh"   # the release-asset basename + the SHA256SUMS key
+# Digest of the launcher verified+swapped by the LAST update_launcher_self run
+# that returned 0. reexec_new_launcher re-verifies the on-disk file against it
+# immediately before exec'ing (guards a racing writer between mv and exec).
+LAUNCHER_SWAPPED_SHA=""
 
 # Update the LAUNCHER ITSELF (this mine-auto.sh) in place, fail-closed + no-brick.
 #
@@ -460,23 +472,35 @@ SELF_NAME="mine-auto.sh"   # the release-asset basename + the SHA256SUMS key
 #     the temp and leave the on-disk launcher byte-for-byte untouched. The rig
 #     keeps running the known-good launcher. We never write an unverified script
 #     over ourselves.
-#   SAFETY (b) NO-BRICK / NO RE-EXEC: we DO NOT exec the new launcher mid-run.
-#     A re-exec of a subtly-broken new script could crash-loop the rig with no
-#     human present (no clawback). Instead we replace the file ATOMICALLY on disk
-#     (write temp → fsync-ish → mv) and let it take effect on the NEXT operator
-#     start/restart of mine-auto.sh. The currently-running process keeps using
-#     the already-loaded (old) script text, so this launch can never be bricked
-#     by the swap. We also keep "$SELF_PATH.bak" (the prior launcher) as a manual
-#     fallback.
+#   SAFETY (b) NO-BRICK SWAP, RE-EXEC SEPARATE + GATED: this function NEVER
+#     execs anything (the launcher_selfupdate.sh static guard F pins that). It
+#     only replaces the file ATOMICALLY on disk (write temp → verify → mv),
+#     keeping "$SELF_PATH.bak" (the prior launcher) as a fallback. The
+#     currently-running process keeps using the already-loaded (old) script
+#     text, so the swap itself can never brick this launch. APPLYING the new
+#     launcher is a SEPARATE, multiply-guarded step — reexec_new_launcher —
+#     which the caller invokes ONLY when this function reports a real byte
+#     change (rc=0); every one of its guards fails SAFE back to "keep running
+#     the old in-memory launcher, miners keep mining". (Pre-v0.2.0 this fn was
+#     no-re-exec-at-all, which meant an always-running rig NEVER picked up a
+#     new launcher — the autorestart root cause.)
 #
 # Verifier trust: we verify with the just-swapped, already-SHA-verified $BIN
 # ("$BIN verify-file") or the OS sha256sum — NEVER by letting the downloaded
-# script check itself. Returns non-zero on any skip/failure; the caller treats
-# this as purely best-effort and ignores the result (a launcher-update failure
-# must never disturb mining).
+# script check itself. The caller treats this as best-effort (a launcher-update
+# failure must never disturb mining).
+#
+# RETURN CONTRACT (v0.2.0, mirrors h-run's ua_download_verify_swap):
+#   0 = a REAL byte change was verified + swapped onto disk; the verified
+#       digest is exported in $LAUNCHER_SWAPPED_SHA for the re-exec re-check.
+#   2 = verified, but the on-disk launcher is ALREADY byte-identical (skip):
+#       nothing swapped, the caller MUST NOT re-exec — this is the natural
+#       re-exec loop-break (after a handoff, the next poll lands here).
+#   1 = any download/verify/swap failure (fail-closed; on-disk untouched).
 update_launcher_self() {
   local staged want got cur
   staged="$SELF_PATH.new.$$"
+  LAUNCHER_SWAPPED_SHA=""   # only a REAL rc=0 swap publishes a digest
 
   # 1. Download the candidate launcher to a per-pid temp (never onto $SELF_PATH).
   if ! download "https://github.com/$REPO/releases/latest/download/$SELF_NAME" "$staged"; then
@@ -518,24 +542,119 @@ update_launcher_self() {
 
   # 4. Skip the write if the on-disk launcher is already byte-identical (same
   #    SHA) — avoids needless churn + a pointless .bak rewrite every poll.
+  #    rc=2 = "verified, already current": the caller must NOT re-exec on it.
   if command -v sha256sum >/dev/null 2>&1; then
     cur="$(sha256sum "$SELF_PATH" 2>/dev/null | awk '{print $1}')"
     if [ -n "$cur" ] && [ "$cur" = "$want" ]; then
       rm -f "$staged"
-      return 0
+      return 2
     fi
   fi
 
   # 5. NO-BRICK atomic on-disk swap. Keep the prior launcher as .bak, preserve the
-  #    exec bit, mv into place. We DO NOT exec it — it takes effect next start.
+  #    exec bit, mv into place. We DO NOT exec here — applying it is the caller's
+  #    separately-gated reexec_new_launcher step (or the next manual start).
   chmod +x "$staged" 2>/dev/null || true
   cp -p "$SELF_PATH" "$SELF_PATH.bak" 2>/dev/null || true
   if mv "$staged" "$SELF_PATH"; then
-    echo "[$(date '+%H:%M:%S')] launcher self-update: refreshed $SELF_NAME on disk (takes effect on the next start; prior kept at $SELF_PATH.bak)."
+    LAUNCHER_SWAPPED_SHA="$want"
+    echo "[$(date '+%H:%M:%S')] launcher self-update: refreshed $SELF_NAME on disk (prior kept at $SELF_PATH.bak)."
     return 0
   fi
   echo "[$(date '+%H:%M:%S')] launcher self-update: on-disk swap failed — keeping current launcher." >&2
   rm -f "$staged"
+  return 1
+}
+
+# Write the operator-visible crumb + log line for a REFUSED/FAILED re-exec,
+# then return 1. NEVER exits: the old in-memory launcher keeps running (bash
+# holds the old inode), miners keep mining — a refused handoff can never hurt
+# the running process; the new launcher still applies on the next manual start.
+reexec_refuse() {
+  local reason="$1" crumb="$DATA_DIR/launcher-reexec-refused.txt"
+  echo "[$(date '+%H:%M:%S')] launcher re-exec: REFUSED — $reason. Staying on the in-memory launcher (the refreshed one applies on the next manual restart)." >&2
+  {
+    echo "time:   $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)"
+    echo "reason: $reason"
+    echo "note:   mining was NOT interrupted; restart mine-auto.sh manually to pick up the refreshed launcher"
+  } > "$crumb" 2>/dev/null || true
+  return 1
+}
+
+# Apply an already-swapped launcher by STAGED HANDOFF: stop the miners cleanly,
+# then `exec` the refreshed on-disk launcher with the ORIGINAL argv. This is the
+# autorestart root-cause fix — on an always-running rig the on-disk swap alone
+# never took effect. Ports the safety properties of mine-auto.bat's trampoline
+# (stage-time SHA re-check + detached-helper discipline) into bash:
+#
+#   g1  SELF_PATH must be a real readable file — skips curl|bash piped runs
+#       (there $0 is "bash"; nothing sensible to exec).
+#   g2  RE-VERIFY the on-disk SHA-256 against the digest verified at swap time
+#       ($1 = $LAUNCHER_SWAPPED_SHA) — guards a racing writer between mv+exec.
+#   g3  `bash -n` syntax gate — a truncated/corrupt script is refused BEFORE
+#       exec (and the .bak is restored over it, best-effort).
+#   g4  BOUNDED: CSD_REEXEC_GEN (exported, survives exec) caps chained handoffs
+#       at 3 — never a re-exec loop. The NATURAL loop-break also holds: after a
+#       handoff the next poll's update_launcher_self returns 2 (skip-if-same),
+#       and the caller only invokes us on rc=0.
+#   g5  HANDOFF: stop_miners (clean kill of miners + relay), `shopt -s execfail`
+#       so a FAILED exec RETURNS instead of killing this shell, exec. On the
+#       fall-through: start_miners (recover mining on the old launcher), refuse.
+#
+# EVERY guard fails SAFE: log + crumb + return 1, old launcher keeps running,
+# miners keep mining. Env knobs (CHECK_MIN, CSD_GPU_IDS, …) survive the exec
+# natively; the address re-loads from $CFG (no re-prompt); the fresh startup's
+# do_update_check reaps any straggler processes before start_miners.
+# Called by do_update_check ONLY when update_launcher_self returned 0.
+reexec_new_launcher() {
+  local swapped_sha="${1:-}" cur
+  # g1: a real, readable file (piped runs: $SELF_PATH is "bash"/missing).
+  if [ -z "$SELF_PATH" ] || [ ! -f "$SELF_PATH" ] || [ ! -r "$SELF_PATH" ]; then
+    reexec_refuse "launcher path '$SELF_PATH' is not a readable file (piped/odd invocation)"
+    return 1
+  fi
+  # g2: the on-disk bytes must still be EXACTLY what was verified at swap time.
+  if [ -z "$swapped_sha" ] || ! command -v sha256sum >/dev/null 2>&1; then
+    reexec_refuse "no swap-time digest (or no sha256sum) to re-verify the on-disk launcher with"
+    return 1
+  fi
+  cur="$(sha256sum "$SELF_PATH" 2>/dev/null | awk '{print $1}')"
+  if [ "$cur" != "$swapped_sha" ]; then
+    reexec_refuse "on-disk launcher SHA changed between swap and exec (want $swapped_sha, got ${cur:-<unreadable>})"
+    return 1
+  fi
+  # g3: refuse a syntactically-broken script BEFORE exec; put the .bak back.
+  if ! bash -n "$SELF_PATH" 2>/dev/null; then
+    [ -f "$SELF_PATH.bak" ] && cp -p "$SELF_PATH.bak" "$SELF_PATH" 2>/dev/null || true
+    reexec_refuse "refreshed launcher failed the bash -n syntax gate (restored $SELF_PATH.bak over it)"
+    return 1
+  fi
+  # g4: bounded chained handoffs (exported so it survives the exec).
+  export CSD_REEXEC_GEN=$(( ${CSD_REEXEC_GEN:-0} + 1 ))
+  if [ "$CSD_REEXEC_GEN" -gt 3 ]; then
+    reexec_refuse "re-exec generation cap reached (gen $CSD_REEXEC_GEN > 3) — falling back to next-manual-restart behaviour"
+    return 1
+  fi
+  # g5: staged handoff. stop_miners kills miners + relay cleanly. `shopt -s
+  # execfail` makes a FAILED exec of an EXISTING-but-unexecutable file (rc 126:
+  # noexec mount, exec-format, missing interpreter) RETURN here instead of
+  # exiting — g1 already proved $SELF_PATH exists+readable and g3 proved it's
+  # valid bash, so a "command not found" (rc 127, which execfail can't catch and
+  # would hard-exit) is unreachable. Under this script's `set -euo pipefail`,
+  # `set -e` is already suppressed inside this function because do_update_check
+  # invokes it as the left operand of `|| true`; the trailing `|| true` here is
+  # defensive depth so the fall-through recovery ALSO holds if the function is
+  # ever called bare. On a SUCCESSFUL exec the image is replaced and neither the
+  # `|| true` nor the recovery block below is ever reached.
+  echo "[$(date '+%H:%M:%S')] launcher re-exec: handing off to the refreshed launcher (generation $CSD_REEXEC_GEN, argv preserved)."
+  stop_miners
+  shopt -s execfail
+  exec "$SELF_PATH" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"} || true
+  # Reached ONLY when the exec itself FAILED (execfail returned control): recover
+  # mining on the old in-memory launcher — the rig must never sit idle because of
+  # a handoff — then log + crumb + return non-zero.
+  start_miners
+  reexec_refuse "exec of the refreshed launcher failed — miners restarted on the old launcher"
   return 1
 }
 
@@ -737,8 +856,16 @@ do_update_check() {
       echo "[$(date '+%H:%M:%S')] now mining $latest on ${#DEVICES[@]} GPU(s) (build: $VARIANT)."
       # Best-effort: also refresh THIS launcher (so a launcher-side fix reaches
       # the rig). Runs AFTER mining is back up so it can never delay the restart;
-      # fail-closed + no-brick (replaces on disk, no re-exec); result ignored.
-      update_launcher_self || true
+      # fail-closed + no-brick (atomic on-disk swap). ONLY a REAL byte change
+      # (rc=0) proceeds to the gated staged-handoff re-exec — rc=2 (already
+      # current, the post-handoff loop-break) and rc=1 (failure) never do. The
+      # re-exec itself is best-effort: every refused guard leaves this (old)
+      # launcher running with the miners restarted — never an idle rig.
+      local launcher_rc=0
+      update_launcher_self || launcher_rc=$?
+      if [ "$launcher_rc" -eq 0 ]; then
+        reexec_new_launcher "$LAUNCHER_SWAPPED_SHA" || true
+      fi
     else
       echo "[$(date '+%H:%M:%S')] update not applied (download/verify failed); keeping current, will retry."
       # If we had a running set, bring it back so a failed update doesn't leave

@@ -21,9 +21,30 @@
 #   B fail-closed bad   — wrong SHA in SHA256SUMS → OLD launcher byte-identical, no swap
 #   C fail-closed miss  — SELF_NAME not listed in SHA256SUMS → OLD launcher kept
 #   D fail-closed dlerr — launcher download fails → OLD launcher kept
-#   E skip-if-same      — on-disk launcher already matches → NO rewrite, NO .bak churn
-#   F no-brick / no-exec— update_launcher_self body contains no `exec` (static guard)
+#   E skip-if-same      — on-disk launcher already matches → rc=2 (verified, no
+#                         change — mirrors h-run's ua_download_verify_swap), NO
+#                         rewrite, NO .bak churn
+#   F no-brick / no-exec— update_launcher_self body contains no `exec` (static
+#                         guard). v0.2.0: the swap fn STAYS exec-free by design;
+#                         the re-exec lives in the SEPARATE, gated
+#                         reexec_new_launcher (tested below) — reviewers: this
+#                         split is intentional, re-affirm it, don't fold them.
 #   G atomic swap       — implementation uses mv (rename), not in-place truncate+write
+#   R rc contract       — a REAL byte change returns rc=0 AND persists the
+#                         verified digest (LAUNCHER_SWAPPED_SHA) for the re-exec
+#
+# v0.2.0 staged-handoff re-exec (reexec_new_launcher — applies a swapped
+# launcher WITHOUT waiting for a manual restart; every guard fails SAFE to
+# "keep running the old in-memory launcher + keep mining" and drops a crumb):
+#   S1 refuses when SELF_PATH is not a real readable file (curl|bash piped run)
+#   S2 refuses when the on-disk SHA no longer matches the swap-time digest
+#   T  refuses (and restores .bak) when the new launcher fails `bash -n`
+#   U  refuses at the CSD_REEXEC_GEN generation cap (never a re-exec loop)
+#   V  execfail fall-through: a failed exec RESTARTS the miners and refuses
+#   W  happy path: execs the new launcher with the ORIGINAL argv, generation 1
+#   X  wiring: do_update_check calls reexec_new_launcher ONLY on rc=0 (a real
+#      byte change), never on rc=2/1 — and mine-auto.bat keeps its trampoline
+#      (parity: BOTH launchers apply a staged launcher without operator action)
 #
 # Run:   bash tests/launcher_selfupdate.sh
 # Exit:  0 = all pass, non-zero = at least one failure printed to stderr
@@ -126,6 +147,7 @@ run_case() {
     rc=0
     update_launcher_self || rc=$?
     echo "RC=$rc"
+    echo "SWAPPED_SHA=${LAUNCHER_SWAPPED_SHA:-}"
   '
 }
 
@@ -195,16 +217,29 @@ else
   fail "D fail-closed download" "expected RC!=0 and unchanged on-disk; got $D_RC"
 fi
 
-# ── E. Skip-if-same: on-disk already == candidate → no rewrite, no .bak ───────
+# ── E. Skip-if-same: on-disk already == candidate → rc=2, no rewrite, no .bak ─
+# rc=2 = "verified, already current" (mirrors h-run's ua_download_verify_swap):
+# the caller must NOT re-exec on it — that's the natural re-exec loop-break.
 E_SAME="SAME-LAUNCHER-CONTENT
 "
 E_OUT="$(run_case E "$E_SAME" "$E_SAME" GOOD || true)"
 E_RC="$(printf '%s\n' "$E_OUT" | grep -oE 'RC=[0-9]+' | tail -1)"
 E_FILE="$SANDBOX/case-E/mine-auto.sh"
-if [ "$E_RC" = "RC=0" ] && file_is_string "$E_FILE" "$E_SAME" && [ ! -e "$SANDBOX/case-E/mine-auto.sh.bak" ]; then
-  ok "E skip-if-same: identical launcher → RC=0, content unchanged, NO .bak churn"
+if [ "$E_RC" = "RC=2" ] && file_is_string "$E_FILE" "$E_SAME" && [ ! -e "$SANDBOX/case-E/mine-auto.sh.bak" ]; then
+  ok "E skip-if-same: identical launcher → RC=2 (no change), content unchanged, NO .bak churn"
 else
-  fail "E skip-if-same" "expected RC=0, unchanged content, no .bak; got $E_RC, bak=$( [ -e "$SANDBOX/case-E/mine-auto.sh.bak" ] && echo present || echo absent)"
+  fail "E skip-if-same" "expected RC=2, unchanged content, no .bak; got $E_RC, bak=$( [ -e "$SANDBOX/case-E/mine-auto.sh.bak" ] && echo present || echo absent)"
+fi
+
+# ── R. rc contract: a REAL byte change → rc=0 + persisted verified digest ─────
+# The digest (LAUNCHER_SWAPPED_SHA) is what reexec_new_launcher re-verifies
+# against before exec'ing (guards a racing writer between mv and exec).
+R_SHA_EXPECT="$(sha_of_string "$A_CAND")"
+R_SHA_GOT="$(printf '%s\n' "$A_OUT" | grep -oE 'SWAPPED_SHA=[0-9a-f]*' | tail -1)"
+if [ "$R_SHA_GOT" = "SWAPPED_SHA=$R_SHA_EXPECT" ]; then
+  ok "R rc contract: real swap (rc=0) persists the verified digest for the re-exec step"
+else
+  fail "R rc contract" "expected SWAPPED_SHA=$R_SHA_EXPECT after the happy-path swap; got '$R_SHA_GOT'"
 fi
 
 # ── F. No-brick: update_launcher_self body must contain NO `exec` COMMAND ─────
@@ -226,6 +261,163 @@ if printf '%s\n' "$FN_BODY" | grep -qE 'mv[[:space:]].*"\$SELF_PATH"'; then
   ok "G atomic swap: uses mv onto \$SELF_PATH (atomic rename, no partial-write window)"
 else
   fail "G atomic swap" "expected an 'mv ... \$SELF_PATH' atomic rename in update_launcher_self"
+fi
+
+# ── v0.2.0 staged-handoff re-exec (reexec_new_launcher) ───────────────────────
+# The autorestart root-cause fix: update_launcher_self swaps the launcher on
+# disk but never re-execs, so on an always-running rig the new launcher NEVER
+# took effect. reexec_new_launcher applies it via a gated staged handoff. Every
+# guard failing must fall back to "keep running the OLD in-memory launcher,
+# miners keep mining" and drop a crumb file for the operator.
+echo
+echo "-- staged-handoff re-exec (reexec_new_launcher) --"
+
+# Driver. Args:
+#   $1 tag
+#   $2 target-script content ("" => SELF_PATH points at a MISSING file)
+#   $3 sha mode: GOOD (sha of the target) | BAD (deliberate mismatch)
+#   $4 gen preset (e.g. "export CSD_REEXEC_GEN=3") or ""
+#   $5 "BAK" to pre-place a .bak beside the target, else ""
+# The stubbed stop_miners/start_miners append to $work/calls; a successfully
+# exec'd target script writes $work/execed (proving the handoff + argv + gen).
+reexec_case() {
+  local tag="$1" content="$2" shamode="$3" gen_preset="$4" mkbak="$5"
+  local work="$SANDBOX/reexec-$tag"
+  mkdir -p "$work"
+  local target="$work/mine-auto.sh"
+  if [ -n "$content" ]; then
+    printf '%s' "$content" > "$target"
+    chmod +x "$target"
+  fi
+  [ "$mkbak" = "BAK" ] && printf '%s' "GOOD-OLD-BAK-LAUNCHER" > "$target.bak"
+  local sha=""
+  if [ "$shamode" = "GOOD" ] && [ -f "$target" ]; then
+    sha="$(sha256sum "$target" | awk '{print $1}')"
+  else
+    sha="1111111111111111111111111111111111111111111111111111111111111111"
+  fi
+
+  # `set -euo pipefail` MATCHES production (mine-auto.sh line 2) so the harness
+  # exercises reexec_new_launcher under the SAME shell options the rig runs it
+  # with — a -e-less harness could green-light a `set -e`/exec-failure brick that
+  # production would hit. Case V's failed exec must still fall through to the
+  # miner-recovery path (execfail + the fn being a `||` left operand keep -e from
+  # aborting); this harness proves it does under real -e.
+  CSD_SOURCE_ONLY=1 CASE_DIR="$work" \
+  bash -c '
+    set -euo pipefail
+    source "'"$LAUNCHER"'" >/dev/null 2>&1
+    SELF_PATH="'"$target"'"
+    DATA_DIR="$CASE_DIR"            # crumb file lands here
+    ORIG_ARGS=(nvidia)              # the argv the handoff must preserve
+    # Stub the miner lifecycle so the test never touches real processes.
+    stop_miners()  { echo stop  >> "$CASE_DIR/calls"; }
+    start_miners() { echo start >> "$CASE_DIR/calls"; }
+    '"$gen_preset"'
+    rc=0
+    reexec_new_launcher "'"$sha"'" || rc=$?
+    echo "RC=$rc"
+  '
+}
+
+# A target script that, when exec'd, proves the handoff happened with the right
+# argv + generation counter (CASE_DIR survives the exec via the environment).
+EXEC_PROOF='#!/usr/bin/env bash
+echo "EXECED gen=${CSD_REEXEC_GEN:-none} args=$*" > "$CASE_DIR/execed"
+'
+# Syntactically valid bash whose exec MUST fail: the shebang interpreter does
+# not exist (execve => ENOENT), portable across Linux + git-bash — unlike a
+# chmod -x probe, which is a no-op on Windows filesystems.
+EXEC_FAIL='#!/nonexistent/interpreter-for-execfail-test
+echo never-runs
+'
+BROKEN_SYNTAX='#!/usr/bin/env bash
+if [ ; then fi (((
+'
+
+# ── S1. Refuses when SELF_PATH is not a real readable file (piped run) ────────
+S1_OUT="$(reexec_case S1 "" GOOD "" "" || true)"
+S1_RC="$(printf '%s\n' "$S1_OUT" | grep -oE 'RC=[0-9]+' | tail -1)"
+if [ "$S1_RC" != "RC=0" ] && [ -n "$S1_RC" ] && [ ! -e "$SANDBOX/reexec-S1/execed" ] \
+   && [ -f "$SANDBOX/reexec-S1/launcher-reexec-refused.txt" ]; then
+  ok "S1 re-exec: missing SELF_PATH (piped run) → refused, no exec, crumb written"
+else
+  fail "S1 re-exec missing SELF_PATH" "expected refusal + crumb + no exec; got rc=$S1_RC execed=$( [ -e "$SANDBOX/reexec-S1/execed" ] && echo yes || echo no) crumb=$( [ -f "$SANDBOX/reexec-S1/launcher-reexec-refused.txt" ] && echo yes || echo no)"
+fi
+
+# ── S2. Refuses when the on-disk SHA != the swap-time digest (racing writer) ──
+S2_OUT="$(reexec_case S2 "$EXEC_PROOF" BAD "" "" || true)"
+S2_RC="$(printf '%s\n' "$S2_OUT" | grep -oE 'RC=[0-9]+' | tail -1)"
+if [ "$S2_RC" != "RC=0" ] && [ -n "$S2_RC" ] && [ ! -e "$SANDBOX/reexec-S2/execed" ] \
+   && [ -f "$SANDBOX/reexec-S2/launcher-reexec-refused.txt" ]; then
+  ok "S2 re-exec: on-disk SHA mismatch vs swap-time digest → refused, no exec, crumb written"
+else
+  fail "S2 re-exec SHA re-verify" "expected refusal + crumb + no exec; got rc=$S2_RC"
+fi
+
+# ── T. Refuses on bash -n failure AND restores the .bak over the bad script ───
+T_OUT="$(reexec_case T "$BROKEN_SYNTAX" GOOD "" BAK || true)"
+T_RC="$(printf '%s\n' "$T_OUT" | grep -oE 'RC=[0-9]+' | tail -1)"
+T_FILE="$SANDBOX/reexec-T/mine-auto.sh"
+if [ "$T_RC" != "RC=0" ] && [ -n "$T_RC" ] && [ ! -e "$SANDBOX/reexec-T/execed" ] \
+   && [ -f "$SANDBOX/reexec-T/launcher-reexec-refused.txt" ] \
+   && file_is_string "$T_FILE" "GOOD-OLD-BAK-LAUNCHER"; then
+  ok "T re-exec: bash -n syntax gate refuses a corrupt launcher and restores the .bak"
+else
+  fail "T re-exec syntax gate" "expected refusal + .bak restored; got rc=$T_RC content=[$(head -c 60 "$T_FILE" 2>/dev/null)]"
+fi
+
+# ── U. Bounded: refuses at the CSD_REEXEC_GEN generation cap (no exec loop) ───
+U_OUT="$(reexec_case U "$EXEC_PROOF" GOOD "export CSD_REEXEC_GEN=3" "" || true)"
+U_RC="$(printf '%s\n' "$U_OUT" | grep -oE 'RC=[0-9]+' | tail -1)"
+if [ "$U_RC" != "RC=0" ] && [ -n "$U_RC" ] && [ ! -e "$SANDBOX/reexec-U/execed" ] \
+   && [ -f "$SANDBOX/reexec-U/launcher-reexec-refused.txt" ]; then
+  ok "U re-exec: generation cap (CSD_REEXEC_GEN>=3) → refused, no exec (bounded, never a loop)"
+else
+  fail "U re-exec gen cap" "expected refusal at gen cap; got rc=$U_RC execed=$( [ -e "$SANDBOX/reexec-U/execed" ] && echo yes || echo no)"
+fi
+
+# ── V. execfail fall-through: a failed exec restarts the miners + refuses ─────
+V_OUT="$(reexec_case V "$EXEC_FAIL" GOOD "" "" || true)"
+V_RC="$(printf '%s\n' "$V_OUT" | grep -oE 'RC=[0-9]+' | tail -1)"
+V_CALLS="$( { cat "$SANDBOX/reexec-V/calls" 2>/dev/null || true; } | tr '\n' ',')"
+if [ "$V_RC" != "RC=0" ] && [ -n "$V_RC" ] \
+   && [ "$V_CALLS" = "stop,start," ] \
+   && [ -f "$SANDBOX/reexec-V/launcher-reexec-refused.txt" ]; then
+  ok "V re-exec: failed exec (execfail) falls through → miners RESTARTED on the old launcher, crumb written"
+else
+  fail "V re-exec execfail fall-through" "expected rc!=0 + calls=stop,start + crumb; got rc=$V_RC calls=[$V_CALLS]"
+fi
+
+# ── W. Happy path: execs the NEW launcher with the ORIGINAL argv, generation 1 ─
+# THE autorestart fix: the staged launcher takes effect WITHOUT operator action.
+# (On old code this fails: reexec_new_launcher doesn't exist / nothing execs.)
+W_OUT="$(reexec_case W "$EXEC_PROOF" GOOD "" "" || true)"
+W_EXECED="$(cat "$SANDBOX/reexec-W/execed" 2>/dev/null || true)"
+W_CALLS="$( { cat "$SANDBOX/reexec-W/calls" 2>/dev/null || true; } | tr '\n' ',')"
+if [ "$W_EXECED" = "EXECED gen=1 args=nvidia" ] && [ "$W_CALLS" = "stop," ] \
+   && [ ! -f "$SANDBOX/reexec-W/launcher-reexec-refused.txt" ]; then
+  ok "W re-exec happy path: miners stopped, NEW launcher exec'd with original argv at generation 1 (no manual restart)"
+else
+  fail "W re-exec happy path" "expected execed marker 'EXECED gen=1 args=nvidia' + calls=stop + no crumb; got execed=[$W_EXECED] calls=[$W_CALLS]"
+fi
+
+# ── X. Wiring + parity: re-exec fires ONLY on a real swap (rc=0) ──────────────
+# do_update_check must gate reexec_new_launcher on update_launcher_self rc=0
+# (never on rc=2 skip-if-same — the loop-break — nor rc=1 failure), and
+# mine-auto.bat keeps its startup trampoline: parity = BOTH launchers apply a
+# staged launcher without operator action.
+DUC_BODY="$(awk '/^do_update_check\(\) \{/{f=1} f{print} /^}/{if(f)exit}' "$LAUNCHER")"
+if printf '%s\n' "$DUC_BODY" | grep -q 'reexec_new_launcher' \
+   && printf '%s\n' "$DUC_BODY" | grep -qE 'eq 0.*\]|\-eq 0'; then
+  ok "X wiring: do_update_check invokes reexec_new_launcher gated on rc=0 (real byte change only)"
+else
+  fail "X wiring" "do_update_check must call reexec_new_launcher only when update_launcher_self returned 0"
+fi
+if grep -qE '^:update_launcher_self' "$REPO_ROOT/mine-auto.bat" && grep -qE 'csd-launcher-promote\.cmd' "$REPO_ROOT/mine-auto.bat"; then
+  ok "X parity: mine-auto.bat keeps its trampoline — both launchers apply staged launchers unattended"
+else
+  fail "X parity" "mine-auto.bat trampoline missing"
 fi
 
 # ── mine-auto.bat (Windows) launcher self-update — STATIC safety checks ───────
