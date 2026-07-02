@@ -98,7 +98,9 @@ call :start_all
 echo(
 echo Launched !NGPU! window(s), one per GPU, all mining to !ADDR!.
 echo Each window shows its own hashrate. This window stays open and auto-updates.
-echo A window that closes instantly = that index had no usable GPU (harmless).
+echo A window that closes instantly = the miner REFUSED to start on that index:
+echo   wrong backend for this build, or that GPU is unusable. It never silently
+echo   CPU-mines. Check that index's log under "%DIR%\gpuN-log" for the reason.
 echo(
 
 REM --- 5. auto-update poll loop ---

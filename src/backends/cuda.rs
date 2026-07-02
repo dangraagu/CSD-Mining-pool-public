@@ -1,9 +1,12 @@
 //! CUDA mining backend — 2-stream pipelined.
 //!
-//! A pre-built PTX (`sha256d.ptx`, compiled offline from `sha256d.cu`) is loaded
-//! via the driver's JIT (`cuModuleLoadData`) at startup — NVRTC is never invoked,
-//! so only the NVIDIA driver is needed at runtime (no CUDA Toolkit). Two CUDA
-//! streams alternate
+//! A pre-built multi-arch fatbin (`sha256d.fatbin`, compiled offline from
+//! `sha256d.cu` by scripts/build-fatbin: native sm_120 SASS + universal
+//! compute_75 PTX pinned at `.version 6.3` — see the KERNEL_FATBIN comment
+//! below) is loaded via the driver (`cuModuleLoadData`) at startup; the driver
+//! picks the native image on Blackwell and JITs the PTX everywhere else.
+//! NVRTC is never invoked, so only the NVIDIA driver is needed at runtime
+//! (no CUDA Toolkit). Two CUDA streams alternate
 //! kernel launches; while one stream is hashing the host reads back the
 //! other stream's prior flag and decides whether to stop. The kernel
 //! itself sweeps `nonces_per_thread` nonces per work-item.

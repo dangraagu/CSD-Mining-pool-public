@@ -1,16 +1,21 @@
 # Changelog
 
-## v0.2.0 (unreleased) — the refactor release
+## v0.2.0 — 2026-07-02 — the refactor release
 
 ### ⚠️ Behavior changes (operator-visible)
 
-- **No silent CPU fallback (default backend is now `cuda` on NVIDIA builds).**
-  Previously `--backend auto` could quietly degrade to CPU mining (kH/s) when the
-  GPU/driver was broken or absent — invisible hashrate bleed. Now the miner
-  HARD-ERRORS at startup instead and mines nothing until the GPU is fixed.
-  Deliberate CPU mining still works: pass `--backend cpu` (explicit) or
-  `--allow-cpu-fallback` (permits the auto→CPU descent). Healthy GPU rigs are
-  unaffected. HiveOS `h-run.sh` driver-check warnings updated to match.
+- **No silent CPU fallback — the default backend is now per build variant.**
+  Each build defaults to its own compiled backend: the nvidia build defaults to
+  `--backend cuda`, the amd build to `--backend opencl`, and the cpu build to
+  `--backend cpu`. No build silently falls back to CPU: a GPU variant whose GPU
+  API fails to init HARD-ERRORS at startup and mines nothing until the
+  GPU/driver is fixed (previously `--backend auto` could quietly degrade to CPU
+  mining at kH/s — invisible hashrate bleed); the cpu build's purpose IS CPU
+  mining, so its `cpu` default is deliberate, not a fallback. Deliberate CPU
+  mining on a GPU build still works: pass `--backend cpu` (explicit) or
+  `--backend auto --allow-cpu-fallback` (permits the auto→CPU descent).
+  Healthy GPU rigs are unaffected. HiveOS `h-run.sh` driver-check warnings
+  updated to match.
 - **Auto-tune runs at every session start (default ON).** The full geometry sweep
   (~10 candidates × 5 s ≈ 50 s, no shares submitted during it) now runs before
   mining on every start, so each rig always mines on its measured-best geometry —
