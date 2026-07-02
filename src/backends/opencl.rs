@@ -22,7 +22,7 @@ use opencl3::memory::{Buffer, CL_MEM_READ_ONLY, CL_MEM_WRITE_ONLY};
 use opencl3::program::Program;
 use opencl3::types::{cl_uchar, cl_uint, CL_BLOCKING};
 
-use crate::backend::{MiningBackend, MiningResult};
+use crate::backend::{DeviceError, MiningBackend, MiningResult};
 use crate::gpu_watchdog::Recoverable;
 use crate::sha256d_cpu::midstate_of_first_chunk_fast as midstate_of_first_chunk;
 
@@ -154,9 +154,9 @@ impl MiningBackend for OpenclBackend {
         nonce_start: u32,
         nonce_end: u32,
         stop: &AtomicBool,
-    ) -> Option<MiningResult> {
+    ) -> Result<Option<MiningResult>, DeviceError> {
         if nonce_end <= nonce_start {
-            return None;
+            return Ok(None);
         }
 
         let midstate = midstate_of_first_chunk(&header_84);
@@ -167,18 +167,20 @@ impl MiningBackend for OpenclBackend {
         let mut tail_16 = [0u8; 16];
         tail_16.copy_from_slice(&header_84[64..80]);
 
+        // IMP-1b: every device-level failure below returns `Err(DeviceError)`
+        // instead of the old bare `None`, so the mining loop can tell a
+        // faulted sweep (log + recover + starve the wedge heartbeat + skip
+        // hashrate accounting) apart from a clean empty one.
         let mut a = match PipeRes::new(&self.context, &self.program) {
             Ok(p) => p,
             Err(e) => {
-                tracing::error!("opencl: pipe A setup failed: {}", e);
-                return None;
+                return Err(DeviceError(format!("opencl: pipe A setup failed: {e}")));
             }
         };
         let mut b = match PipeRes::new(&self.context, &self.program) {
             Ok(p) => p,
             Err(e) => {
-                tracing::error!("opencl: pipe B setup failed: {}", e);
-                return None;
+                return Err(DeviceError(format!("opencl: pipe B setup failed: {e}")));
             }
         };
 
@@ -187,16 +189,13 @@ impl MiningBackend for OpenclBackend {
             unsafe {
                 queue
                     .enqueue_write_buffer(&mut pipe.mid_buf, CL_BLOCKING, 0, &midstate_words, &[])
-                    .map_err(|e| anyhow!("write midstate: {:?}", e))
-                    .ok()?;
+                    .map_err(|e| DeviceError(format!("opencl: write midstate: {e:?}")))?;
                 queue
                     .enqueue_write_buffer(&mut pipe.tail_buf, CL_BLOCKING, 0, &tail_16, &[])
-                    .map_err(|e| anyhow!("write tail: {:?}", e))
-                    .ok()?;
+                    .map_err(|e| DeviceError(format!("opencl: write tail: {e:?}")))?;
                 queue
                     .enqueue_write_buffer(&mut pipe.target_buf, CL_BLOCKING, 0, &target, &[])
-                    .map_err(|e| anyhow!("write target: {:?}", e))
-                    .ok()?;
+                    .map_err(|e| DeviceError(format!("opencl: write target: {e:?}")))?;
             }
         }
 
@@ -208,30 +207,34 @@ impl MiningBackend for OpenclBackend {
 
         loop {
             if stop.load(Ordering::Relaxed) {
-                return None;
+                return Ok(None);
             }
 
             // 1) Drain the current pipe if in flight (no borrow of "other"
-            //    needed yet — keeps the borrow checker happy).
+            //    needed yet — keeps the borrow checker happy). A drain-side
+            //    device error (failed finish/readback) surfaces as `Err` —
+            //    the launch did NOT provably sweep its nonces.
             let drain_result = {
                 let (pipe, queue) = pick_pipe(&mut a, &mut b, current_pipe, &self.queue_a, &self.queue_b);
                 if pipe.in_flight {
                     let res = drain_pipe(queue, pipe);
                     pipe.in_flight = false;
-                    res
+                    res?
                 } else {
                     None
                 }
             };
             if let Some(res) = drain_result {
                 // Drain the other pipe too so its in-flight work doesn't
-                // race with the next job.
+                // race with the next job. A drain error here is ignored on
+                // purpose: we already hold a verified find to return, and the
+                // pre-submit CPU re-hash gates it anyway.
                 let (other, oqueue) = pick_pipe(&mut a, &mut b, current_pipe ^ 1, &self.queue_a, &self.queue_b);
                 if other.in_flight {
                     let _ = drain_pipe(oqueue, other);
                     other.in_flight = false;
                 }
-                return Some(res);
+                return Ok(Some(res));
             }
 
             // 2) Launch the next batch on this pipe (if there's nonce space left).
@@ -243,22 +246,21 @@ impl MiningBackend for OpenclBackend {
                         let start_u32 = next_start as u32;
                         let zero = [0u32];
                         unsafe {
-                            if queue
-                                .enqueue_write_buffer(
-                                    &mut pipe.found_flag,
-                                    CL_BLOCKING,
-                                    0,
-                                    &zero,
-                                    &[],
-                                )
-                                .is_err()
-                            {
-                                return None;
+                            if let Err(e) = queue.enqueue_write_buffer(
+                                &mut pipe.found_flag,
+                                CL_BLOCKING,
+                                0,
+                                &zero,
+                                &[],
+                            ) {
+                                return Err(DeviceError(format!(
+                                    "opencl: zero found_flag write failed: {e:?}"
+                                )));
                             }
                         }
                         let end_u32 = nonce_end; // hard cap respected by kernel
                         unsafe {
-                            if ExecuteKernel::new(&pipe.kernel)
+                            if let Err(e) = ExecuteKernel::new(&pipe.kernel)
                                 .set_arg(&pipe.mid_buf)
                                 .set_arg(&pipe.tail_buf)
                                 .set_arg(&pipe.target_buf)
@@ -271,9 +273,10 @@ impl MiningBackend for OpenclBackend {
                                 .set_global_work_size(global)
                                 .set_local_work_size(local_size)
                                 .enqueue_nd_range(queue)
-                                .is_err()
                             {
-                                return None;
+                                return Err(DeviceError(format!(
+                                    "opencl: kernel enqueue failed: {e:?}"
+                                )));
                             }
                         }
                         pipe.in_flight = true;
@@ -290,7 +293,7 @@ impl MiningBackend for OpenclBackend {
             // 3) If we couldn't launch and neither pipe is busy, the whole
             //    nonce range is exhausted.
             if !launched && !a.in_flight && !b.in_flight {
-                return None;
+                return Ok(None);
             }
 
             current_pipe ^= 1;
@@ -322,34 +325,40 @@ fn pick_pipe<'a>(
 }
 
 /// Wait for `pipe`'s pending launch and read out the flag/nonce/hash.
-fn drain_pipe(queue: &CommandQueue, pipe: &mut PipeRes) -> Option<MiningResult> {
-    let _ = queue.finish();
+/// `Ok(None)` = the launch completed cleanly with no find; `Err` = the DEVICE
+/// faulted (failed finish/readback) — pre-IMP-1b these errors were
+/// `.ok()?`-mapped to the same `None` as "no find", silently swallowing a
+/// dead queue/context.
+fn drain_pipe(queue: &CommandQueue, pipe: &mut PipeRes) -> Result<Option<MiningResult>, DeviceError> {
+    queue
+        .finish()
+        .map_err(|e| DeviceError(format!("opencl: queue finish failed: {e:?}")))?;
     let mut flag = [0u32; 1];
     unsafe {
         queue
             .enqueue_read_buffer(&pipe.found_flag, CL_BLOCKING, 0, &mut flag, &[])
-            .ok()?;
+            .map_err(|e| DeviceError(format!("opencl: read found_flag failed: {e:?}")))?;
     }
     if flag[0] == 0 {
-        return None;
+        return Ok(None);
     }
     let mut nonce_out = [0u32; 1];
     let mut hash_words = [0u32; 8];
     unsafe {
         queue
             .enqueue_read_buffer(&pipe.found_nonce, CL_BLOCKING, 0, &mut nonce_out, &[])
-            .ok()?;
+            .map_err(|e| DeviceError(format!("opencl: read found_nonce failed: {e:?}")))?;
         queue
             .enqueue_read_buffer(&pipe.found_hash, CL_BLOCKING, 0, &mut hash_words, &[])
-            .ok()?;
+            .map_err(|e| DeviceError(format!("opencl: read found_hash failed: {e:?}")))?;
     }
     let mut hash = [0u8; 32];
     for i in 0..8 {
         let be = hash_words[i].to_be_bytes();
         hash[4 * i..4 * i + 4].copy_from_slice(&be);
     }
-    Some(MiningResult {
+    Ok(Some(MiningResult {
         nonce: nonce_out[0],
         hash,
-    })
+    }))
 }

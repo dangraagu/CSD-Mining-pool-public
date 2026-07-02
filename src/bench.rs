@@ -267,11 +267,11 @@ mod tests {
             start: u32,
             end: u32,
             _stop: &AtomicBool,
-        ) -> Option<MiningResult> {
+        ) -> Result<Option<MiningResult>, crate::backend::DeviceError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             self.max_start.fetch_max(start, Ordering::Relaxed);
             self.max_end.fetch_max(end, Ordering::Relaxed);
-            None
+            Ok(None)
         }
     }
 
@@ -291,13 +291,13 @@ mod tests {
             _s: u32,
             _e: u32,
             stop: &AtomicBool,
-        ) -> Option<MiningResult> {
+        ) -> Result<Option<MiningResult>, crate::backend::DeviceError> {
             // Spin until the (caller-or-timer) stop fires. A real backend would be
             // doing GPU launches between these polls; we just wait.
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(5));
             }
-            None
+            Ok(None)
         }
     }
 
@@ -372,8 +372,8 @@ mod tests {
             _s: u32,
             _e: u32,
             _stop: &AtomicBool,
-        ) -> Option<MiningResult> {
-            None
+        ) -> Result<Option<MiningResult>, crate::backend::DeviceError> {
+            Ok(None)
         }
     }
 
@@ -392,7 +392,7 @@ mod tests {
             _s: u32,
             _e: u32,
             _stop: &AtomicBool,
-        ) -> Option<MiningResult> {
+        ) -> Result<Option<MiningResult>, crate::backend::DeviceError> {
             panic!("backend exploded mid-benchmark");
         }
     }

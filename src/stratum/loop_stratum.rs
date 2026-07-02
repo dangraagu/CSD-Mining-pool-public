@@ -26,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 
-use crate::backend::{MiningBackend, MiningResult};
+use crate::backend::{DeviceError, MiningBackend, MiningResult};
 use crate::coinbase::{coinbase_txid, header_84, merkle_root_from_branch};
 use crate::gpu_watchdog::{
     gpu_watchdog_tick, GpuWatchdogCfg, GpuWatchdogState, GpuWatchdogView, Recoverable,
@@ -423,6 +423,19 @@ fn format_health_line(h: &HealthSnapshot, difficulty: f64, hw_err: u64) -> Strin
 /// `jobs_flowing` goes false) rather than both firing.
 const GPU_WD_JOB_FRESH_SECS: u64 = 120;
 
+/// Pause between launches while the GPU backend is FAULTING (`hash_range`
+/// returned `Err(DeviceError)`). A fast-failing device returns in microseconds;
+/// without a backoff the loop would hot-spin re-deriving work and re-launching
+/// against a dead driver. 250ms keeps the loop responsive to `stop`/new jobs
+/// while the starved heartbeat lets the GPU watchdog's dwell (~60s) trip its
+/// existing recover→exit(17) ladder. (IMP-1b — error-path only; a healthy
+/// backend never sleeps here.)
+const GPU_FAULT_BACKOFF: Duration = Duration::from_millis(250);
+
+/// Rate limit for the repeated "device errors continuing" WARN within one
+/// fault streak (the FIRST fault of a streak always logs + attempts recovery).
+const GPU_FAULT_LOG_EVERY: Duration = Duration::from_secs(10);
+
 /// Pure: from a [`HealthSnapshot`], are fresh jobs flowing? True iff a job has
 /// been seen and its age is within [`GPU_WD_JOB_FRESH_SECS`]. `None` job age
 /// (no job yet) ⇒ false: a miner waiting for its first job is idle, never a
@@ -728,6 +741,15 @@ pub fn run_stratum_full<B: MiningBackend + Recoverable + Sync, W: WorkSource + S
         .checked_sub(Duration::from_secs(60))
         .unwrap_or_else(Instant::now);
 
+    // IMP-1b fault bookkeeping: consecutive `Err(DeviceError)` sweeps from the
+    // GPU backend. While > 0 the loop does NOT feed the wedge heartbeat and
+    // does NOT count the faulted range toward hashrate; any clean sweep resets
+    // it. `last_fault_log` rate-limits the continuing-fault WARN.
+    let mut gpu_fault_streak: u64 = 0;
+    let mut last_fault_log = Instant::now()
+        .checked_sub(Duration::from_secs(60))
+        .unwrap_or_else(Instant::now);
+
     // The miner-rolled high half of the coinbase extranonce. Bumped once per
     // exhausted launch. The low half (xn1) is pool-fixed and NEVER rolled here.
     // Seeded per-process so co-fleet rigs (same address, one process per GPU)
@@ -928,7 +950,8 @@ pub fn run_stratum_full<B: MiningBackend + Recoverable + Sync, W: WorkSource + S
             let template_id = template.id;
             let cpu_swept = Arc::new(AtomicU64::new(0));
 
-            let gpu_result: Mutex<Option<MiningResult>> = Mutex::new(None);
+            let gpu_result: Mutex<Result<Option<MiningResult>, DeviceError>> =
+                Mutex::new(Ok(None));
             let gpu_result_ref = &gpu_result;
 
             let midstate = midstate_of_first_chunk_fast(&hdr);
@@ -1006,27 +1029,83 @@ pub fn run_stratum_full<B: MiningBackend + Recoverable + Sync, W: WorkSource + S
                 let res = if gend > gstart {
                     backend.hash_range(hdr, target, gstart, gend, backend_stop)
                 } else {
-                    None
+                    Ok(None)
                 };
                 *gpu_result_ref.lock().unwrap() = res;
                 iter_stop.store(true, Ordering::Release);
             });
 
-            let gpu_found = gpu_result.into_inner().unwrap();
+            let gpu_outcome = gpu_result.into_inner().unwrap();
             let cpu_found = cpu_winner.lock().unwrap().clone();
             let cpu_swept_n = cpu_swept.load(Ordering::Relaxed) as u128;
-            let gpu_swept = (gpu_range.1 as u128).saturating_sub(gpu_range.0 as u128);
-            gpu_nonces_since_log = gpu_nonces_since_log.saturating_add(gpu_swept);
             cpu_nonces_since_log = cpu_nonces_since_log.saturating_add(cpu_swept_n);
 
-            // GPU watchdog heartbeat: this launch completed (hash_range returned),
-            // so the kernel is NOT wedged. Stamp it so the watchdog's
-            // stale-sample check sees the loop is alive; a hung kernel that never
-            // returns from hash_range stops reaching here and the stamp ages out.
-            // (Only meaningful when a GPU range was actually dispatched.)
-            if gpu_range.1 > gpu_range.0 {
-                gpu_sample.touch(now_unix_ms());
-            }
+            // IMP-1b: a device-FAULTED sweep (`Err`) is now distinguishable from
+            // a clean empty one (`Ok(None)`). On a clean sweep everything below
+            // is byte-identical to the pre-fix loop; on a fault the loop
+            //   - WARNs with the device error text,
+            //   - attempts the existing in-process recover() ONCE per streak
+            //     (the GPU watchdog owns further escalation → exit(17)),
+            //   - does NOT count the un-swept range toward hashrate (no
+            //     phantom H/s), and
+            //   - does NOT feed the wedge heartbeat (`touch`), so a
+            //     fast-failing GPU goes stale/floored and the watchdog's
+            //     existing dwell → recover → exit ladder trips naturally.
+            let gpu_found = match gpu_outcome {
+                Ok(found) => {
+                    // Clean sweep (found / exhausted / cancelled): count the
+                    // dispatched range + feed the heartbeat, exactly as before.
+                    let gpu_swept =
+                        (gpu_range.1 as u128).saturating_sub(gpu_range.0 as u128);
+                    gpu_nonces_since_log = gpu_nonces_since_log.saturating_add(gpu_swept);
+
+                    // GPU watchdog heartbeat: this launch completed cleanly
+                    // (hash_range returned Ok), so the kernel is NOT wedged.
+                    // Stamp it so the watchdog's stale-sample check sees the
+                    // loop is alive; a hung kernel that never returns from
+                    // hash_range stops reaching here and the stamp ages out.
+                    // (Only meaningful when a GPU range was actually dispatched.)
+                    if gpu_range.1 > gpu_range.0 {
+                        gpu_sample.touch(now_unix_ms());
+                    }
+                    if gpu_fault_streak > 0 {
+                        tracing::info!(
+                            "gpu: device recovered after {gpu_fault_streak} consecutive faulted sweep(s); resuming normal operation"
+                        );
+                        gpu_fault_streak = 0;
+                    }
+                    found
+                }
+                Err(e) => {
+                    gpu_fault_streak = gpu_fault_streak.saturating_add(1);
+                    if gpu_fault_streak == 1 {
+                        tracing::warn!(
+                            "gpu: device error during sweep: {e} — attempting in-process recovery"
+                        );
+                        last_fault_log = Instant::now();
+                        if backend.recover() {
+                            tracing::warn!(
+                                "gpu: in-process recovery rebuild succeeded; next sweep will confirm"
+                            );
+                        } else {
+                            tracing::warn!(
+                                "gpu: in-process recovery FAILED; heartbeat starved — the GPU watchdog will escalate if faults persist"
+                            );
+                        }
+                    } else if last_fault_log.elapsed() >= GPU_FAULT_LOG_EVERY {
+                        tracing::warn!(
+                            "gpu: device errors continuing (streak={gpu_fault_streak}): {e}"
+                        );
+                        last_fault_log = Instant::now();
+                    }
+                    // No touch(), no swept-nonce accounting: the heartbeat
+                    // starves and the published GPU rate is honestly ~0.0, so
+                    // the watchdog floors it. Brief backoff so a fast-failing
+                    // device doesn't hot-spin the loop.
+                    std::thread::sleep(GPU_FAULT_BACKOFF);
+                    None
+                }
+            };
 
             enum WinSource {
                 Gpu(MiningResult),
@@ -1371,8 +1450,8 @@ mod tests {
             _s: u32,
             _e: u32,
             _stop: &AtomicBool,
-        ) -> Option<MiningResult> {
-            None
+        ) -> Result<Option<MiningResult>, DeviceError> {
+            Ok(None)
         }
     }
     impl Recoverable for NullGpu {} // default no-op recover()
@@ -1458,9 +1537,10 @@ mod tests {
 
         // And the null GPU contributes nothing (CPU is the only finder here).
         let g = NullGpu;
-        assert!(g
-            .hash_range(hdr, easy_target, 0, 64, &AtomicBool::new(false))
-            .is_none());
+        assert!(matches!(
+            g.hash_range(hdr, easy_target, 0, 64, &AtomicBool::new(false)),
+            Ok(None)
+        ));
     }
 
     // --- live wiring: run_stratum against a fake bridge over a real socket ---
@@ -1633,10 +1713,10 @@ mod tests {
             _s: u32,
             _e: u32,
             stop: &AtomicBool,
-        ) -> Option<MiningResult> {
+        ) -> Result<Option<MiningResult>, DeviceError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             if let Some(found) = self.script.lock().unwrap().pop_front().flatten() {
-                return Some(found);
+                return Ok(Some(found));
             }
             // No scripted find. A *returning* backend mimics a real finite sweep:
             // return None at once so the loop re-dispatches each iteration (and
@@ -1645,12 +1725,12 @@ mod tests {
             // stop. NOTE: these tests run cpu_threads=0, so run_stratum passes the
             // outer `stop` to the backend directly (C1 removed the poller).
             if self.return_when_empty {
-                return None;
+                return Ok(None);
             }
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(1));
             }
-            None
+            Ok(None)
         }
     }
     impl Recoverable for MockBackend {
@@ -2438,6 +2518,202 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         assert!(handle.join().expect("no panic").is_ok());
         assert!(dispatched, "resuming the gate must re-enable GPU launches");
+    }
+
+    // --- IMP-1b: device errors must SURFACE (recover + starve heartbeat) ---
+
+    /// A backend whose EVERY sweep faults at the device level (driver error /
+    /// failed launch / dead memcpy). The pre-fix cuda.rs/opencl.rs map such
+    /// errors to the same bare `None` as a clean "swept, found nothing" sweep,
+    /// so the loop treats a fast-failing GPU as healthy: it never attempts
+    /// recovery, keeps the wedge heartbeat fresh, and counts the un-swept
+    /// range as hashed. This mock faults the way the real backends do and
+    /// records `recover()` attempts so the test can prove the loop reacts.
+    struct FaultingBackend {
+        calls: AtomicUsize,
+        recover_calls: AtomicUsize,
+    }
+    impl FaultingBackend {
+        fn new() -> Self {
+            FaultingBackend {
+                calls: AtomicUsize::new(0),
+                recover_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+    impl MiningBackend for FaultingBackend {
+        fn name(&self) -> &'static str {
+            "faulting"
+        }
+        fn hash_range(
+            &self,
+            _h: [u8; 84],
+            _t: [u8; 32],
+            _s: u32,
+            _e: u32,
+            _stop: &AtomicBool,
+        ) -> Result<Option<MiningResult>, DeviceError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            // Post-fix: the real backends now surface a device fault as
+            // `Err(DeviceError)` (pre-fix they returned a bare `None`, which
+            // made this test fail — the pasted-in-commit swallow proof).
+            Err(DeviceError(
+                "injected: CUDA_ERROR_LAUNCH_FAILED (test fault)".to_string(),
+            ))
+        }
+    }
+    impl Recoverable for FaultingBackend {
+        fn recover(&self) -> bool {
+            self.recover_calls.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+    }
+
+    /// IMP-1b core: a device-faulting sweep must make the loop WARN + attempt
+    /// the existing in-process `recover()` path. On the PRE-FIX code the fault
+    /// is swallowed as a clean empty sweep, so `recover()` is never called and
+    /// this test FAILS — proving the swallow.
+    #[test]
+    fn gpu_device_error_surfaces_and_attempts_recovery() {
+        let work = Arc::new(MockWorkSource::new(mock_job(), 1024.0).with_fresh_jobs());
+        let backend = Arc::new(FaultingBackend::new());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let work_l = Arc::clone(&work);
+        let backend_l = Arc::clone(&backend);
+        let stop_l = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let cfg = MiningConfig { cpu_threads: 0, cpu_share: 0.0 };
+            run_stratum(backend_l.as_ref(), work_l.as_ref(), stop_l, cfg)
+        });
+
+        // Wait (up to ~5s) for at least two consecutive faulted sweeps to be
+        // dispatched (the fault backoff paces them ~250ms apart post-fix).
+        for _ in 0..500 {
+            if backend.calls.load(Ordering::Relaxed) >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert!(handle.join().expect("no panic").is_ok());
+        assert!(
+            backend.calls.load(Ordering::Relaxed) >= 2,
+            "the loop must have dispatched the faulting backend repeatedly"
+        );
+        assert!(
+            backend.recover_calls.load(Ordering::Relaxed) >= 1,
+            "a device-faulting sweep must trigger the loop's in-process recovery \
+             path (WARN + backend.recover()); pre-fix the error is swallowed as \
+             a clean empty sweep and recovery never runs"
+        );
+        assert!(
+            work.submits.lock().unwrap().is_empty(),
+            "a faulting backend must never produce a submit"
+        );
+    }
+
+    /// A backend driven by a script of sweep OUTCOMES (fault / clean-empty);
+    /// once the script is exhausted it blocks until `stop` so the loop idles.
+    /// Records `recover()` calls — the loop attempts recovery only on the FIRST
+    /// fault of each consecutive streak, so the recover count equals the number
+    /// of distinct fault streaks.
+    struct ScriptedFaultBackend {
+        script: Mutex<VecDeque<Result<Option<MiningResult>, DeviceError>>>,
+        calls: AtomicUsize,
+        recover_calls: AtomicUsize,
+    }
+    impl ScriptedFaultBackend {
+        fn new(script: Vec<Result<Option<MiningResult>, DeviceError>>) -> Self {
+            ScriptedFaultBackend {
+                script: Mutex::new(script.into()),
+                calls: AtomicUsize::new(0),
+                recover_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+    impl MiningBackend for ScriptedFaultBackend {
+        fn name(&self) -> &'static str {
+            "scripted-fault"
+        }
+        fn hash_range(
+            &self,
+            _h: [u8; 84],
+            _t: [u8; 32],
+            _s: u32,
+            _e: u32,
+            stop: &AtomicBool,
+        ) -> Result<Option<MiningResult>, DeviceError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(outcome) = self.script.lock().unwrap().pop_front() {
+                return outcome;
+            }
+            // Script exhausted: block until stop (keeps call counts exact).
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(None)
+        }
+    }
+    impl Recoverable for ScriptedFaultBackend {
+        fn recover(&self) -> bool {
+            self.recover_calls.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+    }
+
+    /// IMP-1b streak reset: a SUCCESSFUL (clean) sweep resets the fault streak,
+    /// so a later fault starts a NEW streak and triggers recovery again. Script
+    /// = fault, fault, clean, fault: recovery must run exactly once per streak
+    /// start (calls 1 and 4) — 2 total, not 1 (streak never reset) and not 3
+    /// (recovery on every fault).
+    #[test]
+    fn gpu_fault_streak_resets_on_successful_sweep() {
+        let work = Arc::new(MockWorkSource::new(mock_job(), 1024.0).with_fresh_jobs());
+        let fault = || {
+            Err(DeviceError(
+                "injected: CL_DEVICE_NOT_AVAILABLE (test fault)".to_string(),
+            ))
+        };
+        let backend = Arc::new(ScriptedFaultBackend::new(vec![
+            fault(),  // streak 1 starts → recover #1
+            fault(),  // streak continues → no recover
+            Ok(None), // clean sweep → streak resets
+            fault(),  // streak 2 starts → recover #2
+        ]));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let work_l = Arc::clone(&work);
+        let backend_l = Arc::clone(&backend);
+        let stop_l = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let cfg = MiningConfig { cpu_threads: 0, cpu_share: 0.0 };
+            run_stratum(backend_l.as_ref(), work_l.as_ref(), stop_l, cfg)
+        });
+
+        // Wait (generously) for the whole script to be consumed — the three
+        // faulted sweeps each incur the ~250ms fault backoff.
+        for _ in 0..800 {
+            if backend.calls.load(Ordering::Relaxed) >= 5 {
+                break; // 4 scripted outcomes + the blocking idle call
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert!(handle.join().expect("no panic").is_ok());
+        assert!(
+            backend.calls.load(Ordering::Relaxed) >= 4,
+            "the whole fault/clean/fault script must have been dispatched, got {}",
+            backend.calls.load(Ordering::Relaxed)
+        );
+        assert_eq!(
+            backend.recover_calls.load(Ordering::Relaxed),
+            2,
+            "recovery must run exactly once per fault STREAK (2 streaks): the \
+             clean sweep in between must reset the streak, and consecutive \
+             faults within a streak must not re-attempt recovery"
+        );
+        assert!(work.submits.lock().unwrap().is_empty());
     }
 
     /// With the watchdog DISABLED (the `run_stratum` shim's path), behaviour is

@@ -9,7 +9,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
-use crate::backend::{MiningBackend, MiningResult};
+use crate::backend::{DeviceError, MiningBackend, MiningResult};
 use crate::gpu_watchdog::Recoverable;
 use crate::sha256d_cpu::{finish_sha256d_from_midstate_fast, midstate_of_first_chunk_fast};
 
@@ -51,9 +51,9 @@ impl MiningBackend for CpuBackend {
         nonce_start: u32,
         nonce_end: u32,
         stop: &AtomicBool,
-    ) -> Option<MiningResult> {
+    ) -> Result<Option<MiningResult>, DeviceError> {
         if nonce_end <= nonce_start {
-            return None;
+            return Ok(None);
         }
         let midstate = midstate_of_first_chunk_fast(&header_84);
 
@@ -118,8 +118,11 @@ impl MiningBackend for CpuBackend {
             }
         });
 
+        // The CPU backend has no device to fault: every sweep is clean, so
+        // this is always `Ok` (the `DeviceError` arm exists only for the GPU
+        // backends — type plumbing, no CPU behaviour change).
         let g = found.lock().unwrap();
-        *g
+        Ok(*g)
     }
 }
 
@@ -195,9 +198,9 @@ mod tests {
              past nonce_end instead of exhausting"
         );
         assert!(
-            result.is_none(),
+            matches!(result, Ok(None)),
             "no nonce can satisfy an all-zero target; a clean exhausted sweep \
-             returns None"
+             returns Ok(None)"
         );
     }
 
@@ -234,6 +237,7 @@ mod tests {
         let stop = AtomicBool::new(false);
         let res = backend
             .hash_range(header, best_hash, start, end, &stop)
+            .expect("a CPU sweep never faults")
             .expect("the minimum-hash nonce satisfies hash <= target");
         assert_eq!(res.nonce, best_nonce, "must find the argmin nonce");
         assert_eq!(res.hash, best_hash, "returned hash must be its sha256d");

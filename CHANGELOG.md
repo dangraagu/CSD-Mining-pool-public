@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased / v0.1.20 queue
+
+- GPU device errors now surface (`hash_range` → `Err(DeviceError)`) and trigger
+  in-process recovery + the GPU watchdog (heartbeat starved, no phantom hashrate
+  from faulted sweeps) — was: silently mapped to the same `None` as a clean empty
+  sweep, so a fast-failing GPU looked alive while mining nothing. [IMP-1b]
+
 ## 0.1.19
 
 HiveOS + Windows: auto-detect the GPU and fetch the matching build when `--backend`

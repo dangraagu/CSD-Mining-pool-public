@@ -45,4 +45,4 @@ pub mod csd_consensus {
     pub use crate::consensus_types::*;
 }
 
-pub use backend::{MiningBackend, MiningResult};
+pub use backend::{DeviceError, MiningBackend, MiningResult};

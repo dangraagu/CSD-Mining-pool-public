@@ -247,6 +247,18 @@ fn eval_backend(
         let elapsed_micros = started.elapsed().as_micros();
         total_micros += elapsed_micros;
 
+        // IMP-1b: a device fault is now distinguishable from a clean empty
+        // sweep — report it as its own failure note instead of the misleading
+        // "backend missed a solution" the old None-mapping produced.
+        let res = match res {
+            Ok(r) => r,
+            Err(e) => {
+                notes.push(format!("trial {}: DEVICE ERROR: {}", trial, e));
+                pass = false;
+                continue;
+            }
+        };
+
         match res {
             Some(MiningResult { nonce, hash }) => {
                 total_solves += 1;

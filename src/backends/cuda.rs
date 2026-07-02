@@ -34,7 +34,7 @@ use cudarc::driver::{
 };
 use cudarc::nvrtc::Ptx;
 
-use crate::backend::{MiningBackend, MiningResult};
+use crate::backend::{DeviceError, MiningBackend, MiningResult};
 use crate::backends::autotune::{
     self, candidate_geometries, pick_best, CachedGeometry, GeometryMeasurement,
 };
@@ -326,9 +326,9 @@ impl MiningBackend for CudaBackend {
         nonce_start: u32,
         nonce_end: u32,
         stop: &AtomicBool,
-    ) -> Option<MiningResult> {
+    ) -> Result<Option<MiningResult>, DeviceError> {
         if nonce_end <= nonce_start {
-            return None;
+            return Ok(None);
         }
 
         let midstate = midstate_of_first_chunk(&header_84);
@@ -338,11 +338,15 @@ impl MiningBackend for CudaBackend {
         // iter-hotpath #2: borrow the persistent pipes for this call
         // instead of rebuilding them. The mutex is uncontended in
         // practice — each backend is owned by one mining thread.
+        //
+        // IMP-1b: every device-level failure below returns `Err(DeviceError)`
+        // instead of the old bare `None`, so the mining loop can tell a
+        // faulted sweep (log + recover + starve the wedge heartbeat + skip
+        // hashrate accounting) apart from a clean empty one.
         let mut pipes = match self.pipes.lock() {
             Ok(g) => g,
             Err(e) => {
-                tracing::error!("cuda: pipes mutex poisoned: {}", e);
-                return None;
+                return Err(DeviceError(format!("cuda: pipes mutex poisoned: {e}")));
             }
         };
 
@@ -351,12 +355,10 @@ impl MiningBackend for CudaBackend {
         // the old setup_pipe() — 6 small H2D memcpys (3 per pipe) and
         // zero allocations.
         if let Err(e) = prime_pipe(&mut pipes.a, &midstate, &tail_16, &target) {
-            tracing::error!("cuda: prime pipe A failed: {}", e);
-            return None;
+            return Err(DeviceError(format!("cuda: prime pipe A failed: {e}")));
         }
         if let Err(e) = prime_pipe(&mut pipes.b, &midstate, &tail_16, &target) {
-            tracing::error!("cuda: prime pipe B failed: {}", e);
-            return None;
+            return Err(DeviceError(format!("cuda: prime pipe B failed: {e}")));
         }
 
         let cfg = LaunchConfig {
@@ -377,14 +379,16 @@ impl MiningBackend for CudaBackend {
 
         loop {
             if stop.load(Ordering::Relaxed) {
-                return None;
+                return Ok(None);
             }
             let pipe: &mut PipeRes = if current_pipe == 0 { &mut *a } else { &mut *b };
 
-            // Drain if in flight.
+            // Drain if in flight. A drain-side device error (failed
+            // synchronize / readback) surfaces as `Err` — the launch did NOT
+            // provably sweep its nonces.
             if pipe.in_flight {
-                if let Some(res) = drain_pipe(pipe) {
-                    return Some(res);
+                if let Some(res) = drain_pipe(pipe)? {
+                    return Ok(Some(res));
                 }
                 pipe.in_flight = false;
             }
@@ -394,8 +398,10 @@ impl MiningBackend for CudaBackend {
                 if launch_size > 0 {
                     let start_u32 = next_start as u32;
                     let zeros = [0u32];
-                    if pipe.stream.memcpy_htod(&zeros, &mut pipe.found_flag).is_err() {
-                        return None;
+                    if let Err(e) = pipe.stream.memcpy_htod(&zeros, &mut pipe.found_flag) {
+                        return Err(DeviceError(format!(
+                            "cuda: zero found_flag memcpy failed: {e}"
+                        )));
                     }
                     let end_u32 = nonce_end;
 
@@ -410,14 +416,14 @@ impl MiningBackend for CudaBackend {
                     builder.arg(&mut pipe.found_flag);
                     builder.arg(&mut pipe.found_hash);
                     let launch_result = unsafe { builder.launch(cfg) };
-                    if launch_result.is_err() {
-                        return None;
+                    if let Err(e) = launch_result {
+                        return Err(DeviceError(format!("cuda: kernel launch failed: {e}")));
                     }
                     pipe.in_flight = true;
                     next_start = next_start.saturating_add(launch_size);
                 }
             } else if !a.in_flight && !b.in_flight {
-                return None;
+                return Ok(None);
             }
 
             current_pipe ^= 1;
@@ -433,23 +439,39 @@ impl Recoverable for CudaBackend {
     }
 }
 
-fn drain_pipe(pipe: &mut PipeRes) -> Option<MiningResult> {
-    pipe.stream.synchronize().ok()?;
-    let flag_host: Vec<u32> = pipe.stream.clone_dtoh(&pipe.found_flag).ok()?;
+/// Wait for `pipe`'s pending launch and read out the flag/nonce/hash.
+/// `Ok(None)` = the launch completed cleanly with no find; `Err` = the DEVICE
+/// faulted (failed synchronize / readback) — pre-IMP-1b these errors were
+/// `.ok()?`-mapped to the same `None` as "no find", silently swallowing e.g.
+/// a TDR reset mid-drain.
+fn drain_pipe(pipe: &mut PipeRes) -> Result<Option<MiningResult>, DeviceError> {
+    pipe.stream
+        .synchronize()
+        .map_err(|e| DeviceError(format!("cuda: stream synchronize failed: {e}")))?;
+    let flag_host: Vec<u32> = pipe
+        .stream
+        .clone_dtoh(&pipe.found_flag)
+        .map_err(|e| DeviceError(format!("cuda: read found_flag failed: {e}")))?;
     if flag_host[0] == 0 {
-        return None;
+        return Ok(None);
     }
-    let nonce_host: Vec<u32> = pipe.stream.clone_dtoh(&pipe.found_nonce).ok()?;
-    let hash_host: Vec<u32> = pipe.stream.clone_dtoh(&pipe.found_hash).ok()?;
+    let nonce_host: Vec<u32> = pipe
+        .stream
+        .clone_dtoh(&pipe.found_nonce)
+        .map_err(|e| DeviceError(format!("cuda: read found_nonce failed: {e}")))?;
+    let hash_host: Vec<u32> = pipe
+        .stream
+        .clone_dtoh(&pipe.found_hash)
+        .map_err(|e| DeviceError(format!("cuda: read found_hash failed: {e}")))?;
     let mut hash = [0u8; 32];
     for i in 0..8 {
         let be = hash_host[i].to_be_bytes();
         hash[4 * i..4 * i + 4].copy_from_slice(&be);
     }
-    Some(MiningResult {
+    Ok(Some(MiningResult {
         nonce: nonce_host[0],
         hash,
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
