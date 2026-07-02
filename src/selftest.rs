@@ -96,16 +96,16 @@ pub fn run(opts: SelftestOpts) -> Result<()> {
         target[i] = 0x00;
     }
 
-    let mut outcomes: Vec<Outcome> = Vec::new();
-
-    // CPU backend is the reference. Always present.
-    outcomes.push(eval_backend(
+    // CPU backend is the reference. Always present. `mut` is only exercised
+    // by the cfg-gated GPU pushes below.
+    #[cfg_attr(not(any(feature = "cuda", feature = "opencl")), allow(unused_mut))]
+    let mut outcomes: Vec<Outcome> = vec![eval_backend(
         "cpu",
         Box::new(CpuBackend::new(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))),
         &mut rng,
         &target,
         opts,
-    ));
+    )];
 
     #[cfg(feature = "opencl")]
     {

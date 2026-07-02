@@ -1483,7 +1483,7 @@ fn print_devices() -> Result<()> {
 /// Install a Ctrl-C handler that runs `handler` (which sets the stop flag) on
 /// interrupt, so the miner shuts down cleanly instead of being hard-killed.
 fn ctrlc_lite<F: Fn() + Send + 'static>(handler: F) {
-    if let Err(e) = ctrlc::set_handler(move || handler()) {
+    if let Err(e) = ctrlc::set_handler(handler) {
         tracing::warn!("could not install ctrl-c handler ({e}); Ctrl-C will hard-stop");
     }
 }
