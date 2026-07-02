@@ -19,7 +19,7 @@ ok(){ echo "  PASS: $1"; pass=$((pass + 1)); }
 no(){ echo "  FAIL: $1"; fail=$((fail + 1)); }
 
 echo "== static guards on release.yml =="
-grep -q 'cp target/release/csd-gpu-miner csd-gpu-miner-hiveos-seed' "$RY" \
+grep -q 'cp target/x86_64-unknown-linux-gnu/release/csd-gpu-miner csd-gpu-miner-hiveos-seed' "$RY" \
   && ok "CPU build is preserved to the never-overwritten seed path" \
   || no "CPU-seed preservation line missing"
 grep -q 'cp csd-gpu-miner-hiveos-seed' "$RY" \

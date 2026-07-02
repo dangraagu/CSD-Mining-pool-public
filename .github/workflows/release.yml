@@ -178,7 +178,7 @@ jobs:
           set -euo pipefail
           # Plain install first; --break-system-packages fallback covers a
           # PEP-668 "externally managed" python (harmless where not needed).
-          pip3 install cargo-zigbuild || pip3 install --break-system-packages cargo-zigbuild
+          pip3 install cargo-zigbuild==0.23.0 || pip3 install --break-system-packages cargo-zigbuild==0.23.0
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.local/bin:$PATH"
           cargo-zigbuild --version
