@@ -41,16 +41,32 @@ use crate::backends::autotune::{
 use crate::gpu_watchdog::Recoverable;
 use crate::sha256d_cpu::midstate_of_first_chunk_fast as midstate_of_first_chunk;
 
-// CUDA kernel, pre-compiled to PTX *offline* (nvcc -ptx -arch=compute_75
-// -maxrregcount=64 --use_fast_math; see scripts/build-ptx). We embed the PTX and
-// let the NVIDIA driver JIT it to SASS at module-load time, so the CUDA backend
-// needs ONLY the NVIDIA driver at runtime — NOT the CUDA Toolkit / nvrtc shared
-// library. The PTX `.version` is pinned LOW (6.3, the sm_75 floor): a newer
-// toolkit stamps a too-new ISA that older drivers reject with
-// CUDA_ERROR_UNSUPPORTED_PTX_VERSION (→ silent CPU fallback). The kernel uses only
-// old integer ops, so 6.3 is valid and loads on any CUDA-10.0+ driver.
-// Regenerate sha256d.ptx with scripts/build-ptx after editing the .cu.
-const KERNEL_PTX: &str = include_str!("../kernels/sha256d.ptx");
+// CUDA kernel, pre-compiled OFFLINE into a multi-arch FATBIN (see
+// scripts/build-fatbin). The fatbin bundles TWO images compiled from the same
+// sha256d.cu:
+//   1. a NATIVE sm_120 cubin (nvcc -cubin -arch=sm_120 -maxrregcount=128
+//      --use_fast_math) — the RTX 50-series / Blackwell SASS, no JIT; and
+//   2. the compute_75 PTX with `.version` pinned to 6.3 (scripts/build-ptx) —
+//      the PROVEN universal JIT fallback for EVERY non-sm_120 card (Turing
+//      through Blackwell, present and future), byte-for-byte the image the
+//      2080 fleet has always run.
+// We embed the fatbin bytes and hand them to the driver's `cuModuleLoadData`
+// (via cudarc `Ptx::from_binary`), which parses the container and AUTO-SELECTS
+// the sm_120 cubin on a card whose compute cap == 120 (the 5070 Ti) and JITs
+// the compute_75 PTX on anything else. Loading uses ONLY the driver — it never
+// touches NVRTC, so no CUDA Toolkit / nvrtc shared library is needed at runtime.
+//
+// The `.version 6.3` pin on the embedded PTX is LOAD-BEARING: a newer toolkit
+// stamps a too-new ISA that older drivers reject with
+// CUDA_ERROR_UNSUPPORTED_PTX_VERSION. The kernel uses only old integer ops, so
+// 6.3 is valid and JITs on any CUDA-10.0+ driver. Regenerate sha256d.fatbin
+// with scripts/build-fatbin after editing the .cu.
+//
+// To force the compute_75 PTX-JIT path even on a native-cubin card (e.g. to
+// bit-exact-verify the fleet fallback against the CPU sha256d on the dev box),
+// set the driver env var `CUDA_FORCE_PTX_JIT=1` before launch — the driver then
+// ignores the sm_120 ELF and JITs the PTX.
+const KERNEL_FATBIN: &[u8] = include_bytes!("../kernels/sha256d.fatbin");
 const KERNEL_NAME: &str = "mine_sha256d";
 
 pub struct CudaBackend {
@@ -122,16 +138,17 @@ impl CudaBackend {
         ctx.set_blocking_synchronize()
             .map_err(|e| anyhow!("cuda: set_blocking_synchronize failed: {}", e))?;
 
-        // Load the pre-compiled PTX (embedded as `KERNEL_PTX`) and hand it to the
-        // driver's built-in PTX->SASS JIT. The PTX targets the compute_75 (Turing)
-        // virtual arch, so the driver forward-JITs it onto EVERY CUDA-13-supported
-        // NVIDIA GPU (Turing through Blackwell) — this one public binary works
-        // across miners' cards. Crucially, loading pre-built PTX uses ONLY the
+        // Load the pre-compiled multi-arch FATBIN (embedded as `KERNEL_FATBIN`)
+        // and hand it to the driver's `cuModuleLoadData`. The driver parses the
+        // fatbin container and AUTO-SELECTS the native sm_120 cubin on a Blackwell
+        // card (this 5070 Ti) or JITs the embedded compute_75 PTX onto EVERY other
+        // CUDA-13-supported NVIDIA GPU (Turing through Blackwell) — this one public
+        // binary works across miners' cards. Crucially, loading uses ONLY the
         // driver (cuModuleLoadData); it never touches NVRTC, so no CUDA Toolkit /
         // nvrtc shared library is needed at runtime. (The previous code
         // NVRTC-compiled the kernel at startup and silently fell back to CPU on
         // any miner without nvrtc.dll / libnvrtc — the reported "full CPU load" bug.)
-        let ptx = Ptx::from_src(KERNEL_PTX);
+        let ptx = Ptx::from_binary(KERNEL_FATBIN.to_vec());
         let module = ctx
             .load_module(ptx)
             .map_err(|e| anyhow!("cuda: load_module failed: {}", e))?;
@@ -212,9 +229,11 @@ impl CudaBackend {
             }
         };
 
-        // Re-JIT the embedded PTX on the existing context (clears a faulted
-        // module) and reload the kernel function from the fresh module.
-        let ptx = Ptx::from_src(KERNEL_PTX);
+        // Reload the embedded fatbin on the existing context (clears a faulted
+        // module) and reload the kernel function from the fresh module. The
+        // driver re-selects the same image it picked at startup (native sm_120
+        // cubin on this card, else the compute_75 PTX JIT).
+        let ptx = Ptx::from_binary(KERNEL_FATBIN.to_vec());
         let module = match self.ctx.load_module(ptx) {
             Ok(m) => m,
             Err(e) => {

@@ -1,5 +1,11 @@
 /target
 **/*.rs.bk
+
+# Intermediate CUDA cubin: a transient build artifact of scripts/build-fatbin.bat.
+# The committed, embedded (include_bytes!) artifact is src/kernels/sha256d.fatbin,
+# which already contains this cubin; the standalone .cubin is regenerated on each
+# fatbin build, so it is not tracked.
+src/kernels/*.cubin
 # Cargo.lock IS committed: this is a binary crate shipping a TLS/crypto tree
 # (ureq+rustls+ring), so the dependency graph is pinned for reproducible,
 # auditable builds of the public auto-updating miner.
