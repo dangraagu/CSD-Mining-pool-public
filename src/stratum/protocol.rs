@@ -157,12 +157,15 @@ impl SubscribeResult {
 }
 
 /// Build a `mining.subscribe` request. We send a single user-agent string as
-/// the lone positional param; the bridge ignores it but expects an array.
+/// the lone positional param. The v0.2.0 bridge records it as the session's
+/// miner version ("csd-gpu-miner/<version>", shown on the pool dashboard);
+/// older bridges ignore the param entirely but still expect an array, so this
+/// is wire-compatible in both directions.
 pub fn subscribe_request(id: u64) -> Request {
     Request {
         id: Some(id),
         method: "mining.subscribe".to_string(),
-        params: serde_json::json!([format!("csd-pool-miner/{}", env!("CARGO_PKG_VERSION"))]),
+        params: serde_json::json!([format!("csd-gpu-miner/{}", env!("CARGO_PKG_VERSION"))]),
     }
 }
 
@@ -381,13 +384,51 @@ mod tests {
     }
 
     #[test]
+    fn authorize_request_dotted_worker_exact_wire_line() {
+        // A rig-suffixed username ("<addr40>.<rig>") must pass through to the
+        // wire VERBATIM — no re-splitting, no mangling, password stays "x".
+        // The payout identity is the part before the first '.' (the bridge
+        // strips the suffix for the money path); this test pins that the miner
+        // never alters the string it was handed.
+        let addr = "0123456789abcdef0123456789abcdef01234567";
+        let user = format!("{addr}.rig1");
+        let req = authorize_request(2, &user);
+        let line = serialize_line(&req).unwrap();
+        assert_eq!(
+            line,
+            format!("{{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"{user}\",\"x\"]}}\n")
+        );
+        // The bare payout address is recoverable byte-identically by splitting
+        // on the first '.' — the invariant the pool's PPLNS credit relies on.
+        assert_eq!(user.split('.').next().unwrap(), addr);
+    }
+
+    #[test]
     fn subscribe_request_shape() {
         let req = subscribe_request(1);
         assert_eq!(req.method, "mining.subscribe");
         assert_eq!(req.id, Some(1));
-        // A single string user-agent param in an array.
+        // A single string user-agent param in an array. The UA is
+        // "csd-gpu-miner/<version>" — the bridge records it as the session's
+        // miner version (older bridges ignore it entirely).
         assert_eq!(req.params.as_array().unwrap().len(), 1);
-        assert!(req.params[0].as_str().unwrap().starts_with("csd-pool-miner/"));
+        assert!(req.params[0].as_str().unwrap().starts_with("csd-gpu-miner/"));
+    }
+
+    #[test]
+    fn subscribe_request_exact_wire_line() {
+        // Pin the EXACT bytes that hit the socket: the UA is
+        // "csd-gpu-miner/<CARGO_PKG_VERSION>" as the lone positional param,
+        // one trailing newline, no pretty-printing.
+        let req = subscribe_request(1);
+        let line = serialize_line(&req).unwrap();
+        assert_eq!(
+            line,
+            format!(
+                "{{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"csd-gpu-miner/{}\"]}}\n",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
     }
 
     #[test]
