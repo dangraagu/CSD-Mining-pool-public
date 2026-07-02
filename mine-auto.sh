@@ -625,7 +625,11 @@ reexec_new_launcher() {
   fi
   # g3: refuse a syntactically-broken script BEFORE exec; put the .bak back.
   if ! bash -n "$SELF_PATH" 2>/dev/null; then
-    [ -f "$SELF_PATH.bak" ] && cp -p "$SELF_PATH.bak" "$SELF_PATH" 2>/dev/null || true
+    # explicit if-then (not `A && B || true`): identical fail-safe semantics,
+    # and clean under shellcheck 0.9.x (SC2015) which gates the release CI.
+    if [ -f "$SELF_PATH.bak" ]; then
+      cp -p "$SELF_PATH.bak" "$SELF_PATH" 2>/dev/null || true
+    fi
     reexec_refuse "refreshed launcher failed the bash -n syntax gate (restored $SELF_PATH.bak over it)"
     return 1
   fi
