@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased / v0.1.20 queue
+## v0.2.0 (unreleased) — the refactor release
 
 - GPU device errors now surface (`hash_range` → `Err(DeviceError)`) and trigger
   in-process recovery + the GPU watchdog (heartbeat starved, no phantom hashrate
