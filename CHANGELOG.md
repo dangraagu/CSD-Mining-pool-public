@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.2.1 — 2026-07-02 — Linux compatibility hotfix
+
+- **Linux binaries are now built portable to glibc ≥ 2.27** (via `cargo zigbuild
+  --target x86_64-unknown-linux-gnu.2.27`), so they run on stock HiveOS images
+  again. v0.2.0's Linux binaries were built on GitHub's ubuntu-24.04 runners
+  against glibc 2.39 and crash-looped on HiveOS rigs (glibc 2.27/2.31) with
+  `/lib/x86_64-linux-gnu/libc.so.6: version 'GLIBC_2.39' not found` (exit 1,
+  relaunch loop).
+- **Binary logic is unchanged from v0.2.0** — same code, same features per
+  variant (cpu / cuda+nvml / opencl); only the Linux build toolchain changed.
+- **New permanent CI gate ("glibc floor gate"):** the release workflow now runs
+  an objdump max-`GLIBC_*` check over every `csd-pool-miner-linux-*` asset and
+  hard-fails if any requires > 2.27 — fail-closed against future runner
+  migrations. (The bundled prebuilt `csd-relay-node` is fetched, not built here,
+  and is a known separate issue — not covered by this gate.)
+- **Windows rigs are unaffected** (they were never broken; v0.2.0 Windows
+  binaries mine fine).
+
 ## v0.2.0 — 2026-07-02 — the refactor release
 
 ### ⚠️ Behavior changes (operator-visible)
