@@ -724,7 +724,7 @@ else
 fi
 # ── end SP2 relay launch ──────────────────────────────────────────────────────
 
-# Driver check: warn (don't hard-exit — the binary auto-falls back to CPU) when a
+# Driver check: warn (don't hard-exit here) when a
 # GPU backend is going to be USED but its driver/GPU isn't actually present, so the
 # operator sees why. Derive the target from the RESOLVED variant (update_variant),
 # NOT raw $EXTRA_FLAGS: an address-only or `--backend auto` flightsheet now
@@ -736,12 +736,12 @@ RESOLVED_VARIANT="$(update_variant)"
 case "$RESOLVED_VARIANT" in
   nvidia)
     if ! command -v nvidia-smi >/dev/null 2>&1 || ! timeout 5 nvidia-smi -L >/dev/null 2>&1; then
-      echo "[h-run] WARNING: nvidia (cuda) build selected but nvidia-smi found no GPU; the miner will auto-fall back to CPU." | tee -a "$LOG"
+      echo "[h-run] WARNING: nvidia (cuda) build selected but nvidia-smi found no GPU; under v0.2.0 the miner HARD-ERRORS (no silent CPU fallback) and mines NOTHING until the GPU/driver is fixed. Add --allow-cpu-fallback or --backend cpu only if CPU mining is intended." | tee -a "$LOG"
     fi
     ;;
   amd)
     if ! command -v clinfo >/dev/null 2>&1 || ! timeout 5 clinfo 2>/dev/null | grep -q 'Device Type.*GPU'; then
-      echo "[h-run] WARNING: amd (opencl) build selected but clinfo listed no GPU; the miner will auto-fall back to CPU." | tee -a "$LOG"
+      echo "[h-run] WARNING: amd (opencl) build selected but clinfo listed no GPU; under v0.2.0 the miner will NOT silently fall back to CPU and mines NOTHING until the GPU/driver is fixed. Add --allow-cpu-fallback or --backend cpu only if CPU mining is intended." | tee -a "$LOG"
     fi
     ;;
 esac
