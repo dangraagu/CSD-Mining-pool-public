@@ -61,12 +61,31 @@ fn explicit_pinned_geometry_suppresses() {
 }
 
 #[test]
-fn default_backend_is_cuda() {
-    // Fleet default must land on the hard-erroring forced-CUDA path (not the
-    // silent-CPU-capable Auto path).
+fn default_backend_matches_compiled_features() {
+    // Per-variant fleet default (SPEC CHANGE, v0.2.0 pre-release P0): each
+    // build's default backend targets ITS OWN compiled GPU API — cuda build →
+    // cuda, opencl build → opencl, neither → cpu. The old unconditional "cuda"
+    // default bricked the amd + cpu release variants: BackendChoice::Cuda on a
+    // no-cuda build hits `bail!("cuda backend not compiled in")` at EVERY
+    // start (crash-loop, 0 H/s fleet-wide after self-update). No-silent-CPU is
+    // preserved PER VARIANT: a GPU build still lands on its hard-erroring
+    // forced path (never the silent-CPU-capable Auto path), and the dedicated
+    // cpu variant's PURPOSE is CPU mining — not a "silent fallback".
     let cli = parse(&["csd-pool-miner", "--address", &dummy_addr()]);
-    assert!(
-        matches!(cli.backend, BackendChoice::Cuda),
-        "default --backend must be cuda (no silent CPU fallthrough)"
-    );
+    if cfg!(feature = "cuda") {
+        assert!(
+            matches!(cli.backend, BackendChoice::Cuda),
+            "cuda build: default --backend must be cuda (forced, hard-erroring)"
+        );
+    } else if cfg!(feature = "opencl") {
+        assert!(
+            matches!(cli.backend, BackendChoice::Opencl),
+            "opencl build: default --backend must be opencl (forced, hard-erroring)"
+        );
+    } else {
+        assert!(
+            matches!(cli.backend, BackendChoice::Cpu),
+            "cpu-only build: default --backend must be cpu (CPU mining IS the product)"
+        );
+    }
 }

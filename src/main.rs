@@ -106,13 +106,18 @@ pub struct Cli {
     #[arg(long)]
     discord_solutions_only: bool,
 
-    /// Backend to use. Defaults to `cuda` (not `auto`): the shipped fleet
-    /// command targets a GPU, and a GPU that fails to init must HARD-ERROR
-    /// (non-zero exit, clear log) rather than silently degrade to CPU — a
-    /// silent CPU fallback bleeds fleet hashrate invisibly. Use `--backend auto`
+    /// Backend to use. Default is PER BUILD VARIANT (`DEFAULT_BACKEND`, from
+    /// `default_backend()`): cuda build → `cuda`, opencl build → `opencl`,
+    /// cpu build → `cpu`. Each GPU variant targets ITS OWN compiled API and
+    /// HARD-ERRORS (non-zero exit, clear log) if that API fails to init,
+    /// rather than silently degrading to CPU — a silent CPU fallback bleeds
+    /// fleet hashrate invisibly. The cpu variant's default IS cpu: CPU mining
+    /// is that build's purpose, not a fallback. (An unconditional `cuda`
+    /// default would crash-loop the amd/cpu variants at every start —
+    /// `bail!("cuda backend not compiled in")`.) Use `--backend auto`
     /// (optionally with `--allow-cpu-fallback`) to opt into probing, or
     /// `--backend cpu` to force CPU explicitly.
-    #[arg(long, default_value = "cuda")]
+    #[arg(long, default_value = DEFAULT_BACKEND)]
     pub backend: BackendChoice,
 
     /// Allow silent fallback to the CPU backend when no GPU backend initializes
@@ -610,6 +615,34 @@ pub enum BackendChoice {
     Opencl,
     Cuda,
 }
+
+/// Pure per-variant default-backend selection: each build's default targets
+/// ITS OWN compiled GPU API. cuda compiled → `"cuda"`; else opencl compiled →
+/// `"opencl"`; else → `"cpu"`. A `const fn` on plain bools so ALL FOUR feature
+/// combinations are unit-testable on EVERY build (a no-cuda build can still
+/// assert what a cuda build's default would be — see `no_silent_cpu.rs`); the
+/// actual `cfg!` wiring is the thin `DEFAULT_BACKEND` const below.
+///
+/// No-silent-CPU is preserved PER VARIANT: a GPU build defaults to its own
+/// FORCED, hard-erroring backend (never the silent-CPU-capable `auto`), while
+/// the dedicated cpu build's purpose IS CPU mining. The previous unconditional
+/// `"cuda"` default bricked the amd + cpu release variants: on those builds
+/// `BackendChoice::Cuda` hits `bail!("cuda backend not compiled in")` at every
+/// start — a fleet-wide crash-loop after self-update.
+pub const fn default_backend(cuda_compiled: bool, opencl_compiled: bool) -> &'static str {
+    if cuda_compiled {
+        "cuda"
+    } else if opencl_compiled {
+        "opencl"
+    } else {
+        "cpu"
+    }
+}
+
+/// The compiled-in default `--backend` for THIS build's feature set: the thin
+/// `cfg!` wiring over the pure `default_backend()` above (clap default value).
+pub const DEFAULT_BACKEND: &str =
+    default_backend(cfg!(feature = "cuda"), cfg!(feature = "opencl"));
 
 fn num_cpus_default() -> usize {
     std::thread::available_parallelism()
