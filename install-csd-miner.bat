@@ -45,12 +45,21 @@ set "EXE=csd-pool-miner-%VARIANT%.exe"
 set "BIN=%DIR%\%EXE%"
 
 REM --- 2. VC++ runtime via winget (best-effort; skipped if absent) ---
+REM NOTE: --accept-source-agreements + --disable-interactivity on EVERY winget
+REM call below, not just the install. winget's *first-ever* invocation on a
+REM machine (any subcommand, including a plain "list") can print an
+REM interactive "Do you agree to the source agreements? [Y] Yes [N] No"
+REM prompt and block on stdin. The "list" call below redirects its output to
+REM nul, so that prompt was INVISIBLE while still parked waiting for a
+REM keypress that never comes -- a silent, permanent hang right after
+REM "Selected build: %VARIANT%" with zero visible error. Confirmed via git
+REM blame: unfixed since the installer's first commit (401f137a).
 where winget >nul 2>&1
 if !errorlevel!==0 (
-  winget list --id Microsoft.VCRedist.2015+.x64 -e >nul 2>&1
+  winget list --id Microsoft.VCRedist.2015+.x64 -e --accept-source-agreements --disable-interactivity >nul 2>&1
   if !errorlevel! NEQ 0 (
     echo Installing Microsoft VC++ runtime...
-    winget install --id Microsoft.VCRedist.2015+.x64 -e --silent --accept-source-agreements --accept-package-agreements
+    winget install --id Microsoft.VCRedist.2015+.x64 -e --silent --accept-source-agreements --accept-package-agreements --disable-interactivity
   ) else (
     echo VC++ runtime already present.
   )
