@@ -90,8 +90,9 @@ impl MiningBackend for CpuBackend {
                     loop {
                         // Job-change preemption (BUILD #2): `new_job` is OR'd into
                         // the EXISTING between-chunk cancel check. It only changes
-                        // WHEN the sweep stops (abandon stale work on a newer job),
-                        // never WHAT it computes — every hash below is byte-identical.
+                        // WHEN the sweep stops (abandon stale work on a new block =
+                        // a CHANGED prev-hash), never WHAT it computes — every hash
+                        // below is byte-identical.
                         if stop.load(Ordering::Relaxed)
                             || local_stop.load(Ordering::Relaxed)
                             || new_job.load(Ordering::Relaxed)

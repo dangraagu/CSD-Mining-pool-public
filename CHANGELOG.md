@@ -2,12 +2,12 @@
 
 ## v0.2.2 — 2026-07-11 — job-change preemption
 
-- **job-change preemption — abort in-flight sweeps on new job (fewer stale
+- **job-change preemption — abort in-flight sweeps on a new block (fewer stale
   shares).** A session-lived `new_job` cancel flag is threaded into
   `MiningBackend::hash_range` and OR'd into every backend's EXISTING
   between-launch abort check (cuda / opencl / cpu). The stratum reader sets it
-  the instant a `mining.notify` with a NEWER `job_id` (changed prev-hash)
-  arrives — the only writer that runs while the mining thread is blocked inside
+  the instant a `mining.notify` arrives on a CHANGED prev-hash (a genuine new
+  block) — the only writer that runs while the mining thread is blocked inside
   an in-flight sweep — so the GPU/CPU abandons now-stale work within one
   between-launch step instead of grinding the old prev-hash to the end of the
   slice. The loop clears the flag when it picks up the fresh job.
@@ -17,8 +17,12 @@
   byte-identical to v0.2.1. Preemption changes only WHEN a sweep stops, never
   WHAT it computes. Bench and selftest pass an always-false flag so they stay
   deterministic / uninterrupted.
-- **Preempts on a changed `job_id` only, not on `refresh_every`** — a refresh
-  re-derives the SAME job for ntime/diff drift and its work is still valid.
+- **Preempts on a changed prev-hash only (a new block), never on a same-prev
+  refresh** — the bridge re-publishes a fresh `job_id` (with `clean_jobs=true`)
+  for ntime/template drift on an UNCHANGED prev; that work is still node-valid,
+  so preempting it would drop a legit in-flight share for zero staleness benefit.
+  (`clean_jobs` is therefore NOT a sufficient gate — the bridge sets it on
+  same-prev refreshes too.)
 
 ## v0.2.1 — 2026-07-02 — Linux compatibility hotfix
 

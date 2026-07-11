@@ -981,6 +981,20 @@ fn dispatch_frame(line: &str, shared: &Shared) {
                         .as_ref()
                         .map(|j| j.notify.job_id != job_id)
                         .unwrap_or(true);
+                    // Job-change preemption gates on a CHANGED PREV-HASH (a genuine
+                    // new block), NOT on a changed job_id. The bridge mints a fresh
+                    // job_id — WITH clean_jobs=true — on same-prev TEMPLATE_REFRESH
+                    // re-publishes (ntime/template drift on an UNCHANGED prev). A
+                    // sweep in flight on that same prev is still node-valid, so
+                    // preempting it would DROP a legit share for zero staleness
+                    // benefit. Compare the incoming prev-hash to the job currently in
+                    // the slot (the prev the mining thread is grinding); a first-ever
+                    // job (empty slot) counts as changed so mining starts. Computed
+                    // before the move below, while `notify` is still borrowable.
+                    let prev_changed = slot
+                        .as_ref()
+                        .map(|j| j.notify.prev_hash_be_hex != notify.prev_hash_be_hex)
+                        .unwrap_or(true);
                     *slot = Some(StratumJob {
                         notify,
                         extranonce1_hex,
@@ -990,7 +1004,9 @@ fn dispatch_frame(line: &str, shared: &Shared) {
                             .stats
                             .last_new_job_ms
                             .store(now_unix_ms(), Ordering::Relaxed);
-                        // BUILD #2: a NEWER job_id ⇒ the prev-hash changed ⇒ any
+                    }
+                    if prev_changed {
+                        // BUILD #2: a CHANGED prev-hash ⇒ a genuine new block ⇒ any
                         // in-flight GPU sweep is now grinding stale work the pool
                         // will REJECT. Raise the job-change preempt flag so the
                         // mining thread's `hash_range` aborts at its next
@@ -1363,6 +1379,59 @@ mod tests {
         assert_eq!(
             shared.latest_job.lock().unwrap().as_ref().unwrap().notify.job_id,
             "B"
+        );
+    }
+
+    #[test]
+    fn dispatch_preempts_on_changed_prev_not_same_prev_refresh() {
+        // Job-change preemption must fire on a genuine NEW BLOCK (changed
+        // prev-hash), NOT on a same-prev TEMPLATE_REFRESH. The bridge re-publishes
+        // a fresh job_id (with clean_jobs=true) on the SAME prev for ntime/template
+        // drift; preempting the in-flight sweep for those would DROP a legit,
+        // node-valid share for zero staleness benefit. Notify param tuple is
+        // [job_id, prev_hash_be_hex, cb1, cb2, merkle, ver, nbits, ntime, clean].
+        let shared = fresh_shared("00", 4);
+
+        // First job (prev "p0"): a first-ever job counts as a changed prev ⇒ it
+        // must raise the preempt flag so mining starts on it.
+        let job_a = r#"{"id":null,"method":"mining.notify","params":["A","p0","a","b",[],"01000000","1d00ffff","60c0babe",true]}"#;
+        dispatch_frame(job_a, &shared);
+        assert!(
+            shared.new_job.load(Ordering::Relaxed),
+            "first job (new prev) must raise the preempt flag"
+        );
+
+        // The mining loop clears the flag once it picks up the fresh job.
+        shared.new_job.store(false, Ordering::Relaxed);
+
+        // Same-prev refresh: a DIFFERENT job_id ("B") with clean_jobs=true but the
+        // SAME prev-hash ("p0"). This must NOT preempt — the in-flight sweep is
+        // still on a node-valid prev.
+        let job_b_same_prev = r#"{"id":null,"method":"mining.notify","params":["B","p0","a2","b2",[],"01000000","1d00ffff","60c0cafe",true]}"#;
+        dispatch_frame(job_b_same_prev, &shared);
+        assert!(
+            !shared.new_job.load(Ordering::Relaxed),
+            "a same-prev refresh (new job_id, unchanged prev) must NOT raise the preempt flag"
+        );
+        // ...but the fresh job_id IS still stored — job tracking is unchanged.
+        assert_eq!(
+            shared
+                .latest_job
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .notify
+                .job_id,
+            "B"
+        );
+
+        // Genuine new block: prev-hash CHANGES ("p1"). This MUST preempt.
+        let job_c_new_prev = r#"{"id":null,"method":"mining.notify","params":["C","p1","a","b",[],"01000000","1d00ffff","60c0babe",true]}"#;
+        dispatch_frame(job_c_new_prev, &shared);
+        assert!(
+            shared.new_job.load(Ordering::Relaxed),
+            "a changed prev-hash (new block) MUST raise the preempt flag"
         );
     }
 

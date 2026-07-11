@@ -56,9 +56,11 @@ pub trait MiningBackend {
     ///     GPU-only mining, or the per-launch `iter_stop` for CPU+GPU dual
     ///     mining). Returns a clean `Ok(None)` when it fires.
     ///   - `new_job`: **job-change preemption**. Set by the work source the moment
-    ///     a job with a NEWER `job_id` (a changed prev-hash) arrives, so an
+    ///     a job on a CHANGED prev-hash (a genuine new block) arrives, so an
     ///     in-flight sweep abandons work the pool would now REJECT as stale
-    ///     instead of grinding the old prev-hash to the end of the slice. Either
+    ///     instead of grinding the old prev-hash to the end of the slice. A
+    ///     same-prev refresh (new job_id, unchanged prev) does NOT preempt — its
+    ///     work is still node-valid. Either
     ///     flag going true returns `Ok(None)` promptly — within one between-launch
     ///     step (~one launch). Pass an always-false flag to disable preemption
     ///     (bench / selftest need the full, uninterrupted, deterministic sweep).

@@ -402,9 +402,10 @@ impl MiningBackend for CudaBackend {
 
         loop {
             // Job-change preemption (BUILD #2): `new_job` is OR'd into the EXISTING
-            // between-launch cancel check. It abandons a now-stale sweep on a newer
-            // job; it does NOT touch the kernel launch, nonce iteration, digest, or
-            // target compare — every hash stays byte-identical to a full sweep.
+            // between-launch cancel check. It abandons a now-stale sweep on a new
+            // block (a CHANGED prev-hash); it does NOT touch the kernel launch, nonce
+            // iteration, digest, or target compare — every hash stays byte-identical
+            // to a full sweep.
             if stop.load(Ordering::Relaxed) || new_job.load(Ordering::Relaxed) {
                 return Ok(None);
             }
