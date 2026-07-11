@@ -298,6 +298,18 @@ pub trait WorkSource {
     /// running accepted total when it has grown.
     fn notify_heartbeat(&self) {}
 
+    /// The session-lived **job-change preemption** flag, if this source pushes
+    /// jobs asynchronously. The source's reader thread sets it `true` the instant
+    /// a job with a NEWER `job_id` arrives — the ONLY moment that runs CONCURRENTLY
+    /// with an in-flight `hash_range` (the mining thread is blocked in the sweep
+    /// and cannot poll for itself). The loop passes it into `hash_range` so the GPU
+    /// abandons a now-stale sweep within one between-launch step, and clears it when
+    /// it picks up the fresh job. Default `None` (the test mock / any source with
+    /// no async push) ⇒ the loop mines with preemption disabled, exactly as before.
+    fn new_job_flag(&self) -> Option<Arc<AtomicBool>> {
+        None
+    }
+
     /// Poll the next unit of work. **Default = the pool/Stratum path**
     /// (`latest_job` → `notify_to_template`); the test mock may override this.
     /// Decode/mapping failures ⇒ `Idle`.
@@ -379,6 +391,9 @@ impl WorkSource for StratumClient {
     }
     fn notify_heartbeat(&self) {
         StratumClient::notify_heartbeat_sample(self)
+    }
+    fn new_job_flag(&self) -> Option<Arc<AtomicBool>> {
+        Some(StratumClient::new_job_flag(self))
     }
     fn apply_suggest_difficulty(&self, d: f64) {
         // Cache first so the reconnect path always re-sends the latest value,
@@ -789,6 +804,20 @@ pub fn run_stratum_full<B: MiningBackend + Recoverable + Sync, W: WorkSource + S
     // enough that a kernel stuck in `synchronize()` is caught within a few polls.
     let sample_stale_after_ms = (gpu_wd_cfg.poll.as_millis() as u64).saturating_mul(3);
 
+    // Job-change preemption flag (BUILD #2). The work source's reader thread sets
+    // it the instant a job with a NEWER job_id arrives — the ONLY writer that runs
+    // while the mining thread is blocked inside an in-flight `hash_range`. We hand
+    // it to `hash_range` (BOTH the GPU-only and CPU+GPU paths) so a now-stale sweep
+    // aborts within one between-launch step instead of grinding the old prev-hash to
+    // the end of the slice, and we clear it each time we pick up a fresh job below.
+    // A source with no async push (the test mock) returns `None`; we then fall back
+    // to an always-false local flag ⇒ preemption disabled, behaviour byte-identical
+    // to before. `&AtomicBool` is Copy, so the scoped mining closure captures it
+    // freely; both owners outlive the scope.
+    let new_job_owned = client.new_job_flag();
+    let never_new_job = AtomicBool::new(false);
+    let new_job: &AtomicBool = new_job_owned.as_deref().unwrap_or(&never_new_job);
+
     // Drive the mining loop and the GPU stall watchdog inside one `thread::scope`
     // so the watchdog thread can borrow `backend`/`client` (calling
     // `backend.recover()` and `client.health()`) without a `'static` bound. The
@@ -868,6 +897,14 @@ pub fn run_stratum_full<B: MiningBackend + Recoverable + Sync, W: WorkSource + S
                 continue;
             }
         };
+        // We've folded the freshest job into `work`; clear the job-change preempt
+        // flag so THIS job's sweeps run to completion unless a job NEWER than `work`
+        // arrives (the reader re-sets it). Clearing here — BETWEEN sweeps, never
+        // during one (the loop is not inside `hash_range` at this point) — is
+        // race-free: if a newer job landed in the tiny window since `next_work()`
+        // read it, the inner loop's own `latest_job() != work.job_id` check (below)
+        // breaks BEFORE the first sweep, so no stale sweep runs regardless.
+        new_job.store(false, Ordering::Release);
         let template = &work.template;
         let branch: Vec<[u8; 32]> = template.merkle_branch.iter().map(|b| b.0).collect();
 
@@ -1024,10 +1061,13 @@ pub fn run_stratum_full<B: MiningBackend + Recoverable + Sync, W: WorkSource + S
                     &iter_stop
                 };
 
-                // GPU sweep on its assigned sub-range (main scope thread).
+                // GPU sweep on its assigned sub-range (main scope thread). `new_job`
+                // is OR'd into the backend's between-launch abort so a job change
+                // aborts a stale sweep within ~one launch (BUILD #2 preemption),
+                // independently of `backend_stop` (shutdown / CPU-win / iter_stop).
                 let (gstart, gend) = gpu_range;
                 let res = if gend > gstart {
-                    backend.hash_range(hdr, target, gstart, gend, backend_stop)
+                    backend.hash_range(hdr, target, gstart, gend, backend_stop, new_job)
                 } else {
                     Ok(None)
                 };
@@ -1450,6 +1490,7 @@ mod tests {
             _s: u32,
             _e: u32,
             _stop: &AtomicBool,
+            _new_job: &AtomicBool,
         ) -> Result<Option<MiningResult>, DeviceError> {
             Ok(None)
         }
@@ -1538,7 +1579,14 @@ mod tests {
         // And the null GPU contributes nothing (CPU is the only finder here).
         let g = NullGpu;
         assert!(matches!(
-            g.hash_range(hdr, easy_target, 0, 64, &AtomicBool::new(false)),
+            g.hash_range(
+                hdr,
+                easy_target,
+                0,
+                64,
+                &AtomicBool::new(false),
+                &AtomicBool::new(false)
+            ),
             Ok(None)
         ));
     }
@@ -1713,6 +1761,7 @@ mod tests {
             _s: u32,
             _e: u32,
             stop: &AtomicBool,
+            _new_job: &AtomicBool,
         ) -> Result<Option<MiningResult>, DeviceError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             if let Some(found) = self.script.lock().unwrap().pop_front().flatten() {
@@ -2552,6 +2601,7 @@ mod tests {
             _s: u32,
             _e: u32,
             _stop: &AtomicBool,
+            _new_job: &AtomicBool,
         ) -> Result<Option<MiningResult>, DeviceError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             // Post-fix: the real backends now surface a device fault as
@@ -2643,6 +2693,7 @@ mod tests {
             _s: u32,
             _e: u32,
             stop: &AtomicBool,
+            _new_job: &AtomicBool,
         ) -> Result<Option<MiningResult>, DeviceError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             if let Some(outcome) = self.script.lock().unwrap().pop_front() {

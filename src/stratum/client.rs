@@ -307,6 +307,15 @@ struct Shared {
     /// without this a reconnect would lose the head-start). A NaN/non-positive
     /// value reads back as `None` and is never sent.
     suggest_difficulty_bits: AtomicU64,
+    /// **Job-change preemption** flag (BUILD #2). The reader thread sets it `true`
+    /// the instant a `mining.notify` with a NEWER `job_id` arrives — the ONLY
+    /// writer that runs while the mining thread is blocked inside an in-flight GPU
+    /// `hash_range`, so it is the only thing that can make that sweep abandon the
+    /// now-stale prev-hash promptly instead of grinding to the end of the slice.
+    /// The mining loop reads it via [`StratumClient::new_job_flag`], hands it to
+    /// `hash_range`, and clears it when it picks up the fresh job. `Arc` so the loop
+    /// holds a cheap clone that outlives individual borrows of the client.
+    new_job: Arc<AtomicBool>,
 }
 
 impl Shared {
@@ -417,6 +426,7 @@ impl StratumClient {
             // No benchmark has run yet at connect time (the startup benchmark in
             // `drive()` happens AFTER connect); seed the cache empty (NaN).
             suggest_difficulty_bits: AtomicU64::new(f64::NAN.to_bits()),
+            new_job: Arc::new(AtomicBool::new(false)),
         });
 
         let extranonce1 = hs.subscribe.extranonce1_hex.clone();
@@ -690,6 +700,14 @@ impl StratumClient {
             .lock()
             .ok()
             .and_then(|g| g.clone())
+    }
+
+    /// The session **job-change preemption** flag (see [`Shared::new_job`]). The
+    /// reader raises it on every newer `job_id`; the mining loop hands the returned
+    /// handle to `hash_range` so an in-flight sweep aborts the instant a fresh job
+    /// lands, and clears it on pickup. A cheap `Arc` clone — never allocates.
+    pub fn new_job_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.shared.new_job)
     }
 
     /// Current share difficulty (defaults to 1.0 until the pool sends one).
@@ -972,6 +990,15 @@ fn dispatch_frame(line: &str, shared: &Shared) {
                             .stats
                             .last_new_job_ms
                             .store(now_unix_ms(), Ordering::Relaxed);
+                        // BUILD #2: a NEWER job_id ⇒ the prev-hash changed ⇒ any
+                        // in-flight GPU sweep is now grinding stale work the pool
+                        // will REJECT. Raise the job-change preempt flag so the
+                        // mining thread's `hash_range` aborts at its next
+                        // between-launch boundary and picks up this fresh job. The
+                        // loop clears the flag when it does. Release-store pairs with
+                        // the backend's Relaxed load — a plain flag needs no stronger
+                        // ordering (coherence alone guarantees visibility).
+                        shared.new_job.store(true, Ordering::Release);
                     }
                 }
                 tracing::debug!("stratum: new job {job_id} (clean_jobs={clean})");
@@ -1135,6 +1162,7 @@ mod tests {
             stats: SessionStats::default(),
             current_endpoint: Mutex::new("test-pool:3333".to_string()),
             suggest_difficulty_bits: AtomicU64::new(f64::NAN.to_bits()),
+            new_job: Arc::new(AtomicBool::new(false)),
         })
     }
 

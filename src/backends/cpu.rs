@@ -51,6 +51,7 @@ impl MiningBackend for CpuBackend {
         nonce_start: u32,
         nonce_end: u32,
         stop: &AtomicBool,
+        new_job: &AtomicBool,
     ) -> Result<Option<MiningResult>, DeviceError> {
         if nonce_end <= nonce_start {
             return Ok(None);
@@ -87,7 +88,14 @@ impl MiningBackend for CpuBackend {
                 scope.spawn(move || {
                     let mut tail = tail_template;
                     loop {
-                        if stop.load(Ordering::Relaxed) || local_stop.load(Ordering::Relaxed) {
+                        // Job-change preemption (BUILD #2): `new_job` is OR'd into
+                        // the EXISTING between-chunk cancel check. It only changes
+                        // WHEN the sweep stops (abandon stale work on a newer job),
+                        // never WHAT it computes — every hash below is byte-identical.
+                        if stop.load(Ordering::Relaxed)
+                            || local_stop.load(Ordering::Relaxed)
+                            || new_job.load(Ordering::Relaxed)
+                        {
                             return;
                         }
                         // Grab a small chunk of nonces so threads don't
@@ -178,6 +186,7 @@ mod tests {
                 0xffff_f000,
                 u32::MAX,
                 &stop_for_sweep,
+                &AtomicBool::new(false),
             )
         });
 
@@ -236,7 +245,14 @@ mod tests {
         let backend = CpuBackend::new(1);
         let stop = AtomicBool::new(false);
         let res = backend
-            .hash_range(header, best_hash, start, end, &stop)
+            .hash_range(
+                header,
+                best_hash,
+                start,
+                end,
+                &stop,
+                &AtomicBool::new(false),
+            )
             .expect("a CPU sweep never faults")
             .expect("the minimum-hash nonce satisfies hash <= target");
         assert_eq!(res.nonce, best_nonce, "must find the argmin nonce");
