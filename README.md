@@ -143,6 +143,39 @@ the miner falls back to env `CSD_WORKER`, then `WORKER_NAME` (HiveOS), then
 this machine's hostname. Turn the suffix off entirely (authorize as the bare
 address, like older miners) with `--no-worker` or `CSD_NO_WORKER=1`.
 
+> **`solo` is a reserved worker name.** `--worker solo` (or `WORKER_NAME=solo`)
+> switches the rig into [**solo mining**](#solo-mining) — it changes *how* your
+> address is credited, not just the display label. Every other name is
+> display-only as above.
+
+### Solo mining
+
+Prefer to go for the **whole block** yourself instead of a steady pool cut? Set
+your worker name to the reserved keyword `solo`:
+
+```sh
+"$MINER" --address <YOUR_ADDR20> --worker solo
+```
+
+Your miner authorizes as `<address>.solo` and mines **solo**:
+
+- Your shares are **excluded** from the pool (PPLNS) split.
+- If *your* rig solves a block, **you** are credited the **full block reward
+  minus the 2.5% pool fee** — no sharing — once the block confirms (10
+  confirmations), paid on the normal payout schedule.
+- If you don't solve one, you earn nothing that round. Solo is **high-variance**:
+  it shines with serious hashrate (or if you feel lucky), while pool mining pays
+  smoother. Your payout **address is unchanged** — `solo` only changes *how* that
+  address is credited, never *which* address.
+
+Switch back to pool mining with any other worker name (e.g. `--worker rig1`) or
+none. **HiveOS:** add `--worker solo` to your *Extra config arguments* (see
+[docs/HIVEOS.md](docs/HIVEOS.md)).
+
+Watch your results on the pool dashboard: your per-rig stats (including the `solo`
+rig) are under **"Your Miner"**, and solo block wins show up in **blue** on the
+**Winners** board (`/winners.html`).
+
 ## Monitoring (stats endpoint + Discord)
 
 Expose an **xmrig-`/1/summary`-compatible** JSON endpoint for dashboards
@@ -283,10 +316,12 @@ on laptops, where the CPU and GPU share one power/thermal budget — set
 
 ## Payouts
 
-Payouts are **batched hourly by the pool, at the top of every hour (:00)**. Your
-shares accrue continuously; the pool settles all eligible miners together once an
-hour, so you won't see a payout the instant you find a share — wait for the next
-:00 settlement.
+Payouts are **batched by the pool about every 30 minutes**. Your shares accrue
+continuously; the pool settles all eligible miners together each cycle, so you
+won't see a payout the instant you find a share — wait for the next settlement.
+The **pool fee is 2.5%**, and your balance must reach the **minimum payout of
+0.001 CSD** to be included in a settlement (smaller balances roll over to the
+next one).
 
 ## Where to get an addr20
 

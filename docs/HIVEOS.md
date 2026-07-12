@@ -31,6 +31,16 @@ Every release ships a ready-made HiveOS **Custom-miner package**, so setup is ju
 
 4. **Apply** the Flight Sheet to your rig. Done — hashrate and accepted/rejected shares show on the HiveOS dashboard.
 
+## Solo mining
+
+To **solo-mine** on this rig (go for the whole block yourself instead of a steady pool cut), add `--worker solo` to *Extra config arguments* alongside your backend and address:
+
+```
+--backend cuda --address <your 40-hex addr20> --worker solo
+```
+
+The rig then authorizes as `<address>.solo`: your shares are excluded from the pool (PPLNS) split, and if *your* rig solves a block you're credited the **full reward minus the 2.5% fee** (after 10 confirmations, on the normal payout schedule). It's **high-variance** — you win the whole block or nothing that round. Your payout address is unchanged; `solo` only changes how it's credited. Remove `--worker solo` (or use any other name) to go back to pool mining. Solo wins appear in **blue** on the pool's Winners board. See the [main README](../README.md#solo-mining) for the full rundown.
+
 ## Notes
 
 - **The Pool URL field is ignored** (the pool is compiled into the binary) but HiveOS still requires it non-blank — use `stratum+tcp://127.0.0.1:1` as shown above and never point it at a real pool.
