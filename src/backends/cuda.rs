@@ -348,6 +348,7 @@ impl MiningBackend for CudaBackend {
         nonce_start: u32,
         nonce_end: u32,
         stop: &AtomicBool,
+        new_job: &AtomicBool,
     ) -> Result<Option<MiningResult>, DeviceError> {
         if nonce_end <= nonce_start {
             return Ok(None);
@@ -400,7 +401,12 @@ impl MiningBackend for CudaBackend {
         let PipePair { a, b, func } = &mut *pipes;
 
         loop {
-            if stop.load(Ordering::Relaxed) {
+            // Job-change preemption (BUILD #2): `new_job` is OR'd into the EXISTING
+            // between-launch cancel check. It abandons a now-stale sweep on a new
+            // block (a CHANGED prev-hash); it does NOT touch the kernel launch, nonce
+            // iteration, digest, or target compare — every hash stays byte-identical
+            // to a full sweep.
+            if stop.load(Ordering::Relaxed) || new_job.load(Ordering::Relaxed) {
                 return Ok(None);
             }
             let pipe: &mut PipeRes = if current_pipe == 0 { &mut *a } else { &mut *b };
@@ -543,6 +549,9 @@ pub fn benchmark_geometry(
     let target_never = [0u8; 32]; // all-zero ⇒ never "found" ⇒ full sweep
     let header = bench_header();
     let stop = AtomicBool::new(false);
+    // Never-set so the bench sweeps the FULL range uninterrupted (job-change
+    // preemption is a mining-loop concern, never a benchmark one).
+    let never_new_job = AtomicBool::new(false);
 
     let started = Instant::now();
     let mut nonces_done: u128 = 0;
@@ -551,7 +560,7 @@ pub fn benchmark_geometry(
     // attempts the full 2^32 span (it returns None at the end since nothing is
     // "found").
     loop {
-        let _ = backend.hash_range(header, target_never, 0, u32::MAX, &stop);
+        let _ = backend.hash_range(header, target_never, 0, u32::MAX, &stop, &never_new_job);
         nonces_done += u32::MAX as u128;
         if started.elapsed() >= budget {
             break;

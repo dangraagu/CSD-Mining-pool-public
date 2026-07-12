@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.2.2 — 2026-07-11 — job-change preemption
+
+- **job-change preemption — abort in-flight sweeps on a new block (fewer stale
+  shares).** A session-lived `new_job` cancel flag is threaded into
+  `MiningBackend::hash_range` and OR'd into every backend's EXISTING
+  between-launch abort check (cuda / opencl / cpu). The stratum reader sets it
+  the instant a `mining.notify` arrives on a CHANGED prev-hash (a genuine new
+  block) — the only writer that runs while the mining thread is blocked inside
+  an in-flight sweep — so the GPU/CPU abandons now-stale work within one
+  between-launch step instead of grinding the old prev-hash to the end of the
+  slice. The loop clears the flag when it picks up the fresh job.
+- **PoW-safe / control-flow only.** The kernel (fatbin/PTX/CPU inner loop) is
+  untouched; the flag is polled ONLY at the between-launch boundary, never in the
+  hash inner loop — every hash, nonce, digest and target-compare stays
+  byte-identical to v0.2.1. Preemption changes only WHEN a sweep stops, never
+  WHAT it computes. Bench and selftest pass an always-false flag so they stay
+  deterministic / uninterrupted.
+- **Preempts on a changed prev-hash only (a new block), never on a same-prev
+  refresh** — the bridge re-publishes a fresh `job_id` (with `clean_jobs=true`)
+  for ntime/template drift on an UNCHANGED prev; that work is still node-valid,
+  so preempting it would drop a legit in-flight share for zero staleness benefit.
+  (`clean_jobs` is therefore NOT a sufficient gate — the bridge sets it on
+  same-prev refreshes too.)
+
 ## v0.2.1 — 2026-07-02 — Linux compatibility hotfix
 
 - **Linux binaries are now built portable to glibc ≥ 2.27** (via `cargo zigbuild

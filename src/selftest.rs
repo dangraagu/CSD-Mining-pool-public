@@ -234,6 +234,9 @@ fn eval_backend(
     let mut total_solves = 0usize;
     let mut total_micros: u128 = 0;
     let stop = AtomicBool::new(false);
+    // Never-set so selftest sweeps deterministically to completion (bit-exact
+    // verification must never be preempted; job-change preemption is mining-only).
+    let never_new_job = AtomicBool::new(false);
 
     for trial in 0..opts.trials {
         // Fresh random header for each trial.
@@ -243,7 +246,7 @@ fn eval_backend(
         header[0..4].copy_from_slice(&1u32.to_le_bytes());
 
         let started = Instant::now();
-        let res = backend.hash_range(header, *target, 0, opts.nonce_range, &stop);
+        let res = backend.hash_range(header, *target, 0, opts.nonce_range, &stop, &never_new_job);
         let elapsed_micros = started.elapsed().as_micros();
         total_micros += elapsed_micros;
 

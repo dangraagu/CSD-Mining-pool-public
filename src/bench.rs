@@ -100,6 +100,10 @@ pub fn benchmark_hashrate<B: MiningBackend + ?Sized>(
     let mut header = [0u8; 84];
     header[0..4].copy_from_slice(&1u32.to_le_bytes()); // a sane version field
 
+    // Never-set: the benchmark must sweep the FULL range uninterrupted (job-change
+    // preemption is a mining-loop concern, never a rate-measurement one).
+    let never_new_job = AtomicBool::new(false);
+
     // The stop flag actually handed to the backend. It fires when EITHER the
     // caller's `stop` is set OR the HARD_CAP timer trips. A full-u32 sweep can no
     // longer be interrupted between fixed chunks (we sweep the whole range in one
@@ -154,7 +158,14 @@ pub fn benchmark_hashrate<B: MiningBackend + ?Sized>(
             // no early "found" exit, so the backend runs its real geometry over
             // [0, u32::MAX). Returns None at the end (or early if `sweep_stop`
             // fired mid-sweep).
-            let _ = backend.hash_range(header, NEVER_FOUND_TARGET, 0, u32::MAX, &sweep_stop);
+            let _ = backend.hash_range(
+                header,
+                NEVER_FOUND_TARGET,
+                0,
+                u32::MAX,
+                &sweep_stop,
+                &never_new_job,
+            );
             let returned_at = Instant::now();
             // Decide whether this sweep COMPLETED or was cut off. It completed
             // naturally iff it returned strictly before the hard deadline — at that
@@ -267,6 +278,7 @@ mod tests {
             start: u32,
             end: u32,
             _stop: &AtomicBool,
+            _new_job: &AtomicBool,
         ) -> Result<Option<MiningResult>, crate::backend::DeviceError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             self.max_start.fetch_max(start, Ordering::Relaxed);
@@ -291,6 +303,7 @@ mod tests {
             _s: u32,
             _e: u32,
             stop: &AtomicBool,
+            _new_job: &AtomicBool,
         ) -> Result<Option<MiningResult>, crate::backend::DeviceError> {
             // Spin until the (caller-or-timer) stop fires. A real backend would be
             // doing GPU launches between these polls; we just wait.
@@ -372,6 +385,7 @@ mod tests {
             _s: u32,
             _e: u32,
             _stop: &AtomicBool,
+            _new_job: &AtomicBool,
         ) -> Result<Option<MiningResult>, crate::backend::DeviceError> {
             Ok(None)
         }
@@ -392,6 +406,7 @@ mod tests {
             _s: u32,
             _e: u32,
             _stop: &AtomicBool,
+            _new_job: &AtomicBool,
         ) -> Result<Option<MiningResult>, crate::backend::DeviceError> {
             panic!("backend exploded mid-benchmark");
         }

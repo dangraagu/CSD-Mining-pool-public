@@ -45,6 +45,25 @@ impl std::error::Error for DeviceError {}
 pub trait MiningBackend {
     fn name(&self) -> &'static str;
 
+    /// Sweep `[nonce_start, nonce_end)` for a solving nonce.
+    ///
+    /// Two independent cancel flags, both polled ONLY at the backend's
+    /// between-launch boundary (NEVER inside the hash inner loop — every hash
+    /// stays bit-identical to a non-preempted sweep and the MH/s rate is
+    /// unaffected; preemption changes only WHEN a sweep stops, never WHAT it
+    /// computes):
+    ///   - `stop`: shutdown / winner-found abort (the global stop flag for
+    ///     GPU-only mining, or the per-launch `iter_stop` for CPU+GPU dual
+    ///     mining). Returns a clean `Ok(None)` when it fires.
+    ///   - `new_job`: **job-change preemption**. Set by the work source the moment
+    ///     a job on a CHANGED prev-hash (a genuine new block) arrives, so an
+    ///     in-flight sweep abandons work the pool would now REJECT as stale
+    ///     instead of grinding the old prev-hash to the end of the slice. A
+    ///     same-prev refresh (new job_id, unchanged prev) does NOT preempt — its
+    ///     work is still node-valid. Either
+    ///     flag going true returns `Ok(None)` promptly — within one between-launch
+    ///     step (~one launch). Pass an always-false flag to disable preemption
+    ///     (bench / selftest need the full, uninterrupted, deterministic sweep).
     fn hash_range(
         &self,
         header_84: [u8; 84],
@@ -52,5 +71,6 @@ pub trait MiningBackend {
         nonce_start: u32,
         nonce_end: u32,
         stop: &std::sync::atomic::AtomicBool,
+        new_job: &std::sync::atomic::AtomicBool,
     ) -> Result<Option<MiningResult>, DeviceError>;
 }
