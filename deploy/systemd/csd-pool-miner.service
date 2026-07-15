@@ -37,10 +37,23 @@ Group=csdminer
 # a clear "no address" message, which is the desired, visible failure).
 EnvironmentFile=-/etc/csd-pool-miner.env
 
+# Localhost telemetry default. This is a REAL default set in the unit (not a
+# ${VAR:-default}, which systemd's ExecStart does NOT support). EnvironmentFile
+# is read AFTER Environment= and overrides it, so an operator may set a
+# different CSD_STATS_PORT in /etc/csd-pool-miner.env — but if they DON'T, this
+# value still exists, so `--stats-port ${CSD_STATS_PORT}` below never expands to
+# a bare `--stats-port` (which would fail to start every default rig).
+Environment=CSD_STATS_PORT=3380
+
 # One GPU per process. The address is taken from the EnvironmentFile and expanded
 # by systemd. Add extra flags (e.g. --device N, --backend cuda) here or, better,
 # via CSD_EXTRA_ARGS in the env file if you templatise this.
-ExecStart=/usr/local/bin/csd-pool-miner --address ${CSD_ADDRESS}
+#
+# --stats-port/--stats-bind expose the read-only telemetry endpoint
+# (/1/summary: per-rig hashrate windows, shares_good, reconnects, failovers) on
+# LOCALHOST ONLY (127.0.0.1) so per-rig health is diagnosable on-box; the bind
+# address keeps it unreachable off-box.
+ExecStart=/usr/local/bin/csd-pool-miner --address ${CSD_ADDRESS} --stats-port ${CSD_STATS_PORT} --stats-bind 127.0.0.1
 
 # --- restart policy -------------------------------------------------------
 # Always come back: crash, OOM, network kill, or a clean watchdog exit.
