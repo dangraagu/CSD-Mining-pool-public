@@ -124,9 +124,25 @@ __device__ __forceinline__ bool hash_leq_target_words(const unsigned int state[8
 }
 
 /// One full sha256d attempt for a single nonce. Caller supplies the
-/// midstate + the four fixed tail words (merkle_tail, time_lo, time_hi, bits).
+/// midstate + the four fixed tail words (merkle_tail, time_lo, time_hi, bits)
+/// PLUS the per-job inner-compress prefix (see below).
+///
+/// INNER-PREFIX PRECOMPUTE (host-side `inner_prefix_precompute`, sha256d_cpu.rs):
+/// the inner second block only varies in w[4]=BSWAP32(nonce); rounds 0..3
+/// consume the constant words w[0..3] and schedule words w16,w17,w18 are
+/// nonce-independent (w4 first appears in w19). So the host precomputes, ONCE
+/// per job:
+///   prefix_state[8] = the working vars a..h after rounds 0..3 from `midstate`
+///   sched3[3]       = [w16, w17, w18]
+/// and this kernel RESUMES the inner compress from round 4 — skipping 4 rounds
+/// + 3 schedule expansions per nonce. This is a specialized inner path ONLY;
+/// the shared `sha256_compress` (used by the outer hash) is untouched. The
+/// final fold still adds the ORIGINAL `midstate` (prefix_state is a mid-round
+/// working state, not a new midstate), so the digest is bit-identical.
 __device__ __forceinline__ bool try_one_nonce(
     const unsigned int midstate[8],
+    const unsigned int prefix_state[8],
+    const unsigned int sched3[3],
     unsigned int w0_merkle_tail,
     unsigned int w1_time_lo,
     unsigned int w2_time_hi,
@@ -135,8 +151,8 @@ __device__ __forceinline__ bool try_one_nonce(
     unsigned int nonce,
     unsigned int out_hash[8]
 ) {
-    // Second SHA-256 block of the inner hash.
-    unsigned int w[16];
+    // Second SHA-256 block of the inner hash — SPECIALIZED resume-from-round-4.
+    unsigned int w[64];
     w[0] = w0_merkle_tail;
     w[1] = w1_time_lo;
     w[2] = w2_time_hi;
@@ -151,11 +167,37 @@ __device__ __forceinline__ bool try_one_nonce(
     w[10] = 0u; w[11] = 0u; w[12] = 0u; w[13] = 0u;
     w[14] = 0u;
     w[15] = 672u;
-
-    unsigned int state[8];
+    // Constant (nonce-independent) schedule words from the host precompute.
+    w[16] = sched3[0];
+    w[17] = sched3[1];
+    w[18] = sched3[2];
+    // Expand the remaining schedule; w19 is the first word to touch w4 (nonce).
     #pragma unroll
-    for (int i = 0; i < 8; i++) state[i] = midstate[i];
-    sha256_compress(state, w);
+    for (int i = 19; i < 64; i++) {
+        unsigned int s0 = ROTR(w[i-15], 7) ^ ROTR(w[i-15], 18) ^ (w[i-15] >> 3);
+        unsigned int s1 = ROTR(w[i-2], 17) ^ ROTR(w[i-2], 19) ^ (w[i-2] >> 10);
+        w[i] = w[i-16] + s0 + w[i-7] + s1;
+    }
+    // Working vars resume from the precomputed post-round-3 prefix.
+    unsigned int a = prefix_state[0], b = prefix_state[1], c = prefix_state[2], d = prefix_state[3];
+    unsigned int e = prefix_state[4], f = prefix_state[5], g = prefix_state[6], h = prefix_state[7];
+    #pragma unroll
+    for (int i = 4; i < 64; i++) {
+        unsigned int S1 = ROTR(e, 6) ^ ROTR(e, 11) ^ ROTR(e, 25);
+        unsigned int ch = (e & f) ^ (~e & g);
+        unsigned int t1 = h + S1 + ch + K[i] + w[i];
+        unsigned int S0 = ROTR(a, 2) ^ ROTR(a, 13) ^ ROTR(a, 22);
+        unsigned int maj = (a & b) ^ (a & c) ^ (b & c);
+        unsigned int t2 = S0 + maj;
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+    // Fold into the ORIGINAL midstate (identical to sha256_compress's final add).
+    unsigned int state[8];
+    state[0] = midstate[0] + a; state[1] = midstate[1] + b;
+    state[2] = midstate[2] + c; state[3] = midstate[3] + d;
+    state[4] = midstate[4] + e; state[5] = midstate[5] + f;
+    state[6] = midstate[6] + g; state[7] = midstate[7] + h;
 
     // Outer SHA-256 over the 32-byte inner digest.
     unsigned int w2[16];
@@ -182,6 +224,8 @@ __device__ __forceinline__ bool try_one_nonce(
 
 __global__ void mine_sha256d(
     const unsigned int *midstate,        // 8 words
+    const unsigned int *prefix_state,    // 8 words: inner working vars after round 3 (per-job precompute)
+    const unsigned int *sched3,          // 3 words: constant schedule words w16,w17,w18 (per-job precompute)
     const unsigned char *tail_16,        // 16 bytes: merkle_tail(4) | time(8) | bits(4)
     const unsigned char *target_be,      // 32 bytes
     const unsigned int start_nonce,
@@ -216,6 +260,19 @@ __global__ void mine_sha256d(
     unsigned int w3_bits        = ((unsigned int)tail_16[12] << 24) | ((unsigned int)tail_16[13] << 16)
                                 | ((unsigned int)tail_16[14] << 8)  |  (unsigned int)tail_16[15];
 
+    // Cache the per-job inner-compress prefix in registers once per thread so
+    // the hot loop reads them from registers, not global memory. These are
+    // loop-invariant (nonce-independent) — the whole point of the precompute.
+    unsigned int prefix_words[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) prefix_words[i] = prefix_state[i];
+    unsigned int sched3_words[3];
+    #pragma unroll
+    for (int i = 0; i < 3; i++) sched3_words[i] = sched3[i];
+    unsigned int mid_words[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) mid_words[i] = midstate[i];
+
     unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int base = start_nonce + gid * nonces_per_thread;
 
@@ -229,7 +286,7 @@ __global__ void mine_sha256d(
         if ((k & 255u) == 0u && *found_flag != 0) return;
         unsigned int nonce = base + k;
         if (nonce >= nonce_end_excl) return;
-        if (try_one_nonce(midstate, w0_merkle_tail, w1_time_lo, w2_time_hi, w3_bits, target_words, nonce, out_hash)) {
+        if (try_one_nonce(mid_words, prefix_words, sched3_words, w0_merkle_tail, w1_time_lo, w2_time_hi, w3_bits, target_words, nonce, out_hash)) {
             if (atomicCAS(found_flag, 0u, 1u) == 0u) {
                 *found_nonce = nonce;
                 #pragma unroll

@@ -201,9 +201,225 @@ pub fn midstate_of_first_chunk_fast(header_84: &[u8; 84]) -> [u32; 8] {
     state
 }
 
+/// Precompute the constant-per-job prefix of the INNER second-block SHA-256
+/// compression, so the GPU kernel can resume it from round 4 on every nonce
+/// instead of re-running the 4 constant rounds + 3 constant schedule
+/// expansions each time.
+///
+/// The inner second block of an 84-byte-header sha256d is
+///   w[0..=3] = merkle_tail | time_lo | time_hi | bits   (constant per job)
+///   w[4]     = BSWAP32(nonce)                            (VARIES per nonce)
+///   w[5]     = 0x80000000, w[6..=14] = 0, w[15] = 672    (constant padding)
+///
+/// Round `i` of the compression consumes schedule word `w[i]`, so rounds
+/// 0..=3 depend ONLY on the constant words w[0..=3] — their result (the
+/// working vars a..h after round 3) is identical for every nonce. Likewise the
+/// schedule words w16, w17, w18 depend only on constant inputs (w4 first
+/// appears in w19 = w3 + s0(w4) + w12 + s1(w17)); they are the last
+/// nonce-independent schedule words.
+///
+/// Returns `(prefix_state, sched3)` where
+///   `prefix_state` = [a,b,c,d,e,f,g,h] after rounds 0..=3 from `midstate`, and
+///   `sched3`       = [w16, w17, w18].
+///
+/// IMPORTANT: `prefix_state` is the WORKING state after round 3, NOT a new
+/// midstate — the final `state[i] += a..h` fold at the end of the compression
+/// still adds the ORIGINAL `midstate`, so the kernel keeps uploading `midstate`
+/// too. This is a pure schedule/round-prefix precompute; the emitted digest is
+/// bit-for-bit identical to running the full `sha256_compress`.
+///
+/// `tail_16` = bytes 64..80 of the 84-byte header (merkle_tail|time|bits). The
+/// nonce (bytes 80..84) is deliberately NOT an input — it enters at round 4.
+pub fn inner_prefix_precompute(midstate: &[u32; 8], tail_16: &[u8; 16]) -> ([u32; 8], [u32; 3]) {
+    #[inline]
+    fn small_sigma0(x: u32) -> u32 {
+        x.rotate_right(7) ^ x.rotate_right(18) ^ (x >> 3)
+    }
+    #[inline]
+    fn small_sigma1(x: u32) -> u32 {
+        x.rotate_right(17) ^ x.rotate_right(19) ^ (x >> 10)
+    }
+
+    // Constant message words (BE-packed exactly as the kernel packs tail_16 in
+    // mine_sha256d, sha256d.cu:210-217).
+    let w0 = u32::from_be_bytes([tail_16[0], tail_16[1], tail_16[2], tail_16[3]]);
+    let w1 = u32::from_be_bytes([tail_16[4], tail_16[5], tail_16[6], tail_16[7]]);
+    let w2 = u32::from_be_bytes([tail_16[8], tail_16[9], tail_16[10], tail_16[11]]);
+    let w3 = u32::from_be_bytes([tail_16[12], tail_16[13], tail_16[14], tail_16[15]]);
+    // Constant padding words used below: w9 = w10 = w11 = w14 = 0, w15 = 672.
+    let w15: u32 = 672;
+
+    // Constant schedule words. General recurrence w[i] = w[i-16] + s0(w[i-15])
+    // + w[i-7] + s1(w[i-2]); the zero terms are kept explicit so this mirrors
+    // the kernel's expansion one-to-one.
+    //   w16 = w0 + s0(w1) + w9(0)  + s1(w14=0)
+    //   w17 = w1 + s0(w2) + w10(0) + s1(w15)
+    //   w18 = w2 + s0(w3) + w11(0) + s1(w16)
+    let w16 = w0
+        .wrapping_add(small_sigma0(w1))
+        .wrapping_add(small_sigma1(0));
+    let w17 = w1
+        .wrapping_add(small_sigma0(w2))
+        .wrapping_add(small_sigma1(w15));
+    let w18 = w2
+        .wrapping_add(small_sigma0(w3))
+        .wrapping_add(small_sigma1(w16));
+
+    // Rounds 0..=3 from the midstate consume only w[0..=3].
+    let wc = [w0, w1, w2, w3];
+    let mut a = midstate[0];
+    let mut b = midstate[1];
+    let mut c = midstate[2];
+    let mut d = midstate[3];
+    let mut e = midstate[4];
+    let mut f = midstate[5];
+    let mut g = midstate[6];
+    let mut h = midstate[7];
+    for i in 0..4 {
+        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let ch = (e & f) ^ (!e & g);
+        let t1 = h
+            .wrapping_add(s1)
+            .wrapping_add(ch)
+            .wrapping_add(SHA256_K[i])
+            .wrapping_add(wc[i]);
+        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let t2 = s0.wrapping_add(maj);
+        h = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(t1);
+        d = c;
+        c = b;
+        b = a;
+        a = t1.wrapping_add(t2);
+    }
+
+    ([a, b, c, d, e, f, g, h], [w16, w17, w18])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The GPU kernel's specialized inner compress: init the working vars from
+    /// `prefix_state`, splice the constant schedule words `sched3` into
+    /// w16..w18, expand w19..w63 with the standard recurrence, run ONLY rounds
+    /// 4..=63, then fold in the ORIGINAL `midstate`. This is the exact CPU
+    /// mirror of the specialized path added to sha256d.cu::try_one_nonce, used
+    /// as the bit-exact oracle in `inner_prefix_matches_full_compress`.
+    fn inner_compress_via_prefix(midstate: &[u32; 8], tail_16: &[u8; 16], nonce: u32) -> [u32; 8] {
+        let (prefix, sched3) = inner_prefix_precompute(midstate, tail_16);
+
+        let mut w = [0u32; 64];
+        w[0] = u32::from_be_bytes([tail_16[0], tail_16[1], tail_16[2], tail_16[3]]);
+        w[1] = u32::from_be_bytes([tail_16[4], tail_16[5], tail_16[6], tail_16[7]]);
+        w[2] = u32::from_be_bytes([tail_16[8], tail_16[9], tail_16[10], tail_16[11]]);
+        w[3] = u32::from_be_bytes([tail_16[12], tail_16[13], tail_16[14], tail_16[15]]);
+        w[4] = nonce.swap_bytes(); // BSWAP32(nonce)
+        w[5] = 0x8000_0000;
+        w[15] = 672;
+        w[16] = sched3[0];
+        w[17] = sched3[1];
+        w[18] = sched3[2];
+        for i in 19..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+
+        let mut a = prefix[0];
+        let mut b = prefix[1];
+        let mut c = prefix[2];
+        let mut d = prefix[3];
+        let mut e = prefix[4];
+        let mut f = prefix[5];
+        let mut g = prefix[6];
+        let mut h = prefix[7];
+        for i in 4..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ (!e & g);
+            let t1 = h
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(SHA256_K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+
+        [
+            midstate[0].wrapping_add(a),
+            midstate[1].wrapping_add(b),
+            midstate[2].wrapping_add(c),
+            midstate[3].wrapping_add(d),
+            midstate[4].wrapping_add(e),
+            midstate[5].wrapping_add(f),
+            midstate[6].wrapping_add(g),
+            midstate[7].wrapping_add(h),
+        ]
+    }
+
+    /// Build the full 64-byte inner second block exactly as the kernel does and
+    /// run the UNMODIFIED `sha256_compress` — the ground-truth reference.
+    fn inner_compress_full(midstate: &[u32; 8], tail_16: &[u8; 16], nonce: u32) -> [u32; 8] {
+        let mut block = [0u8; 64];
+        block[0..16].copy_from_slice(tail_16);
+        // block[16..20] BE-packs to w[4]=BSWAP32(nonce); BSWAP32(n).to_be_bytes()
+        // == n.to_le_bytes(), i.e. the header's LE nonce bytes (bytes 80..84).
+        block[16..20].copy_from_slice(&nonce.to_le_bytes());
+        block[20] = 0x80;
+        block[56..64].copy_from_slice(&(84u64 * 8).to_be_bytes());
+        let mut state = *midstate;
+        sha256_compress(&mut state, &block);
+        state
+    }
+
+    #[test]
+    fn inner_prefix_matches_full_compress() {
+        // Fail-closed bit-exact gate: resuming the inner compress from the
+        // precomputed prefix+sched3 (round 4 onward, folding the original
+        // midstate) must equal the full compress for every random input.
+        let mut rng = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            // xorshift64* — deterministic, no dep needed.
+            rng ^= rng >> 12;
+            rng ^= rng << 25;
+            rng ^= rng >> 27;
+            rng.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        for _ in 0..2000 {
+            let mut midstate = [0u32; 8];
+            for m in midstate.iter_mut() {
+                *m = next() as u32;
+            }
+            let mut tail_16 = [0u8; 16];
+            for t in tail_16.iter_mut() {
+                *t = next() as u8;
+            }
+            let nonce = next() as u32;
+
+            let via_prefix = inner_compress_via_prefix(&midstate, &tail_16, nonce);
+            let full = inner_compress_full(&midstate, &tail_16, nonce);
+            assert_eq!(
+                via_prefix, full,
+                "inner-prefix resume diverged: midstate={midstate:08x?} tail={tail_16:02x?} nonce={nonce:08x}"
+            );
+        }
+    }
 
     #[test]
     fn midstate_finish_matches_reference() {

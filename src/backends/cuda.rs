@@ -42,6 +42,7 @@ use crate::backends::autotune::{
     self, candidate_geometries, pick_best, CachedGeometry, GeometryMeasurement,
 };
 use crate::gpu_watchdog::Recoverable;
+use crate::sha256d_cpu::inner_prefix_precompute;
 use crate::sha256d_cpu::midstate_of_first_chunk_fast as midstate_of_first_chunk;
 
 // CUDA kernel, pre-compiled OFFLINE into a multi-arch FATBIN (see
@@ -109,6 +110,12 @@ struct PipePair {
 struct PipeRes {
     stream: Arc<CudaStream>,
     mid_dev: CudaSlice<u32>,
+    // Per-job inner-compress precompute (MINER #1): working vars after inner
+    // round 3 (8 words) + the constant schedule words w16,w17,w18 (3 words).
+    // Uploaded once per template alongside the midstate; the kernel resumes the
+    // inner compress from round 4 with them. PoW is bit-identical.
+    prefix_dev: CudaSlice<u32>,
+    sched3_dev: CudaSlice<u32>,
     tail_dev: CudaSlice<u8>,
     target_dev: CudaSlice<u8>,
     found_nonce: CudaSlice<u32>,
@@ -297,6 +304,8 @@ impl CudaBackend {
 fn build_pipe(ctx: &Arc<CudaContext>) -> Result<PipeRes, cudarc::driver::DriverError> {
     let stream = ctx.new_stream()?;
     let mid_dev: CudaSlice<u32> = stream.alloc_zeros::<u32>(8)?;
+    let prefix_dev: CudaSlice<u32> = stream.alloc_zeros::<u32>(8)?;
+    let sched3_dev: CudaSlice<u32> = stream.alloc_zeros::<u32>(3)?;
     let tail_dev: CudaSlice<u8> = stream.alloc_zeros::<u8>(16)?;
     let target_dev: CudaSlice<u8> = stream.alloc_zeros::<u8>(32)?;
     let found_nonce: CudaSlice<u32> = stream.alloc_zeros::<u32>(1)?;
@@ -305,6 +314,8 @@ fn build_pipe(ctx: &Arc<CudaContext>) -> Result<PipeRes, cudarc::driver::DriverE
     Ok(PipeRes {
         stream,
         mid_dev,
+        prefix_dev,
+        sched3_dev,
         tail_dev,
         target_dev,
         found_nonce,
@@ -320,10 +331,14 @@ fn build_pipe(ctx: &Arc<CudaContext>) -> Result<PipeRes, cudarc::driver::DriverE
 fn prime_pipe(
     pipe: &mut PipeRes,
     midstate: &[u32; 8],
+    prefix_state: &[u32; 8],
+    sched3: &[u32; 3],
     tail_16: &[u8; 16],
     target: &[u8; 32],
 ) -> Result<(), cudarc::driver::DriverError> {
     pipe.stream.memcpy_htod(midstate.as_slice(), &mut pipe.mid_dev)?;
+    pipe.stream.memcpy_htod(prefix_state.as_slice(), &mut pipe.prefix_dev)?;
+    pipe.stream.memcpy_htod(sched3.as_slice(), &mut pipe.sched3_dev)?;
     pipe.stream.memcpy_htod(tail_16.as_slice(), &mut pipe.tail_dev)?;
     pipe.stream.memcpy_htod(target.as_slice(), &mut pipe.target_dev)?;
     // found_flag is zeroed at the top of each launch inside the inner
@@ -357,6 +372,9 @@ impl MiningBackend for CudaBackend {
         let midstate = midstate_of_first_chunk(&header_84);
         let mut tail_16 = [0u8; 16];
         tail_16.copy_from_slice(&header_84[64..80]);
+        // MINER #1: precompute the per-job inner-compress prefix (rounds 0..3 +
+        // schedule words w16..w18) once here; the kernel resumes from round 4.
+        let (prefix_state, sched3) = inner_prefix_precompute(&midstate, &tail_16);
 
         // iter-hotpath #2: borrow the persistent pipes for this call
         // instead of rebuilding them. The mutex is uncontended in
@@ -377,10 +395,12 @@ impl MiningBackend for CudaBackend {
         // and target. This is the per-launch hot path that replaces
         // the old setup_pipe() — 6 small H2D memcpys (3 per pipe) and
         // zero allocations.
-        if let Err(e) = prime_pipe(&mut pipes.a, &midstate, &tail_16, &target) {
+        if let Err(e) = prime_pipe(&mut pipes.a, &midstate, &prefix_state, &sched3, &tail_16, &target)
+        {
             return Err(DeviceError(format!("cuda: prime pipe A failed: {e}")));
         }
-        if let Err(e) = prime_pipe(&mut pipes.b, &midstate, &tail_16, &target) {
+        if let Err(e) = prime_pipe(&mut pipes.b, &midstate, &prefix_state, &sched3, &tail_16, &target)
+        {
             return Err(DeviceError(format!("cuda: prime pipe B failed: {e}")));
         }
 
@@ -435,6 +455,10 @@ impl MiningBackend for CudaBackend {
 
                     let mut builder = pipe.stream.launch_builder(func);
                     builder.arg(&pipe.mid_dev);
+                    // ABI order must match sha256d.cu::mine_sha256d: midstate,
+                    // prefix_state, sched3, tail_16, target, ...
+                    builder.arg(&pipe.prefix_dev);
+                    builder.arg(&pipe.sched3_dev);
                     builder.arg(&pipe.tail_dev);
                     builder.arg(&pipe.target_dev);
                     builder.arg(&start_u32);
