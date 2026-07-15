@@ -161,7 +161,7 @@ Your miner authorizes as `<address>.solo` and mines **solo**:
 
 - Your shares are **excluded** from the pool (PPLNS) split.
 - If *your* rig solves a block, **you** are credited the **full block reward
-  minus the 2.5% pool fee** — no sharing — once the block confirms (10
+  minus the 2.5% pool fee** — no sharing — once the block confirms (15
   confirmations), paid on the normal payout schedule.
 - If you don't solve one, you earn nothing that round. Solo is **high-variance**:
   it shines with serious hashrate (or if you feel lucky), while pool mining pays

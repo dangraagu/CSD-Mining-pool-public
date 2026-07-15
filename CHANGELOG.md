@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.2.3 — 2026-07-15 — inner-prefix precompute (+~5.9%) + telemetry on packaged rigs
+
+- **Faster CUDA SHA-256d kernel: inner-block prefix precompute (~+5.9% hashrate,
+  PoW byte-identical).** The second SHA-256 block's working vars after rounds 0–3
+  plus the three constant schedule words (`w16..w18`) are precomputed once per
+  template on the host; the kernel resumes the inner compress from round 4 instead
+  of round 0. Only the nonce word varies per hash, so the result is bit-exact —
+  proven by a CPU oracle (`inner_prefix_matches_full_compress`, 2000 random
+  midstate/tail/nonce) and the GPU selftest (re-hash every found nonce on CPU,
+  assert equal) on **both** the native sm_120 path and the compute_75 PTX-JIT
+  fallback. Benched **4057.8 vs 3832.8 MH/s (+5.87%)** on an RTX 5070 Ti; a
+  105-min live-pool canary accepted **89 shares, 0 stale, 0 reconnects** (3
+  timing-rejects). No consensus/PoW/protocol change — the shipped hash is
+  identical to v0.2.2, just computed faster.
+- **Localhost telemetry enabled on packaged systemd rigs.** The xmrig-compatible
+  `/1/summary` endpoint (already shipped in v0.2.2) is now on by default on
+  packaged (non-HiveOS) rigs via `Environment=CSD_STATS_PORT=3380`, bound to
+  `127.0.0.1` (not reachable off-box, no token needed). No binary change; the
+  unit hardcodes the port so a rig with no override still starts.
+
 ## v0.2.2 — 2026-07-11 — job-change preemption
 
 - **job-change preemption — abort in-flight sweeps on a new block (fewer stale

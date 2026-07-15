@@ -39,7 +39,7 @@ To **solo-mine** on this rig (go for the whole block yourself instead of a stead
 --backend cuda --address <your 40-hex addr20> --worker solo
 ```
 
-The rig then authorizes as `<address>.solo`: your shares are excluded from the pool (PPLNS) split, and if *your* rig solves a block you're credited the **full reward minus the 2.5% fee** (after 10 confirmations, on the normal payout schedule). It's **high-variance** — you win the whole block or nothing that round. Your payout address is unchanged; `solo` only changes how it's credited. Remove `--worker solo` (or use any other name) to go back to pool mining. Solo wins appear in **blue** on the pool's Winners board. See the [main README](../README.md#solo-mining) for the full rundown.
+The rig then authorizes as `<address>.solo`: your shares are excluded from the pool (PPLNS) split, and if *your* rig solves a block you're credited the **full reward minus the 2.5% fee** (after 15 confirmations, on the normal payout schedule). It's **high-variance** — you win the whole block or nothing that round. Your payout address is unchanged; `solo` only changes how it's credited. Remove `--worker solo` (or use any other name) to go back to pool mining. Solo wins appear in **blue** on the pool's Winners board. See the [main README](../README.md#solo-mining) for the full rundown.
 
 ## Notes
 
