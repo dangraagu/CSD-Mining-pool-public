@@ -68,6 +68,17 @@ atomically, so stale docs ship with the binary.
         shipped `Cli`.
       - The HiveOS Installation URL stays the **non-staling**
         `releases/latest/download/csdpool.tar.gz` form (never a pinned tag).
+- [ ] **Update the POOL DASHBOARD "How to mine" tab** — `pool.yamaduo.no` = the
+      live `/var/www/pool/index.html` (`data-tab="mine"` section), a SEPARATE
+      surface from this repo that also cites release-specific facts and drifts
+      silently. On every release, `ssh` to the VPS and reconcile it against the
+      release + live bridge:
+      - The version line `Current miner release: <b>vX.Y.Z</b>` → the new tag.
+      - Fee, min-payout, payout cadence, confirmation depth, endpoint/no-`--pool`
+        claim, install steps, any new/changed flag or mode (e.g. solo).
+      - It is a static file (Caddy serves it, **no bridge restart**): back up
+        `index.html` first, edit, verify served. *(v0.2.3 shipped 2026-07-15 with
+        this tab still on v0.2.2 — this box exists so that never repeats.)*
 - [ ] **If a flag or endpoint changed**, update `RELEASE-v*.bat` header notes and
       any `deploy/systemd/*.env.example` defaults in the same commit.
 
