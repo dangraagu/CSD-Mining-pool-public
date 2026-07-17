@@ -156,16 +156,102 @@ impl SubscribeResult {
     }
 }
 
+/// Normalize a raw GPU device name (as reported by NVML/CUDA/OpenCL, e.g.
+/// `"NVIDIA GeForce RTX 5070 Ti"`) into the compact model string embedded in the
+/// `mining.subscribe` user-agent (e.g. `"RTX 5070 Ti"`), so the pool can harvest
+/// per-card hashrate.
+///
+/// PURE (no I/O, no GPU) → unit-tested with plain strings. Steps, in order:
+///   1. Strip ONE leading vendor prefix, case-insensitively, most-specific
+///      first (`"NVIDIA GeForce "` before `"NVIDIA "`, etc.).
+///   2. Keep only printable ASCII (`0x20..=0x7E`); drop everything else.
+///   3. Collapse internal whitespace runs to a single space and trim the ends.
+///   4. Cap the RESULT at 28 chars (so the whole UA stays well under the pool's
+///      64-char truncation).
+///
+/// An empty input — or one that reduces to nothing — yields `""`, which the UA
+/// builder treats as "no model" (no dangling `"()"`).
+pub fn normalize_gpu_model(raw: &str) -> String {
+    // Most-specific prefix first so "NVIDIA GeForce X" strips to "X", not
+    // "GeForce X". Each is pure ASCII, so byte-length == char-length.
+    const PREFIXES: [&str; 6] = [
+        "NVIDIA GeForce ",
+        "NVIDIA ",
+        "AMD Radeon ",
+        "AMD ",
+        "Intel Arc ",
+        "Intel ",
+    ];
+
+    let mut s = raw.trim();
+    for p in PREFIXES {
+        // `get(..len)` is None if len is out of bounds OR not a char boundary,
+        // so this never panics on a multi-byte name.
+        if let Some(head) = s.get(..p.len()) {
+            if head.eq_ignore_ascii_case(p) {
+                s = &s[p.len()..];
+                break;
+            }
+        }
+    }
+
+    // Printable-ASCII filter + whitespace collapse in one pass. Any whitespace
+    // char becomes at most one ' ' separator; non-printable / non-ASCII bytes
+    // are dropped entirely.
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !out.is_empty() && !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+            continue;
+        }
+        if ch.is_ascii_graphic() {
+            out.push(ch);
+            prev_space = false;
+        }
+        // else: non-printable / non-ASCII → dropped.
+    }
+    while out.ends_with(' ') {
+        out.pop();
+    }
+
+    // Cap the result at 28 chars. Post-filter every char is single-byte ASCII,
+    // so 28 is always a char boundary; trim any space the cut exposed.
+    if out.len() > 28 {
+        out.truncate(28);
+        while out.ends_with(' ') {
+            out.pop();
+        }
+    }
+    out
+}
+
 /// Build a `mining.subscribe` request. We send a single user-agent string as
 /// the lone positional param. The v0.2.0 bridge records it as the session's
 /// miner version ("csd-gpu-miner/<version>", shown on the pool dashboard);
 /// older bridges ignore the param entirely but still expect an array, so this
 /// is wire-compatible in both directions.
-pub fn subscribe_request(id: u64) -> Request {
+///
+/// `gpu_model` is the already-normalized active GPU model (see
+/// [`normalize_gpu_model`]). When it is `Some` and non-empty the UA becomes
+/// `"csd-gpu-miner/<version> (<model>)"` so the pool can attribute hashrate
+/// per card; `None` (or an empty string, defensively) keeps the plain
+/// `"csd-gpu-miner/<version>"` — never a dangling `"()"`. The pool truncates the
+/// UA at 64 chars and a normalized model is capped at 28, so the whole string
+/// stays well under that.
+pub fn subscribe_request(id: u64, gpu_model: Option<&str>) -> Request {
+    let ver = env!("CARGO_PKG_VERSION");
+    let ua = match gpu_model {
+        Some(m) if !m.is_empty() => format!("csd-gpu-miner/{ver} ({m})"),
+        _ => format!("csd-gpu-miner/{ver}"),
+    };
     Request {
         id: Some(id),
         method: "mining.subscribe".to_string(),
-        params: serde_json::json!([format!("csd-gpu-miner/{}", env!("CARGO_PKG_VERSION"))]),
+        params: serde_json::json!([ua]),
     }
 }
 
@@ -405,7 +491,7 @@ mod tests {
 
     #[test]
     fn subscribe_request_shape() {
-        let req = subscribe_request(1);
+        let req = subscribe_request(1, None);
         assert_eq!(req.method, "mining.subscribe");
         assert_eq!(req.id, Some(1));
         // A single string user-agent param in an array. The UA is
@@ -417,10 +503,10 @@ mod tests {
 
     #[test]
     fn subscribe_request_exact_wire_line() {
-        // Pin the EXACT bytes that hit the socket: the UA is
+        // Pin the EXACT bytes that hit the socket: with no GPU model the UA is
         // "csd-gpu-miner/<CARGO_PKG_VERSION>" as the lone positional param,
         // one trailing newline, no pretty-printing.
-        let req = subscribe_request(1);
+        let req = subscribe_request(1, None);
         let line = serialize_line(&req).unwrap();
         assert_eq!(
             line,
@@ -429,6 +515,79 @@ mod tests {
                 env!("CARGO_PKG_VERSION")
             )
         );
+    }
+
+    #[test]
+    fn subscribe_request_with_gpu_model_appends_suffix() {
+        // A non-empty normalized model becomes a " (<model>)" suffix on the UA so
+        // the pool can harvest per-card hashrate from the subscribe user-agent.
+        let req = subscribe_request(1, Some("RTX 5070 Ti"));
+        let ua = req.params[0].as_str().unwrap();
+        assert_eq!(
+            ua,
+            format!("csd-gpu-miner/{} (RTX 5070 Ti)", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn subscribe_request_empty_model_is_plain() {
+        // Defense-in-depth: an empty model string must NOT produce a dangling
+        // "()" — it is treated exactly like `None` (plain UA, no suffix).
+        let plain = format!("csd-gpu-miner/{}", env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            subscribe_request(1, Some("")).params[0].as_str().unwrap(),
+            plain
+        );
+        assert_eq!(
+            subscribe_request(1, None).params[0].as_str().unwrap(),
+            plain
+        );
+    }
+
+    #[test]
+    fn subscribe_ua_stays_well_under_64_chars() {
+        // The pool truncates the subscribe UA at 64 chars; a 28-char model plus
+        // the fixed "csd-gpu-miner/<ver> (...)" scaffold must stay comfortably
+        // under that so the model is never clipped.
+        let model = "X".repeat(28); // the max a normalized model can be
+        let ua = subscribe_request(1, Some(&model)).params[0]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(ua.len() < 64, "UA too long ({}): {ua}", ua.len());
+    }
+
+    #[test]
+    fn normalize_gpu_model_strips_vendor_prefix_and_normalizes() {
+        // Vendor prefixes stripped (case-insensitively, most-specific first).
+        assert_eq!(
+            normalize_gpu_model("NVIDIA GeForce RTX 5070 Ti"),
+            "RTX 5070 Ti"
+        );
+        assert_eq!(normalize_gpu_model("NVIDIA GeForce RTX 4090"), "RTX 4090");
+        assert_eq!(normalize_gpu_model("AMD Radeon RX 7900 XTX"), "RX 7900 XTX");
+        assert_eq!(normalize_gpu_model("Intel Arc A770"), "A770");
+        // Bare "NVIDIA " (no "GeForce") and case-insensitivity.
+        assert_eq!(
+            normalize_gpu_model("nvidia A100-SXM4-80GB"),
+            "A100-SXM4-80GB"
+        );
+        // Empty in → empty out.
+        assert_eq!(normalize_gpu_model(""), "");
+        // Internal whitespace runs collapse to a single space; ends trimmed.
+        assert_eq!(
+            normalize_gpu_model("  NVIDIA GeForce   RTX  4090  "),
+            "RTX 4090"
+        );
+        // Non-printable / non-ASCII bytes are dropped (keep only 0x20..=0x7E).
+        assert_eq!(
+            normalize_gpu_model("NVIDIA GeForce RTX\t4090\u{0}"),
+            "RTX 4090"
+        );
+        // A 60-char junk name is capped to <= 28 chars.
+        let junk = "Q".repeat(60);
+        let out = normalize_gpu_model(&junk);
+        assert!(out.len() <= 28, "not capped: len={} {out}", out.len());
     }
 
     #[test]

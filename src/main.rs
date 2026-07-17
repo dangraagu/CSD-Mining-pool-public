@@ -894,6 +894,42 @@ fn resolve_cuda_geometry(cli: &Cli) -> (u32, u32, u32) {
     (cli.blocks, cli.threads_per_block, cli.nonces_per_thread)
 }
 
+/// Best-effort ACTIVE GPU model for the `mining.subscribe` user-agent, normalized
+/// (`"NVIDIA GeForce RTX 5070 Ti"` -> `"RTX 5070 Ti"`) so the pool can attribute
+/// per-card hashrate. Returns `None` when no model is available at subscribe
+/// time — a CPU/opencl-only build (no `cuda` feature), a forced
+/// `--backend cpu`/`--backend opencl` (no CUDA card in play), or a CUDA
+/// device/driver lookup failure.
+///
+/// Looked up ON DEMAND here because the subscribe handshake runs BEFORE the
+/// mining backend inits. The CUDA device name is cheaply available via the same
+/// lightweight, side-effect-free `CudaContext::new(device).name()` path
+/// [`resolve_cuda_geometry`] already uses. Best-effort only: any failure degrades
+/// to `None` (the plain `csd-gpu-miner/<ver>` UA), never fatal — the model is
+/// telemetry, not correctness.
+fn resolve_gpu_model(cli: &Cli) -> Option<String> {
+    #[cfg(feature = "cuda")]
+    {
+        // Only report a model when a CUDA backend will actually run this session:
+        // `auto` (cuda is tried first) or an explicit `--backend cuda`. A forced
+        // CPU/opencl run reports no GPU model even on a cuda-capable build.
+        if matches!(cli.backend, BackendChoice::Cuda | BackendChoice::Auto) {
+            if let Ok(name) =
+                cudarc::driver::CudaContext::new(cli.device).and_then(|ctx| ctx.name())
+            {
+                let model = csd_gpu_miner::stratum::protocol::normalize_gpu_model(&name);
+                if !model.is_empty() {
+                    return Some(model);
+                }
+            }
+        }
+    }
+    // `cli` is consumed only under the `cuda` cfg above; keep it "used" for the
+    // CPU/opencl builds so they compile warning-free.
+    let _ = cli;
+    None
+}
+
 /// `bench` subcommand: print a stable MH/s for the GPU (or the per-geometry
 /// table + winner with `--all-geometries`), then exit. CUDA only; without the
 /// `cuda` feature it explains how to enable it. Does not mine.
@@ -1289,11 +1325,21 @@ fn run_mining(
         "csd-pool-miner: connecting to pool {endpoint} as address {address} (worker: {})",
         rig.as_deref().unwrap_or("<none — bare address>")
     );
+    // Best-effort ACTIVE GPU model for the subscribe user-agent, so the pool can
+    // harvest per-card hashrate. Looked up on demand (the handshake runs before
+    // the backend inits); `None` on CPU/opencl builds or a device lookup failure,
+    // in which case the UA stays the plain `csd-gpu-miner/<ver>`.
+    let gpu_model = resolve_gpu_model(cli);
+    if let Some(m) = gpu_model.as_deref() {
+        tracing::info!("subscribe: reporting GPU model \"{m}\" in the user-agent");
+    }
+
     // Hand the full ordered list to the client so the reader's reconnect path can
     // fail over to a backup pool (and fail back to the primary). With one
     // endpoint this is the same single-pool, no-failover behavior as before.
-    let mut client = StratumClient::connect_failover(&endpoints, &stratum_user)
-        .map_err(|e| anyhow::anyhow!("failed to connect to pool {endpoint}: {e}"))?;
+    let mut client =
+        StratumClient::connect_failover(&endpoints, &stratum_user, gpu_model.as_deref())
+            .map_err(|e| anyhow::anyhow!("failed to connect to pool {endpoint}: {e}"))?;
 
     // G6: wire the Discord notifier into the pool client (the 30s heartbeat posts
     // an accepted-share milestone when the total grows, unless

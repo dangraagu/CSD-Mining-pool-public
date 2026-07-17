@@ -395,9 +395,11 @@ struct Handshake {
 impl StratumClient {
     /// Connect to a single `endpoint` (`host:port`) with no failover. Thin shim
     /// over [`connect_failover`](Self::connect_failover) on a one-element list,
-    /// preserving every existing caller/test on a no-failover path.
+    /// preserving every existing caller/test on a no-failover path. Reports no
+    /// GPU model in the subscribe UA (`gpu_model = None`); the production path
+    /// that carries a model uses [`connect_failover`](Self::connect_failover).
     pub fn connect(endpoint: &str, worker_addr: &str) -> Result<Self> {
-        Self::connect_failover(&[endpoint.to_string()], worker_addr)
+        Self::connect_failover(&[endpoint.to_string()], worker_addr, None)
     }
 
     /// Connect to the PRIMARY pool (`endpoints.first()`), run the subscribe +
@@ -406,12 +408,22 @@ impl StratumClient {
     /// with the full failover [`EndpointList`]. On a dropped connection the
     /// reader rotates through `endpoints` (and fails back to the primary after a
     /// quiet interval); a single-element list is the no-failover path.
-    pub fn connect_failover(endpoints: &[String], worker_addr: &str) -> Result<Self> {
+    ///
+    /// `gpu_model` (already normalized, see
+    /// [`normalize_gpu_model`](super::protocol::normalize_gpu_model)) is embedded
+    /// in the subscribe user-agent — on the initial handshake AND every reconnect
+    /// — so the pool can attribute per-card hashrate. `None` reports no model
+    /// (CPU/opencl build, or the device name was unavailable at subscribe time).
+    pub fn connect_failover(
+        endpoints: &[String],
+        worker_addr: &str,
+        gpu_model: Option<&str>,
+    ) -> Result<Self> {
         let endpoint = endpoints
             .first()
             .ok_or_else(|| anyhow!("connect_failover needs at least one endpoint"))?;
 
-        let hs = Self::handshake(endpoint, worker_addr)
+        let hs = Self::handshake(endpoint, worker_addr, gpu_model)
             .with_context(|| format!("stratum handshake to {endpoint}"))?;
 
         let shared = Arc::new(Shared {
@@ -451,6 +463,7 @@ impl StratumClient {
         let reader = Self::spawn_reader(
             EndpointList::new(endpoints.to_vec()),
             worker_addr.to_string(),
+            gpu_model.map(str::to_string),
             hs.reader,
             Arc::clone(&shared),
             Arc::clone(&writer),
@@ -476,7 +489,14 @@ impl StratumClient {
     /// One full TCP connect + subscribe + authorize round. Used by both the
     /// initial `connect()` and the reader's reconnect path. Leaves the read
     /// timeout set on the returned stream so subsequent reads can't hang.
-    fn handshake(endpoint: &str, worker_addr: &str) -> Result<Handshake> {
+    ///
+    /// `gpu_model` (already normalized, see
+    /// [`normalize_gpu_model`](super::protocol::normalize_gpu_model)) is embedded
+    /// in the subscribe user-agent so the pool can attribute per-card hashrate;
+    /// `None` on a CPU/opencl build or when the device name is unavailable. It is
+    /// re-sent on every reconnect handshake, so the session's reported model
+    /// never drifts.
+    fn handshake(endpoint: &str, worker_addr: &str, gpu_model: Option<&str>) -> Result<Handshake> {
         let addr = endpoint
             .to_socket_addrs()
             .with_context(|| format!("resolving stratum endpoint {endpoint}"))?
@@ -504,7 +524,7 @@ impl StratumClient {
         // the OS socket alive (one for reading, one for writing).
 
         // --- mining.subscribe ---
-        let sub_req = subscribe_request(1);
+        let sub_req = subscribe_request(1, gpu_model);
         writer
             .write_all(serialize_line(&sub_req)?.as_bytes())
             .context("sending mining.subscribe")?;
@@ -601,6 +621,7 @@ impl StratumClient {
     fn spawn_reader(
         endpoints: EndpointList,
         worker_addr: String,
+        gpu_model: Option<String>,
         initial_reader: BufReader<TcpStream>,
         shared: Arc<Shared>,
         writer: Arc<Mutex<TcpStream>>,
@@ -679,6 +700,7 @@ impl StratumClient {
                             if !reconnect(
                                 &mut endpoints,
                                 &worker_addr,
+                                gpu_model.as_deref(),
                                 &shared,
                                 &writer,
                                 &mut reader,
@@ -1058,6 +1080,7 @@ fn dispatch_frame(line: &str, shared: &Shared) {
 fn reconnect(
     endpoints: &mut EndpointList,
     worker_addr: &str,
+    gpu_model: Option<&str>,
     shared: &Arc<Shared>,
     writer: &Arc<Mutex<TcpStream>>,
     reader: &mut BufReader<TcpStream>,
@@ -1082,7 +1105,7 @@ fn reconnect(
         }
         let ep = endpoints.current().to_string();
 
-        match StratumClient::handshake(&ep, worker_addr) {
+        match StratumClient::handshake(&ep, worker_addr, gpu_model) {
             Ok(hs) => {
                 // Refresh session params the bridge may have rotated.
                 if let Ok(mut x) = shared.extranonce1_hex.lock() {
@@ -1759,6 +1782,7 @@ mod tests {
         let client = StratumClient::connect_failover(
             &[addr_a.clone(), addr_b.clone()],
             "csd1testworker",
+            None,
         )
         .expect("connect to primary A ok");
 
@@ -1889,6 +1913,7 @@ mod tests {
         let client = StratumClient::connect_failover(
             &[addr_a.clone(), addr_b.clone()],
             "csd1testworker",
+            None,
         )
         .expect("connect to primary A ok");
 
