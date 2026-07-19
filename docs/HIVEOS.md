@@ -111,6 +111,26 @@ Each process authorizes as `<address>.<worker>`, and HiveOS bakes **one** worker
 
 If you want per-card names (`RIG1-GPU0` … `RIG1-GPU7`, so a dead card is obvious at a glance instead of "the rig lost a third of its hashrate"), run the miner outside HiveOS with one `--worker` per process — see the [main README](../README.md#worker-names-on-a-multi-gpu-rig). One production miner on this pool runs **8× V100S** exactly that way.
 
+## Hardware reporting (v0.2.4)
+
+From **v0.2.4** the miner appends the **GPU model** to the version string it has always sent in the Stratum handshake: `csd-gpu-miner/0.2.4 (RTX 5070 Ti)` instead of `csd-gpu-miner/0.2.3`. It lets the pool publish what each card *actually* does on this coin, measured from real submitted shares across the fleet, instead of our own bench figures on the few cards we own.
+
+It is telemetry and we will be plain about it. **What goes out:** the card's marketing name, vendor prefix stripped, printable ASCII, capped at 28 characters. Nothing else — no serial, no driver version, no hostname, no IP, no rig or OS detail. **When:** once per connection — in the opening handshake, on the line that already carried the version, and again in the same handshake on a reconnect or failover. Nothing polls it. **What it can affect:** nothing that pays you. Payouts key off `mining.authorize`, a different message carrying your address; the handshake string never reaches the share, credit, or payout path.
+
+**CUDA only, best-effort.** The AMD/OpenCL and CPU builds have no lookup compiled in at all. On an NVIDIA build any failure to read the card name falls silently back to the plain string — it can't stall or fail a launch.
+
+Because `h-run.sh` gives every process its own `--device <i>`, **each card reports its own model**, so a mixed rig shows up as the mix it is rather than N copies of card 0.
+
+> **Opt out** by adding `--no-hardware-report` to *Extra config arguments*, next to your backend and address:
+>
+> ```
+> --backend cuda --no-hardware-report
+> ```
+>
+> Or, if you would rather not touch the flight sheet's arguments, set the environment variable `CSD_NO_HARDWARE_REPORT=1` — either one alone is enough. Setting the flag always wins, so `--no-hardware-report` still opts out even on a rig where something else has exported `CSD_NO_HARDWARE_REPORT=0`. Either way the miner logs `hardware reporting DECLINED` on start, so you can confirm it took effect in the rig's log rather than trusting this page.
+>
+> Running the **AMD or CPU build**, or forcing `--backend cpu` / `--backend opencl`, also turns it off with no flag at all. See [What the miner reports about your hardware](../README.md#what-the-miner-reports-about-your-hardware) in the main README for the full detail.
+
 ## Notes
 
 - **The Pool URL field is ignored** (the pool is compiled into the binary) but HiveOS still requires it non-blank — use `stratum+tcp://127.0.0.1:1` as shown above and never point it at a real pool.

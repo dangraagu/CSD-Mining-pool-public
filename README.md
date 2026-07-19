@@ -176,6 +176,66 @@ Watch your results on the pool dashboard: your per-rig stats (including the `sol
 rig) are under **"Your Miner"**, and solo block wins show up in **blue** on the
 **Winners** board (`/winners.html`).
 
+## What the miner reports about your hardware
+
+From **v0.2.4** the miner appends your **GPU model** to the version string it has
+always sent in the Stratum handshake — `csd-gpu-miner/0.2.4 (RTX 5070 Ti)` where
+earlier releases sent `csd-gpu-miner/0.2.3`. This is opt-in software you run on
+your own machine, so here is exactly what that means, and how to turn it off.
+
+**Why.** So the pool can publish what each card *actually* does on this coin,
+measured from real submitted shares across the whole fleet, instead of our bench
+figures on the handful of cards we happen to own. It also lets you see whether
+your card is performing in line with the same model on other people's rigs.
+
+**What is sent.** The card's marketing name with the vendor prefix stripped,
+printable ASCII only, collapsed whitespace, capped at 28 characters —
+`NVIDIA GeForce RTX 5070 Ti` becomes `RTX 5070 Ti`. That is the entire payload.
+No serial number, no driver or CUDA version, no hostname, no IP, no OS or host
+detail, nothing about the other cards or processes on the machine, and nothing
+that is not already implied by the hashrate you submit.
+
+**When it is sent.** Once per connection — in the opening handshake, on the line
+that already carried the miner version, and again in the same handshake if the
+miner reconnects or fails over. Nothing polls it, and there is no callback of any
+kind.
+
+**It cannot touch your money.** Payouts key off `mining.authorize` — a
+*different* message, carrying your address. The handshake string is never read by
+the share-validation, credit, or payout path. It is display-only, exactly as the
+version number inside it has always been.
+
+**CUDA only, best-effort.** The AMD/OpenCL and CPU builds contain no lookup at
+all — it is compiled out of those binaries, so they send the byte-identical plain
+string they send today. On an NVIDIA build, `--backend cpu` or `--backend opencl`
+skips the lookup too, and *any* failure to read the card name (no driver,
+unsupported card, anything at all) falls silently back to plain
+`csd-gpu-miner/<version>`. There is no path by which this slows, interrupts, or
+fails mining.
+
+> **Opt out.** `--no-hardware-report` (or `CSD_NO_HARDWARE_REPORT=1`) suppresses
+> the suffix: the miner sends the bare `csd-gpu-miner/0.2.4`, the same shape
+> every release before this one sent. Nothing else changes — same pool, same
+> shares, same payouts, same hashrate. You don't have to tell us, and we don't
+> count who opted out.
+>
+> The miner logs which way it went on every start, so you can confirm from your
+> own log rather than taking this page's word for it:
+>
+> ```
+> subscribe: hardware reporting DECLINED (--no-hardware-report) — sending the plain user-agent
+> ```
+>
+> The flag governs *this* handshake string only. The separate `--stats-port`
+> dashboard endpoint is opt-in and stays off unless you pass it; this flag
+> neither enables nor disables it.
+
+On HiveOS, put the flag in *Extra config arguments* alongside your backend and
+address (see [docs/HIVEOS.md](docs/HIVEOS.md)). Two things already turn it off
+without a flag, if you would rather not add one: run the **AMD or CPU build** (no
+lookup exists in those binaries), or force `--backend cpu` / `--backend opencl`
+on an NVIDIA build.
+
 ## Multi-GPU rigs
 
 **One miner process drives exactly one GPU.** The card is picked with `--device N`

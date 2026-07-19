@@ -591,6 +591,81 @@ mod tests {
     }
 
     #[test]
+    fn normalize_gpu_model_survives_hostile_device_names() {
+        // A device name comes from the driver, but it is not something we get to
+        // assume is well-formed: an OpenCL/CUDA name can carry vendor junk, and
+        // the pool-side harvester parses this UA. Whatever comes in, the UA must
+        // stay a single well-formed JSON line with a parseable "(<model>)".
+        let hostile: [&str; 12] = [
+            "",
+            "   ",
+            "NVIDIA GeForce RTX 4090 (Laptop GPU)", // parens: bracket confusion
+            "RTX ) 4090 (",                         // unbalanced parens
+            "RTX\n4090\r\nEVIL",                    // newlines: frame injection
+            "RTX\u{0}4090",                         // NUL
+            "RTX\u{7}\u{1b}[31m4090",               // control chars / ANSI escape
+            "NVIDIA GeForce RTX 4090\", \"injected", // JSON string break
+            "显卡 GeForce RTX 4090",                // non-ASCII
+            "\u{202e}RTX 4090",                     // RTL override
+            "GeForce",                              // prefix-only-ish
+            "NVIDIA GeForce ",                      // reduces to nothing
+        ];
+        let long = "NVIDIA GeForce ".to_string() + &"Z(\n\"".repeat(50); // ~200 chars
+        let ver = env!("CARGO_PKG_VERSION");
+
+        for raw in hostile.iter().copied().chain(std::iter::once(long.as_str())) {
+            let m = normalize_gpu_model(raw);
+
+            // 1. Only printable ASCII survives — no newline can split the frame,
+            //    no NUL/control char can reach the pool's parser.
+            assert!(
+                m.chars().all(|c| c.is_ascii_graphic() || c == ' '),
+                "non-printable survived from {raw:?}: {m:?}"
+            );
+            assert!(!m.contains('\n') && !m.contains('\r'));
+            // 2. Never leading/trailing space, never a double space.
+            assert_eq!(m, m.trim(), "untrimmed from {raw:?}: {m:?}");
+            assert!(!m.contains("  "), "uncollapsed run from {raw:?}: {m:?}");
+            // 3. Always within the cap.
+            assert!(m.len() <= 28, "over cap ({}) from {raw:?}: {m:?}", m.len());
+
+            // 4. The resulting UA is always a well-formed, re-parseable single
+            //    JSON line under the pool's 64-char truncation.
+            let req = subscribe_request(1, Some(m.as_str()));
+            let line = serialize_line(&req).unwrap();
+            assert_eq!(line.matches('\n').count(), 1, "extra newline from {raw:?}");
+            assert!(line.ends_with('\n'));
+            let back: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+            let ua = back["params"][0].as_str().unwrap();
+            assert!(ua.len() < 64, "UA >= 64 ({}) from {raw:?}: {ua}", ua.len());
+
+            // 5. The pool's parser shape: either the plain UA, or exactly
+            //    "csd-gpu-miner/<ver> (<model>)" with ONE trailing ')' — never a
+            //    dangling "()" for a model that normalized away to nothing.
+            if m.is_empty() {
+                assert_eq!(ua, format!("csd-gpu-miner/{ver}"), "from {raw:?}");
+            } else {
+                assert_eq!(ua, format!("csd-gpu-miner/{ver} ({m})"), "from {raw:?}");
+                let inner = ua
+                    .strip_prefix(&format!("csd-gpu-miner/{ver} ("))
+                    .and_then(|r| r.strip_suffix(')'))
+                    .unwrap_or_else(|| panic!("UA not parseable from {raw:?}: {ua}"));
+                assert_eq!(inner, m);
+            }
+        }
+    }
+
+    #[test]
+    fn normalize_gpu_model_caps_a_200_char_name() {
+        // Explicit long-input case: 200 chars in, <= 28 out, no trailing space
+        // left behind by the cut.
+        let out = normalize_gpu_model(&"A".repeat(200));
+        assert_eq!(out.len(), 28);
+        let out = normalize_gpu_model(&"AB ".repeat(70)); // cut lands on a space
+        assert!(out.len() <= 28 && !out.ends_with(' '), "{out:?}");
+    }
+
+    #[test]
     fn serialize_line_appends_newline_and_is_parseable() {
         let req = authorize_request(1, "addr");
         let line = serialize_line(&req).unwrap();

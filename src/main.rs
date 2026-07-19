@@ -80,6 +80,29 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     no_worker: bool,
 
+    /// Decline hardware reporting (also via env `CSD_NO_HARDWARE_REPORT=1`).
+    ///
+    /// WHAT IS REPORTED, by default: your GPU's model name and nothing else —
+    /// e.g. "RTX 5070 Ti" — appended to the miner's `mining.subscribe`
+    /// user-agent as `csd-gpu-miner/<ver> (RTX 5070 Ti)`. No serial number, no
+    /// hostname, no driver/OS details, no per-card telemetry.
+    ///
+    /// WHY: so the pool can publish real, measured per-card hashrate figures
+    /// (a fleet MEDIAN over many rigs) instead of vendor marketing numbers, and
+    /// so you can tell whether your card is performing like its peers.
+    ///
+    /// It is BEST-EFFORT and never load-bearing: if the model can't be read,
+    /// the miner just sends the plain `csd-gpu-miner/<ver>`. Passing this flag
+    /// does exactly that, always. It NEVER affects your payouts, your payout
+    /// address, your worker/rig name, share validation, or difficulty — the
+    /// user-agent is display-only telemetry that the pool keys nothing on.
+    ///
+    /// SCOPE: this governs the subscribe user-agent only. `--stats-port` (the
+    /// local dashboard endpoint) is a separate, opt-in setting that stays off
+    /// unless you pass it; this flag neither enables nor disables it.
+    #[arg(long, default_value_t = false)]
+    no_hardware_report: bool,
+
     /// Telemetry: serve an xmrig-compatible `/1/summary` JSON endpoint on this
     /// port (plus `/healthz`) for dashboards/monitoring. Omitted ⇒ no server.
     #[arg(long)]
@@ -520,6 +543,26 @@ fn worker_suffix_enabled(cli: &Cli) -> bool {
     )
 }
 
+/// Is hardware reporting — the GPU model in the `mining.subscribe` user-agent —
+/// enabled? ON by default; declined by `--no-hardware-report` OR the env var
+/// `CSD_NO_HARDWARE_REPORT=1`. Mirrors [`worker_suffix_enabled`] and
+/// [`suggest_diff_enabled`] exactly, so one kill-switch spelling covers all
+/// three (the env form is what HiveOS flight sheets and systemd units can set).
+///
+/// This is a PUBLIC miner that strangers run on their own hardware: the model
+/// string is benign and useful, but it must be declinable, so this gate is
+/// checked before any device lookup happens. Telemetry only — it can never
+/// affect payouts, the payout address, the rig name, or share validation.
+fn hardware_report_enabled(cli: &Cli) -> bool {
+    if cli.no_hardware_report {
+        return false;
+    }
+    !matches!(
+        std::env::var("CSD_NO_HARDWARE_REPORT").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes")
+    )
+}
+
 #[derive(Subcommand, Debug, Clone)]
 enum Cmd {
     /// Create a brand-new CSD payout wallet (keypair + addr20) locally, print
@@ -897,9 +940,10 @@ fn resolve_cuda_geometry(cli: &Cli) -> (u32, u32, u32) {
 /// Best-effort ACTIVE GPU model for the `mining.subscribe` user-agent, normalized
 /// (`"NVIDIA GeForce RTX 5070 Ti"` -> `"RTX 5070 Ti"`) so the pool can attribute
 /// per-card hashrate. Returns `None` when no model is available at subscribe
-/// time — a CPU/opencl-only build (no `cuda` feature), a forced
-/// `--backend cpu`/`--backend opencl` (no CUDA card in play), or a CUDA
-/// device/driver lookup failure.
+/// time — the operator DECLINED hardware reporting (`--no-hardware-report` /
+/// `CSD_NO_HARDWARE_REPORT=1`, see [`hardware_report_enabled`]), a CPU/opencl-only
+/// build (no `cuda` feature), a forced `--backend cpu`/`--backend opencl` (no CUDA
+/// card in play), or a CUDA device/driver lookup failure.
 ///
 /// Looked up ON DEMAND here because the subscribe handshake runs BEFORE the
 /// mining backend inits. The CUDA device name is cheaply available via the same
@@ -908,6 +952,13 @@ fn resolve_cuda_geometry(cli: &Cli) -> (u32, u32, u32) {
 /// to `None` (the plain `csd-gpu-miner/<ver>` UA), never fatal — the model is
 /// telemetry, not correctness.
 fn resolve_gpu_model(cli: &Cli) -> Option<String> {
+    // PRIVACY OPT-OUT, checked FIRST and outside every `cfg`: a miner who
+    // declined hardware reporting must never have their device queried, on any
+    // build variant. Everything below is unreachable once this returns.
+    if !hardware_report_enabled(cli) {
+        return None;
+    }
+
     #[cfg(feature = "cuda")]
     {
         // Only report a model when a CUDA backend will actually run this session:
@@ -1329,9 +1380,26 @@ fn run_mining(
     // harvest per-card hashrate. Looked up on demand (the handshake runs before
     // the backend inits); `None` on CPU/opencl builds or a device lookup failure,
     // in which case the UA stays the plain `csd-gpu-miner/<ver>`.
+    // Never silent, in EITHER direction: the miner says on every start whether it
+    // is reporting a model (and which), or that reporting is off and how it was
+    // turned off. A stranger running this on their own hardware should be able to
+    // see what leaves their box by reading the log.
     let gpu_model = resolve_gpu_model(cli);
-    if let Some(m) = gpu_model.as_deref() {
-        tracing::info!("subscribe: reporting GPU model \"{m}\" in the user-agent");
+    match gpu_model.as_deref() {
+        Some(m) => tracing::info!(
+            "subscribe: reporting GPU model \"{m}\" in the user-agent (model name only — \
+             no serial/hostname; never affects payouts). Decline with --no-hardware-report \
+             or CSD_NO_HARDWARE_REPORT=1"
+        ),
+        None if !hardware_report_enabled(cli) => tracing::info!(
+            "subscribe: hardware reporting DECLINED ({}) — sending the plain user-agent",
+            if cli.no_hardware_report {
+                "--no-hardware-report"
+            } else {
+                "CSD_NO_HARDWARE_REPORT"
+            }
+        ),
+        None => {}
     }
 
     // Hand the full ordered list to the client so the reader's reconnect path can
@@ -1816,9 +1884,9 @@ fn ctrlc_lite<F: Fn() + Send + 'static>(handler: F) {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_gpu_watchdog_cfg, build_mining_config, num_cpus_default, resolve_rig_from,
-        sanitize_rig, stratum_username, suggest_diff_enabled, validate_address,
-        worker_suffix_enabled, Cli,
+        build_gpu_watchdog_cfg, build_mining_config, hardware_report_enabled, num_cpus_default,
+        resolve_gpu_model, resolve_rig_from, sanitize_rig, stratum_username, suggest_diff_enabled,
+        validate_address, worker_suffix_enabled, Cli,
     };
     use clap::Parser;
     use std::sync::Mutex;
@@ -2055,6 +2123,273 @@ mod tests {
             Some(v) => std::env::set_var("CSD_NO_WORKER", v),
             None => std::env::remove_var("CSD_NO_WORKER"),
         }
+    }
+
+    // --- hardware reporting opt-out (--no-hardware-report) -------------------
+
+    #[test]
+    fn hardware_report_flag_parses_and_defaults_off() {
+        // Reporting is ON by default, so the OPT-OUT flag defaults to false.
+        let cli = Cli::try_parse_from(["csd-pool-miner", "--address", &"a".repeat(40)]).unwrap();
+        assert!(
+            !cli.no_hardware_report,
+            "hardware reporting is ON by default, so the opt-out flag is off"
+        );
+
+        let cli = Cli::try_parse_from([
+            "csd-pool-miner",
+            "--address",
+            &"a".repeat(40),
+            "--no-hardware-report",
+        ])
+        .unwrap();
+        assert!(cli.no_hardware_report);
+    }
+
+    #[test]
+    fn hardware_report_enabled_default_on_flag_off() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("CSD_NO_HARDWARE_REPORT");
+
+        let cli = Cli::try_parse_from(["csd-pool-miner", "--address", &"a".repeat(40)]).unwrap();
+        assert!(hardware_report_enabled(&cli), "default must be ENABLED");
+
+        let cli = Cli::try_parse_from([
+            "csd-pool-miner",
+            "--address",
+            &"a".repeat(40),
+            "--no-hardware-report",
+        ])
+        .unwrap();
+        assert!(
+            !hardware_report_enabled(&cli),
+            "--no-hardware-report must disable"
+        );
+    }
+
+    #[test]
+    fn hardware_report_enabled_env_kill_switch() {
+        // Same env spelling set as CSD_NO_WORKER / CSD_NO_SUGGEST_DIFF, so an
+        // operator who knows one kill switch knows all of them. HiveOS and
+        // systemd unit files can only set env, not argv, so the env form is the
+        // one a fleet operator actually reaches for.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("CSD_NO_HARDWARE_REPORT").ok();
+        let cli = Cli::try_parse_from(["csd-pool-miner", "--address", &"a".repeat(40)]).unwrap();
+
+        for truthy in ["1", "true", "TRUE", "yes"] {
+            std::env::set_var("CSD_NO_HARDWARE_REPORT", truthy);
+            assert!(
+                !hardware_report_enabled(&cli),
+                "env={truthy} must disable hardware reporting"
+            );
+        }
+
+        std::env::set_var("CSD_NO_HARDWARE_REPORT", "0");
+        assert!(hardware_report_enabled(&cli), "env=0 must NOT disable");
+
+        std::env::remove_var("CSD_NO_HARDWARE_REPORT");
+        assert!(hardware_report_enabled(&cli), "no env var => enabled");
+
+        match prev {
+            Some(v) => std::env::set_var("CSD_NO_HARDWARE_REPORT", v),
+            None => std::env::remove_var("CSD_NO_HARDWARE_REPORT"),
+        }
+    }
+
+    #[test]
+    fn no_hardware_report_suppresses_the_gpu_model() {
+        // The opt-out gate sits BEFORE the `#[cfg(feature = "cuda")]` block, so
+        // this holds on EVERY build variant (cpu/opencl/cuda) and on a box with
+        // a real CUDA card present: opting out yields no model, full stop.
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("CSD_NO_HARDWARE_REPORT");
+
+        let cli = Cli::try_parse_from([
+            "csd-pool-miner",
+            "--address",
+            &"a".repeat(40),
+            "--no-hardware-report",
+        ])
+        .unwrap();
+        assert_eq!(
+            resolve_gpu_model(&cli),
+            None,
+            "--no-hardware-report must suppress the GPU model"
+        );
+
+        // Env form suppresses it just the same, with no flag on the command line.
+        let cli = Cli::try_parse_from(["csd-pool-miner", "--address", &"a".repeat(40)]).unwrap();
+        std::env::set_var("CSD_NO_HARDWARE_REPORT", "1");
+        assert_eq!(
+            resolve_gpu_model(&cli),
+            None,
+            "CSD_NO_HARDWARE_REPORT=1 must suppress the GPU model"
+        );
+        std::env::remove_var("CSD_NO_HARDWARE_REPORT");
+    }
+
+    #[test]
+    fn opted_out_miner_sends_the_plain_unchanged_user_agent() {
+        // End-to-end on the wire: an opted-out miner's subscribe line must be
+        // BYTE-IDENTICAL to the pre-v0.2.4 plain UA — no suffix, no dangling
+        // "()", nothing for the pool to parse as hardware.
+        use csd_gpu_miner::stratum::protocol::{serialize_line, subscribe_request};
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("CSD_NO_HARDWARE_REPORT");
+        let cli = Cli::try_parse_from([
+            "csd-pool-miner",
+            "--address",
+            &"a".repeat(40),
+            "--no-hardware-report",
+        ])
+        .unwrap();
+
+        let model = resolve_gpu_model(&cli);
+        let line = serialize_line(&subscribe_request(1, model.as_deref())).unwrap();
+        assert_eq!(
+            line,
+            format!(
+                "{{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"csd-gpu-miner/{}\"]}}\n",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+    }
+
+    /// BLAST-RADIUS LOCK for every non-CUDA miner in the fleet (the CPU and
+    /// AMD/OpenCL variants — which includes the pool's largest miner, an 8x
+    /// V100S rig whose cc 7.0 cards are below the compute_75 fatbin floor and so
+    /// cannot run the CUDA build at all). On a build without the `cuda` feature
+    /// the lookup is not merely skipped, it is not COMPILED: the model is always
+    /// `None` and the UA is byte-identical to pre-v0.2.4, opt-out or not.
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn non_cuda_builds_always_send_the_plain_user_agent() {
+        use csd_gpu_miner::stratum::protocol::subscribe_request;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("CSD_NO_HARDWARE_REPORT");
+        let addr = "a".repeat(40);
+        let plain = format!("csd-gpu-miner/{}", env!("CARGO_PKG_VERSION"));
+
+        // Every backend choice, with reporting left fully ENABLED.
+        for backend in ["auto", "cpu", "opencl"] {
+            let cli = Cli::try_parse_from([
+                "csd-pool-miner",
+                "--address",
+                &addr,
+                "--backend",
+                backend,
+            ])
+            .unwrap();
+            let model = resolve_gpu_model(&cli);
+            assert_eq!(model, None, "--backend {backend} leaked a model");
+            assert_eq!(
+                subscribe_request(1, model.as_deref()).params[0]
+                    .as_str()
+                    .unwrap(),
+                plain,
+                "--backend {backend} changed the UA"
+            );
+        }
+    }
+
+    /// POSITIVE path on a CUDA build: with the flag absent, a real card present
+    /// yields a real model in a well-formed UA. Requires an actual CUDA device,
+    /// so it self-skips where there is none (CI runners) rather than failing —
+    /// what it must never do is pass while the OPT-OUT is broken, and the
+    /// opt-out assertion at the end runs on the same device either way.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_build_reports_a_real_model_unless_opted_out() {
+        use csd_gpu_miner::stratum::protocol::subscribe_request;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("CSD_NO_HARDWARE_REPORT");
+        let addr = "a".repeat(40);
+        let cli =
+            Cli::try_parse_from(["csd-pool-miner", "--address", &addr, "--backend", "cuda"])
+                .unwrap();
+
+        match resolve_gpu_model(&cli) {
+            None => eprintln!("SKIP: no CUDA device on this box; opt-out half still checked"),
+            Some(model) => {
+                assert!(!model.is_empty() && model.len() <= 28, "bad model: {model:?}");
+                assert!(model.chars().all(|c| c.is_ascii_graphic() || c == ' '));
+                // No vendor prefix survived normalization.
+                assert!(!model.to_ascii_uppercase().starts_with("NVIDIA"), "{model}");
+                let ua = subscribe_request(1, Some(model.as_str())).params[0]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                assert_eq!(
+                    ua,
+                    format!("csd-gpu-miner/{} ({model})", env!("CARGO_PKG_VERSION"))
+                );
+                assert!(ua.len() < 64);
+                eprintln!("OBSERVED on this box: UA = {ua:?}");
+            }
+        }
+
+        // Same box, same card, flag on => nothing reported.
+        let opted = Cli::try_parse_from([
+            "csd-pool-miner",
+            "--address",
+            &addr,
+            "--backend",
+            "cuda",
+            "--no-hardware-report",
+        ])
+        .unwrap();
+        assert_eq!(
+            resolve_gpu_model(&opted),
+            None,
+            "opt-out failed to beat a real device lookup"
+        );
+    }
+
+    #[test]
+    fn hardware_report_opt_out_never_touches_the_payout_path() {
+        // PAYOUT INVARIANT: declining hardware reporting is telemetry-only. It
+        // must not perturb the address, the rig suffix, or the authorize
+        // username by even one byte — otherwise an opt-out would silently
+        // redirect or drop someone's earnings.
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("CSD_NO_HARDWARE_REPORT");
+        let addr = "a".repeat(40);
+
+        let base = ["csd-pool-miner", "--address", &addr, "--worker", "rig1"];
+        let cli_on = Cli::try_parse_from(base).unwrap();
+        let mut opted = base.to_vec();
+        opted.push("--no-hardware-report");
+        let cli_off = Cli::try_parse_from(opted).unwrap();
+
+        // Address and rig survive the flag untouched.
+        assert_eq!(cli_on.address, cli_off.address);
+        assert_eq!(cli_on.worker, cli_off.worker);
+
+        // The Stratum username the pool keys payouts on is byte-identical.
+        let user_on = stratum_username(&cli_on.address.clone().unwrap(), Some("rig1"));
+        let user_off = stratum_username(&cli_off.address.clone().unwrap(), Some("rig1"));
+        assert_eq!(user_on, user_off);
+        assert_eq!(user_off, format!("{addr}.rig1"));
+
+        // And the independent rig kill-switch is unaffected by this flag.
+        assert_eq!(
+            worker_suffix_enabled(&cli_on),
+            worker_suffix_enabled(&cli_off)
+        );
+        assert!(worker_suffix_enabled(&cli_off));
+
+        // The env form must not touch the payout path either.
+        std::env::set_var("CSD_NO_HARDWARE_REPORT", "1");
+        assert!(worker_suffix_enabled(&cli_on), "wrong kill switch fired");
+        assert_eq!(
+            stratum_username(&cli_on.address.clone().unwrap(), Some("rig1")),
+            format!("{addr}.rig1")
+        );
+        std::env::remove_var("CSD_NO_HARDWARE_REPORT");
     }
 
     #[test]
