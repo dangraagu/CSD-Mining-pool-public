@@ -394,6 +394,20 @@ jobs:
           mkdir -p "$STAGE"
           cp hiveos/h-manifest.conf hiveos/h-config.sh hiveos/h-run.sh hiveos/h-stats.sh hiveos/h-stop.sh "$STAGE"/
           chmod +x "$STAGE"/h-config.sh "$STAGE"/h-run.sh "$STAGE"/h-stats.sh "$STAGE"/h-stop.sh
+          # Stamp the release version into the STAGED manifest (never the repo
+          # source) so every published tarball self-describes correctly instead of
+          # carrying a hand-edited value that goes stale each release — it shipped
+          # 0.2.1 through the whole 0.2.2/0.2.3 cycle. CUSTOM_VERSION is
+          # display-only: the auto-update sidecar keys off the BINARY's --version
+          # and latest-version.txt, so this never affects update decisions, only
+          # what an operator reads in the HiveOS UI. Fail closed — a sed that
+          # silently matched nothing would reintroduce the drift invisibly.
+          sed -i -E "s|^CUSTOM_VERSION=.*|CUSTOM_VERSION=${VER}|" "$STAGE/h-manifest.conf"
+          grep -qx "CUSTOM_VERSION=${VER}" "$STAGE/h-manifest.conf" || {
+            echo "::error::HiveOS manifest CUSTOM_VERSION stamp failed (expected ${VER}) — h-manifest.conf may have lost its CUSTOM_VERSION line."
+            exit 1
+          }
+          echo "stamped CUSTOM_VERSION=${VER} into the staged h-manifest.conf"
           # Bundle the live terminal dashboard so it's already on every rig. Run it
           # from the Hive Shell: /hive/miners/custom/csdpool/csd-dashboard.sh
           # (read-only viewer of the miner's own /1/summary; never touches mining).

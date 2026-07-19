@@ -176,6 +176,207 @@ Watch your results on the pool dashboard: your per-rig stats (including the `sol
 rig) are under **"Your Miner"**, and solo block wins show up in **blue** on the
 **Winners** board (`/winners.html`).
 
+## Multi-GPU rigs
+
+**One miner process drives exactly one GPU.** The card is picked with `--device N`
+(0-based, default `0`). There is **no flag that makes a single process use every
+card** — an 8-GPU rig runs **8 processes**, all with the *same* `--address`, each
+with its own `--device` and its own `--stats-port`. The pool sums their shares
+automatically; you are one miner as far as payouts are concerned.
+
+`--gpu-id` is **not** the device selector. It is an **include-list the *launcher*
+reads** to decide which cards to spawn a process for — useful to skip a card that
+is unstable or already busy. The miner itself only validates it and logs it.
+
+```sh
+"$MINER" --list-devices        # index -> card, so you know what N means
+```
+
+### HiveOS — automatic, nothing to configure
+
+`h-run.sh` fans out on its own: it counts the cards (`nvidia-smi -L`, or `clinfo`
+on AMD), launches devices `1..N-1` in the background with `--device <i>
+--stats-port <3380+i>`, then `exec`s device 0 on `3380`. Shipped since v0.1.19 —
+**apply the Flight Sheet and every card mines.** Every probe is fail-soft: if
+anything fails the rig falls back to card 0 only, never a brick.
+
+> ⚠️ **Never put `--device` in *Extra config arguments*.** The launcher already
+> emits `--device <i>` *before* your extra flags, and the **last** `--device` on
+> the command line wins — so a `--device 0` in that box overrides the launcher's
+> per-card assignment and collapses **every** process onto card 0. The rig looks
+> like it is mining N GPUs and mines one. Current glue strips a stray `--device`
+> and warns, but the glue only refreshes on a Flight-Sheet re-apply. Choose cards
+> with `--gpu-id`, never `--device`.
+
+> **Keep *Extra config arguments* on ONE line, space-separated.** `h-run.sh`
+> matches ` --gpu-id ` (or `--gpu-id=`) inside a single flag string. Split your
+> arguments across newlines and the match fails and the launcher **silently
+> falls back to "all cards"** — no warning. Usually harmless, but if you were
+> trying to skip a bad card it will keep mining on it.
+
+> **Careful with the rig name `solo`.** HiveOS bakes its `$WORKER_NAME` — your
+> rig's name — into the config as the worker, and `solo` is a **reserved opt-in
+> mode**, not a label: a rig named `solo` is [solo mining](#solo-mining), its
+> shares are excluded from the PPLNS split, and it earns nothing unless it
+> solves a whole block. Don't name a rig `solo` unless you mean it.
+
+Full HiveOS detail (including how to skip a bad card): **[docs/HIVEOS.md](docs/HIVEOS.md#multi-gpu-rigs)**.
+
+### Plain Linux — one process per card
+
+Six cards, six processes, six stats ports:
+
+```sh
+MINER=~/.local/share/csd-pool-miner/csd-pool-miner-linux-nvidia
+BASE=~/.local/share/csd-pool-miner
+ADDR=<YOUR_ADDR20>
+
+for i in 0 1 2 3 4 5; do
+  mkdir -p "$BASE/gpu$i-log"
+  "$MINER" --address "$ADDR" --worker "rig1-GPU$i" \
+    --device "$i" --stats-port $((3380 + i)) --stats-bind 127.0.0.1 \
+    --log-dir "$BASE/gpu$i-log" \
+    >> "$BASE/gpu$i-log/stdout.log" 2>&1 &
+done
+```
+
+Count the cards instead of hardcoding six:
+
+```sh
+N=$(nvidia-smi -L | grep -c '^GPU ')      # AMD: clinfo | grep -c 'Device Type.*GPU'
+for i in $(seq 0 $((N - 1))); do … ; done
+```
+
+The shipped launchers (`mine-auto.sh`, `mine-all-gpus.sh`) do this fan-out for you
+and add auto-update — restrict them to specific cards with `CSD_GPU_IDS=0,2`
+(they forward it as `--gpu-id`).
+
+> **They do not pass `--stats-port`.** Under `mine-auto.sh` / `mine-all-gpus.sh`
+> the stats endpoint is **off**, so `csd-dashboard.sh` has nothing to read. If you
+> want telemetry on a non-HiveOS Linux rig, launch by hand as above or use the
+> systemd units.
+
+**systemd:** use the templated unit, one instance per card:
+
+```sh
+sudo systemctl enable --now csd-pool-miner@0 csd-pool-miner@1 csd-pool-miner@2
+```
+
+> ⚠️ The template reads one shared `CSD_STATS_PORT`, so every instance binds
+> **3380** unless you give each card its own `/etc/csd-pool-miner.<i>.env` with a
+> distinct port. See [`deploy/systemd/README.md`](deploy/systemd/README.md).
+
+### Plain Windows — one process per card
+
+```bat
+set MINER=%LOCALAPPDATA%\csd-pool-miner\csd-pool-miner-nvidia.exe
+set ADDR=<YOUR_ADDR20>
+
+for /L %%i in (0,1,5) do start "CSD GPU%%i" "%MINER%" --address %ADDR% ^
+  --worker rig1-GPU%%i --device %%i --stats-port 338%%i ^
+  --log-dir "%LOCALAPPDATA%\csd-pool-miner\gpu%%i-log"
+```
+
+(The `338%%i` port trick is good for up to 10 cards; past that, write the lines
+out.) `mine-all-gpus.bat` does the same fan-out — also without `--stats-port`.
+
+### ⚠️ HiveOS under-reports ~1/N until you re-apply the Flight Sheet
+
+`h-stats.sh` used to scrape a **single** stats port (`CUSTOM_API_PORT`, default
+`3380`), which is **device 0's**. The extra cards report on `3381`, `3382`, … and
+were never summed, so an N-card rig reads roughly **1/N of its real hashrate** on
+the HiveOS dashboard. The current glue probes the whole port range and merges
+what it finds, one `hs[]` entry per card.
+
+> **The fix does not reach your rig on its own — re-apply the Flight Sheet.**
+> `h-run.sh` self-updates the **miner binary** only (see
+> [Notes](docs/HIVEOS.md#notes)); the HiveOS glue around it (`h-run.sh`,
+> `h-config.sh`, `h-stats.sh`) is installed from the tarball and **only refreshes
+> on a Flight-Sheet re-apply**. A rig that has been up since before the fix keeps
+> reporting ~1/N however current its binary is. Re-apply once — that is the whole
+> procedure.
+
+After a re-apply the HiveOS tile **should** show a rate per card and a total in
+line with the pool. That path has not yet been confirmed on a real multi-GPU rig,
+so treat it as expected-not-proven: **if your tile still reads low after a
+re-apply, please tell us** — open an issue with the output of the per-port probe
+(step 2 below) and of `h-stats.sh` itself.
+
+**The cards are mining either way — only the number is wrong.** The pool has
+always counted every card. Measured in the field on a real 6-GPU rig: HiveOS
+showed **1.64 GH/s** while the pool measured **11.68 GH/s** from that rig's
+submitted shares — a ~7× under-report on a rig that was completely healthy. Do
+not restart or tear down a rig on the strength of the HiveOS tile; confirm
+against the pool dashboard first (step 5 below).
+
+### Verifying every card is actually mining
+
+**1. Count the processes** — one per card:
+
+```sh
+pgrep -a 'csd-(gpu|pool)-miner' | wc -l
+```
+
+**2. Ask each stats port directly** (the miner scrapes its own endpoint; no `jq`
+needed, and it never hangs):
+
+```sh
+for p in 3380 3381 3382 3383 3384 3385; do
+  printf '%s: ' "$p"
+  "$MINER" hiveos-stats --stats-port "$p"      # HiveOS: /hive/miners/custom/csdpool/csd-gpu-miner
+done
+```
+
+A card that is mining reports a non-zero `hs` value. An all-zero object means
+that process is missing or wedged.
+
+**3. Per-GPU logs** — each background process writes its own file:
+
+```sh
+tail -n 20 ~/.local/share/csd-pool-miner/gpu*-log/*.log     # plain Linux
+tail -n 20 /var/log/miner/csdpool/gpu*.log                  # HiveOS (device 0 is csdpool.log)
+grep 'multi-GPU' /var/log/miner/csdpool/*.log               # HiveOS: what the launcher spawned
+```
+
+**4. The hardware itself** — every card should show high utilisation and power
+near its limit:
+
+```sh
+nvidia-smi --query-gpu=index,name,utilization.gpu,power.draw --format=csv
+```
+
+**5. The pool dashboard** — the authoritative number, and the one to check
+*first* when HiveOS looks wrong. Your per-rig hashrate under **"Your Miner"** is
+derived from the shares your rig actually submitted, so it is a measurement of
+real work, not a scrape of a local endpoint — it counts every process regardless
+of what HiveOS displays. A real 6-GPU rig read **1.64 GH/s** on the HiveOS tile
+while the pool measured **11.68 GH/s** from its shares; the rig was fine and the
+tile was wrong. **Believe the pool.**
+
+### Worker names on a multi-GPU rig
+
+Each process authorizes as `<address>.<worker>` and shows up under that name on
+the pool dashboard. On a rig you control the argv for, **give every card its own
+name**:
+
+```sh
+--worker rig1-GPU0    --worker rig1-GPU1    …    --worker rig1-GPU7
+```
+
+This is worth the two minutes. A rig reporting under one name tells you "the rig
+lost a third of its hashrate"; per-card names tell you "GPU3 is dead". One
+production miner on this pool runs **8× V100S** exactly this way, one worker per
+card. Names allow `A-Za-z0-9_-`, max 24 chars, and payouts always go to the bare
+address regardless of the name.
+
+> **HiveOS bakes ONE worker name for the whole rig** (from the HiveOS
+> `$WORKER_NAME`, into the config every card shares), so per-card names are not
+> available under the HiveOS glue — all cards report under the rig name.
+
+> **Per-card names and [solo mining](#solo-mining) are mutually exclusive.** Only
+> the exact name `solo` is solo; `rig1-GPU0` pool-mines. A solo rig's cards all
+> report as `solo`.
+
 ## Monitoring (stats endpoint + Discord)
 
 Expose an **xmrig-`/1/summary`-compatible** JSON endpoint for dashboards

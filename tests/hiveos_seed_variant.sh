@@ -44,6 +44,25 @@ grep -q 'PKG="csdpool"' "$RY" \
   && ok "PKG=csdpool (hyphen-free name HiveOS derives cleanly)" \
   || no "PKG is not csdpool"
 
+# B4: CUSTOM_VERSION must be stamped into the STAGED manifest from the release
+# tag, so the HiveOS UI stops showing a hand-edited value that goes stale every
+# release (shipped 0.2.1 while the fleet ran 0.2.3).
+grep -qF 's|^CUSTOM_VERSION=.*|CUSTOM_VERSION=${VER}|' "$RY" \
+  && ok "release.yml stamps CUSTOM_VERSION into the staged manifest from \$VER" \
+  || no "CUSTOM_VERSION is NOT stamped at package time (it will go stale again)"
+grep -qF 'grep -qx "CUSTOM_VERSION=${VER}"' "$RY" \
+  && ok "the stamp is verified fail-closed (a silent no-op sed cannot ship)" \
+  || no "no fail-closed verify after the CUSTOM_VERSION stamp"
+
+# The checked-in value is what a hand-built tarball and any repo reader sees, so
+# lock it to Cargo.toml. This is the assertion that makes the drift impossible to
+# reintroduce silently.
+MANIFEST_VER="$(sed -n 's/^CUSTOM_VERSION=//p' "$ROOT/hiveos/h-manifest.conf" | tr -d '\r')"
+CARGO_VER="$(grep -m1 '^version' "$ROOT/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')"
+[ -n "$MANIFEST_VER" ] && [ "$MANIFEST_VER" = "$CARGO_VER" ] \
+  && ok "checked-in CUSTOM_VERSION ($MANIFEST_VER) == Cargo.toml version" \
+  || no "checked-in CUSTOM_VERSION ('$MANIFEST_VER') != Cargo.toml version ('$CARGO_VER')"
+
 echo "== functional: replicate the Package seed+marker+tar logic =="
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/dist" "$T/target/release" "$T/hiveos"
@@ -52,7 +71,10 @@ printf 'AMDBIN'     > "$T/target/release/csd-gpu-miner"  # last build = AMD/open
 printf 'NVBIN'      > "$T/dist/csd-pool-miner-linux-nvidia"
 printf 'relaybytes' > "$T/dist/csd-relay-node"
 printf 'dash'       > "$T/csd-dashboard.sh"
-for f in h-manifest.conf h-config.sh h-run.sh h-stats.sh h-stop.sh; do printf '%s\n' "$f" > "$T/hiveos/$f"; done
+for f in h-config.sh h-run.sh h-stats.sh h-stop.sh; do printf '%s\n' "$f" > "$T/hiveos/$f"; done
+# A realistic manifest carrying a deliberately STALE version, so the replication
+# below proves the package step rewrites it.
+printf 'CUSTOM_NAME=csdpool\nCUSTOM_VERSION=0.0.1\nCUSTOM_BUILD=1\n' > "$T/hiveos/h-manifest.conf"
 
 (
   cd "$T" || exit 1
@@ -60,6 +82,9 @@ for f in h-manifest.conf h-config.sh h-run.sh h-stats.sh h-stop.sh; do printf '%
   cp dist/csd-relay-node "$STAGE"/csd-relay-node                       # relay (csdpool path)
   cp hiveos/h-manifest.conf hiveos/h-config.sh hiveos/h-run.sh hiveos/h-stats.sh hiveos/h-stop.sh "$STAGE"/
   cp csd-dashboard.sh "$STAGE"/csd-dashboard.sh
+  VER=9.9.9
+  sed -i -E "s|^CUSTOM_VERSION=.*|CUSTOM_VERSION=${VER}|" "$STAGE/h-manifest.conf"
+  grep -qx "CUSTOM_VERSION=${VER}" "$STAGE/h-manifest.conf" || exit 1
   if [ -f csd-gpu-miner-hiveos-seed ]; then
     cp csd-gpu-miner-hiveos-seed "$STAGE"/csd-gpu-miner                # seed, NOT target/release
   else
@@ -76,6 +101,13 @@ got="$(cat "$T/hiveos-pkg/csdpool/csd-gpu-miner" 2>/dev/null)"
 [ "$(cat "$T/hiveos-pkg/csdpool/.installed-variant" 2>/dev/null)" = "cpu" ] \
   && ok ".installed-variant == cpu in the staged dir" \
   || no "marker content wrong"
+[ "$(sed -n 's/^CUSTOM_VERSION=//p' "$T/hiveos-pkg/csdpool/h-manifest.conf" 2>/dev/null)" = "9.9.9" ] \
+  && ok "staged h-manifest.conf CUSTOM_VERSION stamped to the release version" \
+  || no "staged CUSTOM_VERSION not stamped (still stale)"
+[ "$(sed -n 's/^CUSTOM_VERSION=//p' "$T/hiveos/h-manifest.conf" 2>/dev/null)" = "0.0.1" ] \
+  && ok "the stamp rewrites the COPY, leaving the repo source untouched" \
+  || no "the stamp mutated the repo-source manifest (must only touch \$STAGE)"
+
 TL="$(tar -tzf "$T/csdpool.tar.gz" 2>/dev/null)"
 printf '%s\n' "$TL" | grep -q '^csdpool/.installed-variant$' && ok "tar contains csdpool/.installed-variant" || no "tar missing the marker"
 printf '%s\n' "$TL" | grep -q '^csdpool/csd-gpu-miner$'      && ok "tar contains csdpool/csd-gpu-miner"       || no "tar missing the binary"

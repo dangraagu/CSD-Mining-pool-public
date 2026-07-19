@@ -131,6 +131,19 @@ fi
 # override the forced value (miner serves stats on a port h-stats doesn't scrape
 # -> dashboard shows 0 H/s; or --stats-bind 0.0.0.0 undoes loopback-only). Strip
 # both flags (and any "=value" form) out here so they CANNOT be overridden.
+#
+# --device is stripped for the SAME last-wins reason, and it is the costlier of
+# the two. The binary is one-process-one-GPU, so h-run.sh fans a multi-GPU rig
+# out itself: hive_launch_extra_gpus() emits `--device $_dev` per background card
+# and the final exec emits `--device 0` — in BOTH cases BEFORE $EXTRA_FLAGS. An
+# operator `--device 0` in the extras box therefore wins on EVERY process and
+# collapses the whole rig onto one card: N processes fight over GPU 0, the rig
+# looks like it is mining N GPUs and mines ~1. Strip it (both the space and the
+# =value form) so the launcher's per-card assignment always stands.
+# NOT stripped: --gpu-id. That flag is legitimately consumed by the launcher as
+# the include-list of WHICH cards to fan out to (h-run.sh hive_gpu_id_list); the
+# miner itself only parses+logs it. It is not a device selector and removing it
+# would break operator card selection.
 EXTRA_FLAGS_FILE="$CONF_DIR/extra-flags"
 if [ -n "${CUSTOM_USER_CONFIG:-}" ]; then
   # If the operator NAMED a --backend, sanity-check the token: valid ones are
@@ -147,11 +160,36 @@ if [ -n "${CUSTOM_USER_CONFIG:-}" ]; then
       *) echo "h-config: WARNING — unrecognised --backend '$_be' (expected one of: auto, cuda, opencl, cpu). The rig will AUTO-DETECT the GPU instead; fix the token if you meant a specific backend." ;;
     esac
   fi
+  # If the operator pasted a --device, it is about to be stripped (see below) —
+  # tell them, so a silently-ignored flag doesn't look like the launcher lost it.
+  # Same detection idiom as the --backend check above; handles space and =value.
+  _dv="$(printf '%s' "$CUSTOM_USER_CONFIG" | tr '\n\t' '  ' \
+          | sed -n 's/.*--device[ =]\{1,\}\([^ ]*\).*/\1/p')"
+  if [ -n "$_dv" ]; then
+    echo "h-config: WARNING — removed '--device $_dv' from the extra config arguments. The launcher assigns one process per GPU automatically (--device 0, 1, 2, …); a --device here is applied LAST and would pin EVERY process to a single card, so the rig would mine on one GPU instead of all of them. To restrict WHICH cards are used, use --gpu-id (e.g. --gpu-id 0,2) instead."
+  fi
   # Flight-sheet extras present this run -> (re)write them, stripping the forced
-  # --stats-port/--stats-bind so they cannot be overridden.
+  # --stats-port/--stats-bind/--device so they cannot be overridden.
+  #
+  # The `tr '\n\t' '  '` is REQUIRED, not cosmetic — it is the same normalisation
+  # the two detection paths above already do, and for the same reason. The extras
+  # box is a TEXTAREA and preserves newlines, but `sed` is LINE-oriented and
+  # [[:space:]] matches a space/tab WITHIN a line, never the newline that ended
+  # it. Without this, a flag split across lines —
+  #     --backend cuda --device
+  #     0
+  # — is warned about (the detection path tr's first) yet NOT stripped, so a real
+  # `--device 0` reaches clap and collapses the whole rig onto one card: the exact
+  # bug this strip exists to prevent, while printing a warning claiming otherwise.
+  # A trailing space before the newline is worse still: `--device` is removed but
+  # its value is ORPHANED into a stray positional argument and clap refuses to
+  # start at all. Flattening first makes every token visible to one sed pass.
+  # Safe for legit multi-line extras: h-run.sh word-splits $EXTRA_FLAGS on IFS,
+  # where newline and space are already the same separator.
   {
     printf '%s' "$CUSTOM_USER_CONFIG" \
-      | sed -E 's/(^|[[:space:]])--stats-port([[:space:]]+|=)[^[:space:]]*/\1/g; s/(^|[[:space:]])--stats-bind([[:space:]]+|=)[^[:space:]]*/\1/g'
+      | tr '\n\t' '  ' \
+      | sed -E 's/(^|[[:space:]])--stats-port([[:space:]]+|=)[^[:space:]]*/\1/g; s/(^|[[:space:]])--stats-bind([[:space:]]+|=)[^[:space:]]*/\1/g; s/(^|[[:space:]])--device([[:space:]]+|=)[^[:space:]]*/\1/g'
     printf '\n'
   } > "$EXTRA_FLAGS_FILE"
 elif [ ! -s "$EXTRA_FLAGS_FILE" ]; then
