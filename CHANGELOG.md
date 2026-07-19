@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.2.4 — 2026-07-19 — whole-rig HiveOS stats + GPU-model reporting
+
+- **HiveOS multi-GPU stats: a rig now reports the WHOLE rig, not just GPU 0.**
+  The miner is one-process-one-device and `h-run.sh` puts each extra card on
+  `PORT+1, PORT+2, …`, but `h-stats.sh` scraped only `$CUSTOM_API_PORT` — so an
+  N-card rig under-reported by ~1/N (a 6-GPU rig showed **1.64 GH/s against
+  11.68 GH/s of accepted shares**). It now TCP-probes each port, scrapes every
+  live one, and merges the objects into a single payload with one `hs[]` element
+  **per card**; `ar[]` is summed, `uptime` is the max, `temp[]` stays positional
+  (a dead card's slot is `0`, and `temp[]` stays empty when no card reports).
+  **This is an uptime bug, not a cosmetic one:** HiveOS's own hashrate watchdog
+  compares the reported rate against a threshold, so a healthy multi-GPU rig
+  could be killed and restarted in a loop. A 1-GPU rig's output is
+  byte-identical to before.
+- **The port scan is bounded by the real device count, not a blind 32.** The
+  scan probes `nvidia-smi`'s device count (mirroring `h-run.sh:hive_gpu_count`),
+  which is a complete bound — `h-run.sh` launches device `d` only when
+  `d < gpu_count` and places it on `PORT+d`, so every live stats port is in
+  `[PORT, PORT+gpu_count-1]`, including the sparse `--gpu-id 0,8` case. Measured
+  end-to-end: all-dead **279 ms → 25 ms**, 6 live **132 ms → 45 ms**. At 32 ports
+  the probe consumed ~93% of the budget against a ~10 s HiveOS poll, which broke
+  the scrape loop on iteration 1 and silently fell back to scraping `$PORT`
+  alone — re-entering the very under-report this change fixes. The budget is now
+  split so the probe cannot starve the scrape (`HS_PROBE_BUDGET`), and **the
+  single-port fallback LOGS**, so that regression can never again be silent. If
+  no device count is available the legacy 32-port bound is kept — degraded, but
+  never narrower than before.
+- **GPU model reported in the `mining.subscribe` user-agent.** The miner appends
+  its normalized device name, e.g. `csd-gpu-miner/0.2.4 (RTX 5070 Ti)`, so the
+  pool dashboard can show per-card hashrate expectations instead of hand-
+  maintained guesses.
+- **`--no-hardware-report` opts out of that.** The flag suppresses the model
+  suffix and sends the plain `csd-gpu-miner/<ver>` user-agent. Payout address,
+  share submission and PoW are unaffected either way — the model is display-only
+  telemetry.
+- **`h-config.sh` strips an operator-supplied `--device` from `EXTRA_ARGS`.** The
+  per-GPU sidecars set their own device, so a stray `--device` in the flightsheet
+  pinned **every** sidecar to the same card.
+- **`CUSTOM_VERSION` is stamped into the staged HiveOS manifest from the release
+  tag** (fail-closed if the sed matches nothing), so a published tarball always
+  self-describes correctly — it shipped `0.2.1` through the entire 0.2.2/0.2.3
+  cycle. The checked-in value is locked equal to the `Cargo.toml` version by
+  `tests/hiveos_seed_variant.sh`.
+- **No consensus / PoW / wire-format change.** The kernel, nonce search, digest
+  and target comparison are byte-identical to v0.2.3; the stats merge is pure
+  aggregation of values the Rust `hiveos-stats` subcommand already converted to
+  kH/s, so no unit maths moved into shell.
+
 ## v0.2.3 — 2026-07-15 — inner-prefix precompute (+~5.9%) + telemetry on packaged rigs
 
 - **Faster CUDA SHA-256d kernel: inner-block prefix precompute (~+5.9% hashrate,
