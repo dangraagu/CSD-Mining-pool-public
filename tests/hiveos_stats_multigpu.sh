@@ -64,7 +64,7 @@ stub() { local dir="$1" name="$2" body="$3"; printf '#!/usr/bin/env bash\n%s\n' 
 # unmistakable diff and the assertion fails cleanly rather than mysteriously.
 FNS="$(mktemp)"
 : > "$FNS"
-for f in hs_extract hs_merge hs_live_ports hs_port_live hs_scrape; do
+for f in hs_log hs_gpu_count hs_extract hs_merge hs_live_ports hs_port_live hs_scrape; do
   if grep -qE "^$f\(\)[[:space:]]*\{" "$HSTATS"; then
     awk -v fn="$f" '$0 ~ "^"fn"\\(\\)[[:space:]]*\\{"{f=1} f{print} f&&/^\}/{exit}' "$HSTATS" >> "$FNS"
   else
@@ -88,9 +88,23 @@ echo
 # ── 1. hs_extract: object -> flat record, BOTH implementations ────────────────
 echo "-- hs_extract: object -> flat record (awk fallback AND jq) --"
 
-SB="$(mktemp -d)"; mkdir -p "$SB/bin"   # empty bin => no jq on PATH => awk path
+SB="$(mktemp -d)"; mkdir -p "$SB/bin"
 
-extract_awk() { PATH="$SB/bin:/usr/bin:/bin" bash -c 'set -uo pipefail; source "$1"; hs_extract' _ "$FNS"; }
+# FIXED 2026-07-19. This used to be PATH="$SB/bin:/usr/bin:/bin" and was labelled
+# "empty bin => no jq on PATH => awk path". That was FALSE on any host with
+# /usr/bin/jq: `command -v jq` found it, so every "awk fallback" case below
+# actually exercised jq, and case (4) failed for a reason that had nothing to do
+# with awk. $SB/nojq holds ONLY the tools hs_extract's awk path needs, so the
+# awk branch is genuinely the one under test — on a dev box and on a bare rig.
+mkdir -p "$SB/nojq"
+for t in bash sh awk gawk mawk sed grep cat tr head; do
+  p="$(command -v "$t" 2>/dev/null)" && ln -sf "$p" "$SB/nojq/$t"
+done
+if [ -n "$(command -v jq 2>/dev/null)" ] && PATH="$SB/nojq" command -v jq >/dev/null 2>&1; then
+  fail "harness: awk-path isolation" "jq is still reachable from \$SB/nojq; the 'awk fallback' cases would silently test jq instead"
+fi
+
+extract_awk() { PATH="$SB/nojq" bash -c 'set -uo pipefail; source "$1"; hs_extract' _ "$FNS"; }
 
 R="$(obj 4058000 42 3 5 3600 65 | extract_awk)"
 eq "(1) awk extractor pulls khs/temp/uptime/ar/ver" \
@@ -113,6 +127,20 @@ if command -v jq >/dev/null 2>&1; then
   RJ="$(obj 4058000 42 3 5 3600 65 | PATH="$JQSB/bin:/usr/bin:/bin" bash -c 'set -uo pipefail; source "$1"; hs_extract' _ "$FNS")"
   eq "(5) jq extractor agrees with the awk extractor byte-for-byte" \
      "$(printf '4058000\t65\t3600\t42\t3\t0\t5\t0.2.3')" "$RJ"
+  # PARITY ON MALFORMED INPUT — the gap that let a real defect sit green. (5)
+  # only compared the two implementations on a WELL-FORMED object, where they
+  # trivially agree. On an object with no hs[] they did NOT: jq's `.hs[0]//0`
+  # returns 0 for ANY valid JSON, so a foreign service occupying a stats port
+  # was extracted as a real card reporting 0 kH/s, while awk correctly dropped
+  # it. Fixed in h-stats.sh with a `select((.hs|type)=="array" ...)` guard.
+  extract_jq() { PATH="$JQSB/bin:$SB/nojq" bash -c 'set -uo pipefail; source "$1"; hs_extract' _ "$FNS"; }
+  eq "(5a) jq extractor ALSO drops an object with no hs[] (parity on malformed input)" \
+     "" "$(printf '{"algo":"sha256d","uptime":5}\n' | extract_jq)"
+  eq "(5b) jq extractor ALSO drops an empty hs[]" "" \
+     "$(printf '{"algo":"sha256d","hs":[],"uptime":5}\n' | extract_jq)"
+  eq "(5c) jq extractor drops a non-JSON line" "" "$(printf 'not json at all\n' | extract_jq)"
+  eq "(5d) awk extractor drops an empty hs[] (the other half of 5b)" "" \
+     "$(printf '{"algo":"sha256d","hs":[],"uptime":5}\n' | extract_awk)"
   rm -rf "$JQSB"
 else
   ok "(5) jq extractor parity SKIPPED (no jq on this host; awk path is the rig default)"
@@ -226,19 +254,39 @@ if [ "${1:-}" = "bash" ]; then
   # socket. NB: take the LAST argument then strip; "${*##*/}" would apply the
   # removal per-argument and rejoin ("bash -c 3381").
   p="${*: -1}"; p="${p##*/}"
+  [ -n "${HS_PROBE_COUNT_FILE:-}" ] && echo "$p" >> "$HS_PROBE_COUNT_FILE"
   case " ${LIVE_SET:-} " in *" $p "*) exit 0 ;; *) exit 1 ;; esac
 fi
 exec /usr/bin/timeout "$secs" "$@"
 TSTUB
   chmod +x "$d/bin/timeout"
-  env "$@" LIVE_SET="$live" PATH="$d/bin:/usr/bin:/bin" bash -c '
+  # `nvidia-smi` stub: h-stats.sh now bounds the scan by the REAL device count
+  # (NEW-C), which it learns exactly the way h-run.sh:hive_gpu_count does. With
+  # NVSMI_GPUS unset it prints no "GPU N:" lines => count 0 => h-stats.sh keeps
+  # the legacy blind-32 bound, so every pre-existing case below is unaffected.
+  cat > "$d/bin/nvidia-smi" <<'NSTUB'
+#!/usr/bin/env bash
+n="${NVSMI_GPUS:-0}"
+if [ "${1:-}" = "-L" ]; then
+  i=0; while [ "$i" -lt "$n" ]; do echo "GPU $i: NVIDIA Stub (UUID: GPU-stub-$i)"; i=$((i + 1)); done
+fi
+exit 0
+NSTUB
+  chmod +x "$d/bin/nvidia-smi"
+  # Count every liveness probe so the scan bound can be asserted directly.
+  # e2e is called inside $( ), so any variable it sets is lost with the subshell.
+  # Side-channel stderr and the probe count through $SB, which outlives it.
+  : > "$SB/last-probes"
+  env "$@" LIVE_SET="$live" HS_PROBE_COUNT_FILE="$SB/last-probes" PATH="$d/bin:/usr/bin:/bin" bash -c '
     set -uo pipefail
     cd "$1"
     source ./h-stats.sh
     printf "%s\n%s\n" "$khs" "$stats"
-  ' _ "$d"
+  ' _ "$d" 2>"$SB/last-err"
   rm -rf "$d"
 }
+e2e_err()    { cat "$SB/last-err" 2>/dev/null; }
+e2e_probes() { wc -l < "$SB/last-probes" 2>/dev/null | tr -d ' '; }
 
 # (a) 1 GPU: the output must be BYTE-IDENTICAL to the legacy single-port path —
 # i.e. exactly what `hiveos-stats --stats-port 3380` printed, verbatim.
@@ -454,6 +502,157 @@ fi
 R="$(printf '100\t\t10\t0\t0\t0\t0\t0.2.3","evil":"x\n' | merge)"
 eq "(g10) a forged ver cannot inject JSON keys (allowlist-sanitised)" \
    '{"algo":"sha256d","ar":[0,0,0,0],"fan":[],"hs":[100],"hs_units":"khs","temp":[],"uptime":10,"ver":"0.2.3evilx"}' "$R"
+
+# ── 4c. NEW-C: the scan bound, the probe budget, and the LOUD fallback ───────
+# The 32-port blind scan was a REGRESSION INTO THE ORIGINAL BUG. Measured on
+# WSL2 (closed loopback stalls the connect — the pessimal case, and the one a
+# wedged rig produces): 32 dead ports cost 33154 ms timeout-bounded and 65093 ms
+# with a bare /dev/tcp subshell. Against a ~10s HiveOS poll the probe ate the
+# whole HS_BUDGET, the scrape loop broke on iteration 1, hs_merge got nothing,
+# and the fallback scraped $PORT alone => the ~1/N under-report was BACK, with
+# no log line anywhere. Three defences, each pinned here.
+echo
+echo "-- NEW-C: device-count scan bound, probe budget, LOUD fallback --"
+
+# (h1) The bound is the REAL device count. h-run.sh:hive_multi_gpu_plan launches
+# device d only when `d < gpu_count` (:256) and puts it on PORT+d, so every live
+# stats port is inside [PORT, PORT+count-1]. Bounding by the count is therefore
+# COMPLETE, not a heuristic — and on a 6-GPU rig it is 6 probes, not 32.
+OUT="$(e2e "3380 3381 3382 3383 3384 3385" "3380=1000:0:0:0:100
+3381=1000:0:0:0:100
+3382=1000:0:0:0:100
+3383=1000:0:0:0:100
+3384=1000:0:0:0:100
+3385=1000:0:0:0:100" NVSMI_GPUS=6)"
+eq "(h1) 6-GPU rig: the scan probes 6 ports, not 32 (5.3x fewer connect stalls)" \
+   "6" "$(e2e_probes)"
+eq "(h2) 6-GPU rig: bounding by the device count still reports the WHOLE rig" \
+   "6000" "$(printf '%s' "$OUT" | sed -n 1p)"
+
+# (h3) Sparse `--gpu-id 0,8` is still complete: h-run.sh only honours id 8 on a
+# rig with >=9 cards, so the count-derived bound reaches it.
+OUT="$(e2e "3380 3388" "3380=1000:10:0:0:100
+3388=9000:10:0:0:100" NVSMI_GPUS=9)"
+eq "(h3) --gpu-id 0,8 on a 9-GPU box: card 8 still found under the count bound" \
+   '[1000,0,0,0,0,0,0,0,9000]' \
+   "$(printf '%s' "$OUT" | sed -n 2p | sed -n 's/.*"hs":\(\[[^]]*\]\).*/\1/p')"
+eq "(h4) --gpu-id 0,8: exactly 9 probes (the count), never 32" "9" "$(e2e_probes)"
+
+# (h5) Detection failure (cpu variant / container / no nvidia-smi) must DEGRADE
+# to the old blind bound, never to something narrower — a narrower guess would
+# drop real cards. Every earlier case in this file runs with NVSMI_GPUS unset
+# and still reaches port 3388 (g7), which is that guarantee in action.
+OUT="$(e2e "3380 3388" "3380=1000:10:0:0:100
+3388=9000:10:0:0:100")"
+eq "(h5) no GPU count available => legacy 32-port bound, card 8 NOT dropped" \
+   "10000" "$(printf '%s' "$OUT" | sed -n 1p)"
+
+# (h6) THE MANDATORY ONE. When the fallback fires it MUST say so. A fix that
+# fails back into the bug it fixes, invisibly, is worse than no fix: the rig
+# under-reports, HiveOS's hashrate watchdog may kill it, and nothing in any log
+# points at h-stats.sh. All ports dead => fallback => a line on stderr.
+OUT="$(e2e "" "")"
+ERR="$(e2e_err)"
+case "$ERR" in
+  *"[h-stats] FALLBACK:"*) ok "(h6) fallback to the single-port path LOGS (no silent regression)" ;;
+  *) fail "(h6) fallback logs" "no '[h-stats] FALLBACK:' on stderr; got: ${ERR:-<empty>}" ;;
+esac
+case "$ERR" in
+  *"UNDER-REPORT"*) ok "(h7) the fallback log names the consequence (under-reporting)" ;;
+  *) fail "(h7) fallback log names the consequence" "got: ${ERR:-<empty>}" ;;
+esac
+eq "(h8) the fallback still emits a VALID zero object, not an empty \$stats" \
+   "$(obj 0 0 0 0 0)" "$(printf '%s' "$OUT" | sed -n 2p)"
+
+# (h9) A healthy multi-GPU poll must NOT log the fallback — otherwise the signal
+# is noise and the next operator learns to ignore it.
+OUT="$(e2e "3380 3381" "3380=1000:0:0:0:100
+3381=2000:0:0:0:100" NVSMI_GPUS=2)"
+case "$(e2e_err)" in
+  *FALLBACK*) fail "(h9) healthy rig is quiet" "the fallback logged on a healthy 2-GPU poll: $(e2e_err)" ;;
+  *) ok "(h9) healthy multi-GPU poll logs no fallback (the signal stays meaningful)" ;;
+esac
+
+# (h10) The probe must not be able to consume the whole budget — that starvation
+# is the exact mechanism that put the under-report back. HS_PROBE_BUDGET is a
+# strict slice of HS_BUDGET, so the scrape loop always gets time.
+if grep -q 'HS_PROBE_BUDGET' "$HSTATS"; then
+  ok "(h10) a probe-only budget exists, so the probe cannot starve the scrape loop"
+else
+  fail "(h10) probe budget" "h-stats.sh has no HS_PROBE_BUDGET: a slow probe can still eat HS_BUDGET whole and silently re-enter the 1/N under-report"
+fi
+
+# ── 4d. NEW-D: what a non-reporting card's temperature must be ───────────────
+# A lone card 5 emits temp:[0,0,0,0,0,70]. Omitting shifts 70C onto GPU 0
+# (HiveOS indexes temp[] positionally); null changes a third-party contract for
+# no gain; 0 reads as "card present, not reporting", which the NEW-C bound makes
+# provable — the scan stops at the real device count and h-run.sh only launches
+# device d when d < count, so every index below a reporting card IS a real card.
+echo
+echo "-- NEW-D: a dead card's temperature is 0, and only when some card reports --"
+
+OUT="$(e2e "3385" "3385=6000:10:0:0:100:70" NVSMI_GPUS=6)"
+E_STATS="$(printf '%s' "$OUT" | sed -n 2p)"
+eq "(i1) lone card 5 WITH a sensor: temp[] stays positional, dead cards are 0" \
+   '[0,0,0,0,0,70]' \
+   "$(printf '%s' "$E_STATS" | sed -n 's/.*"temp":\(\[[^]]*\]\).*/\1/p')"
+eq "(i2) lone card 5: hs[] agrees index-for-index with temp[]" \
+   '[0,0,0,0,0,6000]' \
+   "$(printf '%s' "$E_STATS" | sed -n 's/.*"hs":\(\[[^]]*\]\).*/\1/p')"
+# The non-nvml fleet build reports no temperature at all. It must stay [] rather
+# than becoming a row of fabricated 0C readings.
+OUT="$(e2e "3385" "3385=6000:10:0:0:100" NVSMI_GPUS=6)"
+eq "(i3) no card reports a temperature => temp[] stays EMPTY, no fake 0C row" \
+   '[]' \
+   "$(printf '%s' "$OUT" | sed -n 2p | sed -n 's/.*"temp":\(\[[^]]*\]\).*/\1/p')"
+
+# ── 4e. NEW-E: the ver allowlist is STRUCTURAL, not per-path ─────────────────
+# The old single-port shortcut echoed the miner's JSON VERBATIM, bypassing the
+# allowlist in hs_merge entirely. Any local process that bound $PORT could forge
+# keys into what the rig reports. The fix is not a second sanitiser to remember:
+# the shortcut is GONE, so every path — 1 card, 6 cards, fallback — funnels
+# through hs_extract | hs_merge and there is no unsanitised path left to forget.
+echo
+echo "-- NEW-E: no verbatim passthrough; one sanitised output path --"
+
+# A hostile object on the SINGLE live port. Pre-fix this was echoed verbatim and
+# "evil" reached HiveOS; now it is normalised out of existence.
+d="$(mktemp -d)"; mkdir -p "$d/bin"
+cat > "$d/csd-gpu-miner" <<'EVIL'
+#!/usr/bin/env bash
+echo '{"algo":"sha256d","ar":[1,0,0,0],"fan":[],"hs":[1000],"hs_units":"khs","temp":[],"uptime":7,"ver":"0.2.4","evil":"pwned"}'
+exit 0
+EVIL
+chmod +x "$d/csd-gpu-miner"; : > "$d/h-manifest.conf"; cp "$HSTATS" "$d/h-stats.sh"
+cat > "$d/bin/timeout" <<'TS2'
+#!/usr/bin/env bash
+secs="$1"; shift
+if [ "${1:-}" = "bash" ]; then
+  p="${*: -1}"; p="${p##*/}"
+  case " ${LIVE_SET:-} " in *" $p "*) exit 0 ;; *) exit 1 ;; esac
+fi
+exec /usr/bin/timeout "$secs" "$@"
+TS2
+chmod +x "$d/bin/timeout"
+R="$(LIVE_SET="3380" PATH="$d/bin:/usr/bin:/bin" bash -c '
+  set -uo pipefail; cd "$1"; source ./h-stats.sh; printf "%s\n" "$stats"' _ "$d" 2>/dev/null)"
+rm -rf "$d"
+case "$R" in
+  *evil*|*pwned*) fail "(j1) single live port cannot inject keys" "forged key survived into \$stats: $R" ;;
+  *) ok "(j1) a forged key on the SINGLE live port is stripped (no verbatim passthrough)" ;;
+esac
+eq "(j2) the legitimate fields survive the normalisation intact" \
+   '{"algo":"sha256d","ar":[1,0,0,0],"fan":[],"hs":[1000],"hs_units":"khs","temp":[],"uptime":7,"ver":"0.2.4"}' "$R"
+
+# (j3) STRUCTURAL, not incidental: there must be no path that assigns the raw
+# scrape straight to $stats. Every assignment has to pass through hs_merge.
+RAW_ASSIGN="$(grep -nE '^[[:space:]]*stats="\$\(hs_scrape[^|]*\)"[[:space:]]*$' "$HSTATS" || true)"
+if [ -z "$RAW_ASSIGN" ]; then
+  ok "(j3) no raw hs_scrape output is ever assigned to \$stats unsanitised"
+else
+  fail "(j3) no verbatim passthrough" "an unsanitised scrape reaches \$stats, bypassing the ver allowlist:
+$RAW_ASSIGN"
+fi
 
 # ── 5. Structural guards ─────────────────────────────────────────────────────
 echo
