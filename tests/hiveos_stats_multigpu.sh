@@ -96,15 +96,49 @@ SB="$(mktemp -d)"; mkdir -p "$SB/bin"
 # actually exercised jq, and case (4) failed for a reason that had nothing to do
 # with awk. $SB/nojq holds ONLY the tools hs_extract's awk path needs, so the
 # awk branch is genuinely the one under test — on a dev box and on a bare rig.
+#
+# FIXED 2026-07-19 (second defect, same block). The sandbox used to be built with
+# `ln -sf "$p" "$SB/nojq/$t"`, i.e. it RELOCATED the interpreters themselves. On
+# a host where `ln -s` cannot make a real symlink and silently COPIES instead
+# (MSYS2 / Git-Bash on Windows, the default when MSYS=winsymlinks is unset), the
+# copied bash.exe / gawk.exe sit outside their install dir and can no longer
+# resolve msys-2.0.dll:
+#     $SB/nojq/bash: error while loading shared libraries: ...
+# hs_extract pipes awk's stderr to /dev/null (correctly — a garbage port must
+# never spew), so the dead awk produced NO output and NO diagnostic, and cases
+# (1) and (2) failed as if the extractor were broken. It is not: run the exact
+# same $FNS with the host's real awk and both records come out byte-perfect.
+# Cases (3) and (4) expect EMPTY output, so they "passed" against a sandbox that
+# was executing nothing at all — which is how this hid.
+#
+# The fix keeps the intent (jq unreachable, everything else real) but stops
+# relocating binaries: each sandbox entry is a wrapper SCRIPT with an absolute
+# shebang that execs the tool AT ITS REAL PATH. Nothing moves, so nothing loses
+# its runtime linkage, on any host. `bash` is deliberately NOT in the sandbox —
+# we invoke the interpreter by absolute path, because PATH here is meant to
+# constrain what the CODE UNDER TEST can find, not which shell runs the harness.
 mkdir -p "$SB/nojq"
-for t in bash sh awk gawk mawk sed grep cat tr head; do
-  p="$(command -v "$t" 2>/dev/null)" && ln -sf "$p" "$SB/nojq/$t"
+_real_sh="$(command -v sh 2>/dev/null || echo /bin/sh)"
+for t in sh awk gawk mawk sed grep cat tr head; do
+  p="$(command -v "$t" 2>/dev/null)" || continue
+  printf '#!%s\nexec "%s" "$@"\n' "$_real_sh" "$p" > "$SB/nojq/$t"
+  chmod +x "$SB/nojq/$t"
 done
 if [ -n "$(command -v jq 2>/dev/null)" ] && PATH="$SB/nojq" command -v jq >/dev/null 2>&1; then
   fail "harness: awk-path isolation" "jq is still reachable from \$SB/nojq; the 'awk fallback' cases would silently test jq instead"
 fi
+# HARNESS SELF-CHECK — the guard that would have caught the above immediately.
+# An unusable sandbox awk turns every assertion that expects empty output into a
+# false PASS, so assert the sandbox can actually RUN awk before trusting a single
+# empty result from it.
+if [ "$(PATH="$SB/nojq" "${BASH:-bash}" -c 'awk "BEGIN{print \"awkalive\"}" 2>/dev/null')" = "awkalive" ]; then
+  ok "(0) harness: awk is executable inside the jq-free sandbox (empty results are meaningful)"
+else
+  fail "(0) harness: awk is executable inside the jq-free sandbox" \
+       "awk cannot run from \$SB/nojq, so hs_extract returns empty for a harness reason and the 'drops garbage' cases would pass vacuously"
+fi
 
-extract_awk() { PATH="$SB/nojq" bash -c 'set -uo pipefail; source "$1"; hs_extract' _ "$FNS"; }
+extract_awk() { PATH="$SB/nojq" "${BASH:-bash}" -c 'set -uo pipefail; source "$1"; hs_extract' _ "$FNS"; }
 
 R="$(obj 4058000 42 3 5 3600 65 | extract_awk)"
 eq "(1) awk extractor pulls khs/temp/uptime/ar/ver" \
@@ -123,8 +157,12 @@ eq "(4) awk extractor drops an object with no hs[]" "" \
 # one is absent, so this runs on a bare rig and on a dev box alike.
 if command -v jq >/dev/null 2>&1; then
   JQSB="$(mktemp -d)"; mkdir -p "$JQSB/bin"
-  cp "$(command -v jq)" "$JQSB/bin/jq" 2>/dev/null || ln -s "$(command -v jq)" "$JQSB/bin/jq"
-  RJ="$(obj 4058000 42 3 5 3600 65 | PATH="$JQSB/bin:/usr/bin:/bin" bash -c 'set -uo pipefail; source "$1"; hs_extract' _ "$FNS")"
+  # Wrapper script, not a copy/symlink: see the $SB/nojq note above — relocating
+  # a binary can strip it of its runtime linkage on some hosts.
+  printf '#!%s
+exec "%s" "$@"
+' "$_real_sh" "$(command -v jq)" > "$JQSB/bin/jq"; chmod +x "$JQSB/bin/jq"
+  RJ="$(obj 4058000 42 3 5 3600 65 | PATH="$JQSB/bin:/usr/bin:/bin" "${BASH:-bash}" -c 'set -uo pipefail; source "$1"; hs_extract' _ "$FNS")"
   eq "(5) jq extractor agrees with the awk extractor byte-for-byte" \
      "$(printf '4058000\t65\t3600\t42\t3\t0\t5\t0.2.3')" "$RJ"
   # PARITY ON MALFORMED INPUT — the gap that let a real defect sit green. (5)
@@ -133,7 +171,7 @@ if command -v jq >/dev/null 2>&1; then
   # returns 0 for ANY valid JSON, so a foreign service occupying a stats port
   # was extracted as a real card reporting 0 kH/s, while awk correctly dropped
   # it. Fixed in h-stats.sh with a `select((.hs|type)=="array" ...)` guard.
-  extract_jq() { PATH="$JQSB/bin:$SB/nojq" bash -c 'set -uo pipefail; source "$1"; hs_extract' _ "$FNS"; }
+  extract_jq() { PATH="$JQSB/bin:$SB/nojq" "${BASH:-bash}" -c 'set -uo pipefail; source "$1"; hs_extract' _ "$FNS"; }
   eq "(5a) jq extractor ALSO drops an object with no hs[] (parity on malformed input)" \
      "" "$(printf '{"algo":"sha256d","uptime":5}\n' | extract_jq)"
   eq "(5b) jq extractor ALSO drops an empty hs[]" "" \
@@ -150,7 +188,7 @@ fi
 echo
 echo "-- hs_merge: per-GPU hs[], summed shares, max uptime --"
 
-merge() { PATH="$SB/bin:/usr/bin:/bin" bash -c 'set -uo pipefail; source "$1"; hs_merge' _ "$FNS"; }
+merge() { PATH="$SB/bin:/usr/bin:/bin" "${BASH:-bash}" -c 'set -uo pipefail; source "$1"; hs_merge' _ "$FNS"; }
 
 R="$(printf '100\t\t10\t1\t0\t0\t0\t0.2.3\n200\t\t20\t2\t1\t0\t3\t0.2.3\n' | merge)"
 eq "(6) two cards => hs[] has BOTH rates, ar[] summed, uptime = max" \
